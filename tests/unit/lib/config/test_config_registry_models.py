@@ -203,3 +203,49 @@ class TestProviderRegistry:
         # agent plan 套餐未纳入 2.5，registry 不得先于套餐登记
         meta = PROVIDER_REGISTRY["ark-agent-plan"]
         assert not [mid for mid in meta.models if "seedance-2.5" in mid or "seedance-2-5" in mid]
+
+    def test_agnes_text_models_include_25_flash(self):
+        # 官方已将 2.0 标为废弃、2.5 为兼容替换；2.5 接管默认文本模型，2.0 仍可选手选。
+        meta = PROVIDER_REGISTRY["agnes"]
+        text_models = {mid: m for mid, m in meta.models.items() if m.media_type == "text"}
+        assert set(text_models) == {"agnes-2.5-flash", "agnes-2.0-flash"}
+        flash25 = text_models["agnes-2.5-flash"]
+        assert flash25.display_name == "Agnes 2.5 Flash"
+        assert flash25.default is True
+        assert flash25.capabilities == ["text_generation", "structured_output", "vision"]
+        assert text_models["agnes-2.0-flash"].default is False
+        assert text_models["agnes-2.0-flash"].capabilities == ["text_generation", "structured_output"]
+
+    def test_agnes_image_models_include_25_flash(self):
+        # 2.5 与 2.1 同契约；默认仍是网关已登记的 2.1，2.5 可选手选。
+        meta = PROVIDER_REGISTRY["agnes"]
+        image_models = {mid: m for mid, m in meta.models.items() if m.media_type == "image"}
+        assert set(image_models) == {"agnes-image-2.5-flash", "agnes-image-2.1-flash"}
+        flash25 = image_models["agnes-image-2.5-flash"]
+        assert flash25.display_name == "Agnes Image 2.5 Flash"
+        assert flash25.default is False
+        assert flash25.capabilities == ["text_to_image", "image_to_image"]
+        assert flash25.resolutions == ["1K", "2K"]
+        assert image_models["agnes-image-2.1-flash"].default is True
+        assert image_models["agnes-image-2.1-flash"].resolutions == ["1K", "2K"]
+
+    def test_agnes_default_concurrency_serial_image_and_video(self):
+        meta = PROVIDER_REGISTRY["agnes"]
+        assert meta.default_concurrency == {"image": 1, "video": 1}
+
+    def test_agnes_video_models_include_25(self):
+        # 2.5 / 2.5 Flash 是新一代视频型号，时长/分辨率/计费与 v2.0 不同；v2.0 仍是默认以免改掉 1–3s / 13–18s 项目。
+        meta = PROVIDER_REGISTRY["agnes"]
+        video_models = {mid: m for mid, m in meta.models.items() if m.media_type == "video"}
+        assert set(video_models) == {"agnes-video-v2.0", "agnes-video-2.5", "agnes-video-2.5-flash"}
+        v25 = video_models["agnes-video-2.5"]
+        assert v25.display_name == "Agnes Video 2.5"
+        assert v25.default is False
+        assert v25.supported_durations == list(range(4, 13))
+        assert v25.resolutions == ["720p", "1080p", "1K", "2K"]
+        flash = video_models["agnes-video-2.5-flash"]
+        assert flash.display_name == "Agnes Video 2.5 Flash"
+        assert flash.default is False
+        assert flash.supported_durations == list(range(4, 13))
+        assert flash.resolutions == ["720p"]
+        assert video_models["agnes-video-v2.0"].default is True

@@ -49,7 +49,7 @@ class TestConstruction:
 
             backend = AgnesTextBackend(api_key="sk")
             assert backend.name == PROVIDER_AGNES
-            assert backend.model == "agnes-2.0-flash"
+            assert backend.model == "agnes-2.5-flash"
 
     def test_custom_model(self):
         with captured_openai_clients():
@@ -58,14 +58,22 @@ class TestConstruction:
             backend = AgnesTextBackend(api_key="sk", model="agnes-2.0-pro")
             assert backend.model == "agnes-2.0-pro"
 
-    def test_capabilities_text_and_structured_no_vision(self):
+    def test_default_model_declares_vision(self):
         with captured_openai_clients():
             from lib.text_backends.agnes import AgnesTextBackend
 
             backend = AgnesTextBackend(api_key="sk")
             assert TextCapability.TEXT_GENERATION in backend.capabilities
             assert TextCapability.STRUCTURED_OUTPUT in backend.capabilities
-            # vision 未实测，不声明
+            # 2.5 官方支持 image_url 图像理解，能力集跟 registry 对齐
+            assert TextCapability.VISION in backend.capabilities
+
+    def test_legacy_20_flash_still_omits_vision(self):
+        with captured_openai_clients():
+            from lib.text_backends.agnes import AgnesTextBackend
+
+            backend = AgnesTextBackend(api_key="sk", model="agnes-2.0-flash")
+            assert TextCapability.STRUCTURED_OUTPUT in backend.capabilities
             assert TextCapability.VISION not in backend.capabilities
 
     def test_missing_api_key_raises(self):
@@ -104,7 +112,7 @@ class TestGenerate:
 
         assert result.text == "Test output"
         assert result.provider == PROVIDER_AGNES
-        assert result.model == "agnes-2.0-flash"
+        assert result.model == "agnes-2.5-flash"
         assert result.input_tokens == 15
         assert result.output_tokens == 8
 

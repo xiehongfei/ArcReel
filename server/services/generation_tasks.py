@@ -3096,6 +3096,10 @@ async def execute_product_task(
     return await execute_design_task("product", project_name, resource_id, payload, user_id=user_id, task_id=task_id)
 
 
+# 宫格跨格并集的收集上限；发给供应商前仍按图像模型 ``max_reference_images`` 再裁。
+_GRID_MAX_REFERENCE_IMAGES = 9
+
+
 def _collect_grid_reference_images(
     project_path: Path,
     payload: dict[str, Any],
@@ -3110,7 +3114,7 @@ def _collect_grid_reference_images(
     """Collect character/scene/prop sheet images referenced by grid scenes.
 
     Returns a tuple of ``(image_paths, metadata)``:
-    - *image_paths*: up to 6 :class:`~pathlib.Path` objects for the generation API.
+    - *image_paths*: at most ``_GRID_MAX_REFERENCE_IMAGES`` paths for the generation API.
     - *metadata*: list of dicts ``{path, name, ref_type}`` for persisting in
       :class:`~lib.grid.models.GridGeneration`.
     """
@@ -3152,7 +3156,7 @@ def _collect_grid_reference_images(
         char_field=char_field,
         scene_field=scene_field,
         prop_field=prop_field,
-        max_count=6,
+        max_count=_GRID_MAX_REFERENCE_IMAGES,
         visual_references=selected_visuals,
         currency_resolver=currency_resolver,
         formal_claims=formal_claims,
@@ -3259,6 +3263,7 @@ async def execute_grid_task(
     2. Generate the joint image via MediaGenerator (versioned as resource_type "grids")
     3. Mark completed and split the requested cells before the task settles
     """
+    from lib.grid.character_identity import project_grid_character_context
     from lib.grid.layout import GRID_FALLBACK_RESOLUTION, grid_aspect_ratio_for
     from lib.grid.prompt_builder import build_grid_prompt
     from lib.grid_manager import GridManager
@@ -3346,13 +3351,19 @@ async def execute_grid_task(
         grid_manager.save(grid)
 
         # d) Generate grid image
-        items, id_field, _char_field, _scene_field, _prop_field = get_storyboard_items(script)
+        items, id_field, char_field, _scene_field, _prop_field = get_storyboard_items(script)
         item_by_id = {str(item.get(id_field)): item for item in items if isinstance(item, dict)}
         if len(set(grid.scene_ids)) != len(grid.scene_ids):
             raise ValueError("grid scene identities must be unique")
         missing_members = [scene_id for scene_id in grid.scene_ids if scene_id not in item_by_id]
         if missing_members:
             raise ValueError(f"grid scenes are no longer present in the bound script: {missing_members}")
+        ordered_scenes = [item_by_id[scene_id] for scene_id in grid.scene_ids]
+        character_context = project_grid_character_context(
+            ordered_scenes,
+            char_field=char_field,
+            characters=project.get("characters"),
+        )
         members = tuple(
             GridStoryboardVisual(
                 resource_id=scene_id,
@@ -3364,7 +3375,7 @@ async def execute_grid_task(
         member_aspect_ratio = grid.video_aspect_ratio or get_aspect_ratio(project, "storyboards")
         grid_aspect_ratio = grid_aspect_ratio_for(grid.rows, grid.cols, member_aspect_ratio)
         prompt_text = build_grid_prompt(
-            scenes=[item_by_id[scene_id] for scene_id in grid.scene_ids],
+            scenes=ordered_scenes,
             id_field=id_field,
             rows=grid.rows,
             cols=grid.cols,
@@ -3372,6 +3383,9 @@ async def execute_grid_task(
             aspect_ratio=member_aspect_ratio,
             grid_aspect_ratio=grid_aspect_ratio,
             references=sent_references.visual_references,
+            char_field=char_field,
+            characters=project.get("characters"),
+            character_context=character_context,
         )
         grid_basis = build_grid_composite_visual_basis(
             group_id=grid.id,
@@ -3381,6 +3395,7 @@ async def execute_grid_task(
             style=str(project.get("style") or ""),
             grid_aspect_ratio=grid_aspect_ratio,
             references=frozen_references.visual_references,
+            character_context=character_context,
         )
         generator = ctx.generator
         aspect_ratio = grid_aspect_ratio

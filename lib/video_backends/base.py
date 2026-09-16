@@ -464,6 +464,7 @@ async def poll_with_retry[T](
     poll_interval: float = VIDEO_POLL_INTERVAL_SECONDS,
     retryable_errors: tuple[type[Exception], ...] = BASE_RETRYABLE_ERRORS,
     retry_if: Callable[[Exception], bool] | None = None,
+    retry_wait_seconds: float | None = None,
     label: str = "",
     on_progress: Callable[[T, float], None] | None = None,
     clock: AsyncClock | None = None,
@@ -471,10 +472,11 @@ async def poll_with_retry[T](
     """通用异步轮询辅助函数，带瞬态错误重试和超时控制。
 
     连续可重试错误（其间无一次成功响应）满 `VIDEO_POLL_MAX_CONSECUTIVE_FAILURES` 次即抛
-    RuntimeError 终态失败，任一成功响应清零。重试等待按 `poll_interval × 2^k` 退避、封顶
+    RuntimeError 终态失败，任一成功响应清零。默认重试等待按 `poll_interval × 2^k` 退避、封顶
     `VIDEO_POLL_MAX_BACKOFF_SECONDS`；响应带整数秒且不超过该封顶的 `Retry-After` 时优先采用。
-    失败预算管「供应商不可达」，`max_wait` 管「供应商可达但慢」。任何一次等待都截到 `max_wait`
-    的截止时刻，故最后一次轮询发出时必定仍在预算内。
+    传入 `retry_wait_seconds` 时忽略指数退避，改用该固定等待；合法且更长的 `Retry-After`
+    仍优先。失败预算管「供应商不可达」，`max_wait` 管「供应商可达但慢」。任何一次等待都截到
+    `max_wait` 的截止时刻，故最后一次轮询发出时必定仍在预算内。
 
     失败预算对全部消费方生效，视频与图片两条通道同此一份：图片侧的 `lib/image_backends/vidu.py`
     与 `lib/kling_backend_base.py` 同样在连续失败满额时终止，不会用满各自的 `max_wait` 窗口。
@@ -488,6 +490,7 @@ async def poll_with_retry[T](
         retryable_errors: 可重试的异常类型元组（未指定 retry_if 时生效）。
         retry_if: 自定义重试谓词，指定时替代默认的 `_should_retry`，让调用方精确控制
             哪些异常应当重试（如按 HTTP status_code 区分确定性 4xx 与瞬态 5xx）。
+        retry_wait_seconds: 可重试失败的固定等待秒数；None 时保持指数退避。
         label: 日志前缀（如 "Ark"、"Gemini"）。
         on_progress: 可选的进度回调，每次非终态轮询后调用。
         clock: 单调计时与异步等待 seam；生产默认使用系统时钟。
@@ -511,15 +514,22 @@ async def poll_with_retry[T](
                 raise RuntimeError(
                     f"{prefix}连续轮询失败 {VIDEO_POLL_MAX_CONSECUTIVE_FAILURES} 次，最后错误: {e}"
                 ) from e
-            retry_after = _retry_after_seconds(e)
-            wait_time = (
-                retry_after
-                if retry_after is not None
-                else min(
-                    poll_interval * 2 ** (consecutive_failures - 1),
-                    VIDEO_POLL_MAX_BACKOFF_SECONDS,
-                )
+            retry_after = _retry_after_seconds(
+                e, max_seconds=None if retry_wait_seconds is not None else VIDEO_POLL_MAX_BACKOFF_SECONDS
             )
+            if retry_wait_seconds is not None:
+                wait_time = retry_wait_seconds
+                if retry_after is not None and retry_after > wait_time:
+                    wait_time = retry_after
+            else:
+                wait_time = (
+                    retry_after
+                    if retry_after is not None
+                    else min(
+                        poll_interval * 2 ** (consecutive_failures - 1),
+                        VIDEO_POLL_MAX_BACKOFF_SECONDS,
+                    )
+                )
         else:
             consecutive_failures = 0
             error_msg = is_failed(result)
@@ -538,7 +548,7 @@ async def poll_with_retry[T](
         await active_clock.sleep(min(wait_time, remaining))
 
 
-def _retry_after_seconds(exc: Exception) -> int | None:
+def _retry_after_seconds(exc: Exception, *, max_seconds: float | None = VIDEO_POLL_MAX_BACKOFF_SECONDS) -> int | None:
     response = getattr(exc, "response", None)
     headers = getattr(response, "headers", None)
     if headers is None:
@@ -547,7 +557,11 @@ def _retry_after_seconds(exc: Exception) -> int | None:
     if not isinstance(raw, str) or not raw.isdigit():
         return None
     seconds = int(raw)
-    return seconds if 0 <= seconds <= VIDEO_POLL_MAX_BACKOFF_SECONDS else None
+    if seconds < 0:
+        return None
+    if max_seconds is None:
+        return seconds
+    return seconds if seconds <= max_seconds else None
 
 
 def url_origin(url: str) -> tuple[str, str, int | None]:

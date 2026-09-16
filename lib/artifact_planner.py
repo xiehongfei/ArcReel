@@ -40,6 +40,7 @@ from lib.asset_derivatives import (
 )
 from lib.asset_types import ASSET_SPECS, DERIVATIVES_FIELD, AssetSpec, asset_name_comparison_key
 from lib.episode_paths import episode_source_relpath
+from lib.grid.character_identity import GridCharacterContext, project_grid_character_context
 from lib.grid.layout import grid_aspect_ratio_for
 from lib.grid.models import GridGeneration
 from lib.media_artifact_currency import build_current_audio_artifact_basis, build_current_video_artifact_basis
@@ -766,8 +767,9 @@ class TargetStatePlanner:
             if grid.grid_image_path != resource_relative_path("grids", grid.id):
                 continue
             members = self._grid_visual_members(grid, episode)
+            character_context = self._grid_character_context(grid, episode)
             references = self._grid_references(grid)
-            if members is None or references is None:
+            if members is None or character_context is None or references is None:
                 continue
             member_ratio = grid.video_aspect_ratio or self.project.get("aspect_ratio") or "9:16"
             if not isinstance(member_ratio, str):
@@ -781,6 +783,7 @@ class TargetStatePlanner:
                     style=str(self.project.get("style") or ""),
                     grid_aspect_ratio=grid_aspect_ratio_for(grid.rows, grid.cols, member_ratio),
                     references=references,
+                    character_context=character_context,
                 )
             except (OSError, TypeError, ValueError):
                 continue
@@ -807,9 +810,10 @@ class TargetStatePlanner:
             if episode is None:
                 continue
             members = self._grid_visual_members(grid, episode)
+            character_context = self._grid_character_context(grid, episode)
             references = self._grid_references(grid)
             composite_path = self._safe_present_path(grid.grid_image_path)
-            if members is None or references is None or composite_path is None:
+            if members is None or character_context is None or references is None or composite_path is None:
                 continue
             member_ratio = grid.video_aspect_ratio or self.project.get("aspect_ratio") or "9:16"
             if not isinstance(member_ratio, str):
@@ -843,6 +847,7 @@ class TargetStatePlanner:
                         member_aspect_ratio=member_ratio,
                         references=references,
                         source_composite_digest=composite_digest,
+                        character_context=character_context,
                     )
                 except (OSError, TypeError, ValueError):
                     continue
@@ -876,6 +881,24 @@ class TargetStatePlanner:
             except (TypeError, ValueError):
                 return None
         return tuple(members)
+
+    def _grid_character_context(
+        self,
+        grid: GridGeneration,
+        episode: _EpisodeState,
+    ) -> GridCharacterContext | None:
+        by_id = {str(item[episode.id_field]): item for item in episode.items}
+        if len(set(grid.scene_ids)) != len(grid.scene_ids):
+            return None
+        scenes = [by_id.get(resource_id) for resource_id in grid.scene_ids]
+        if any(scene is None for scene in scenes):
+            return None
+        _, _, char_field, _, _ = get_storyboard_items(episode.script)
+        return project_grid_character_context(
+            [scene for scene in scenes if scene is not None],
+            char_field=char_field,
+            characters=self.project.get("characters"),
+        )
 
     def _grid_references(self, grid: GridGeneration) -> tuple[VisualReference, ...] | None:
         references: list[VisualReference] = []

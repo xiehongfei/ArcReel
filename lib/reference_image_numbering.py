@@ -1,9 +1,10 @@
 """参考图的「图N」编号：类型声明行与正文 ``@[名称]`` 的替换。
 
 分镜图与宫格图的参考图对图像模型只是一个图数组，模型能理解的指认方式是「图N」。编排层在
-最终参考图列表确定后，由本模块机械渲染两样东西：一行不带资产名的类型声明（YAML 键
-``Reference_Images``），以及正文里 ``@[名称]`` 到对应「图N」的替换。编号即列表位置（从 1
-起）；压缩层与执行时的临时复制都不改数量与顺序，故只在此处编号一次，对全部图像后端同一口径。
+最终参考图列表确定后，由本模块机械渲染两样东西：一行按类型声明、可选附带逻辑资产名的
+``Reference_Images``，以及正文里 ``@[名称]`` 到对应「图N」的替换。
+编号即列表位置（从 1 起）；压缩层与执行时的临时复制都不改数量与顺序，故只在此处编号一次，
+对全部图像后端同一口径。
 
 输入是与实际随请求发出的参考图严格等长同序的 :class:`ReferenceImageSlot` 序列
 （:class:`lib.visual_artifact_provenance.VisualReference` 满足该协议）。参考图列表仍由
@@ -45,6 +46,12 @@ _TYPE_DESCRIPTIONS: dict[str, str] = {
     "scene": "场景参考图",
     "prop": "道具参考图",
 }
+_NAMED_TYPE_DESCRIPTIONS: dict[str, str] = {
+    "product": "商品「{logical_id}」参考图，画面中的商品须与之完全一致",
+    "character": "角色「{logical_id}」参考图",
+    "scene": "场景「{logical_id}」参考图",
+    "prop": "道具「{logical_id}」参考图",
+}
 _PREVIOUS_STORYBOARD_DESCRIPTION = f"上一分镜图，{PREVIOUS_STORYBOARD_REFERENCE_DESCRIPTION}"
 _EXTRA_DESCRIPTION = "补充参考图"
 
@@ -74,8 +81,24 @@ def _describe(slot: ReferenceImageSlot) -> str:
     return _EXTRA_DESCRIPTION
 
 
-def reference_images_declaration(references: Sequence[ReferenceImageSlot]) -> str:
-    """``Reference_Images`` 行的值：按类型分组的编号声明；无参考图时为空串。"""
+def reference_images_declaration(
+    references: Sequence[ReferenceImageSlot],
+    *,
+    include_logical_ids: bool = False,
+) -> str:
+    """``Reference_Images`` 行的值；可为具名资产逐图声明逻辑身份。"""
+    if include_logical_ids:
+        entries: list[str] = []
+        for position, slot in enumerate(references):
+            label = _image_label(position)
+            description = _describe(slot)
+            named_description = _NAMED_TYPE_DESCRIPTIONS.get(slot.logical_type or "")
+            if slot.logical_id is None or named_description is None:
+                entries.append(f"{label}为{description}")
+            else:
+                entries.append(f"{label}为{named_description.format(logical_id=slot.logical_id)}")
+        return "；".join(entries) + ("。" if entries else "")
+
     groups: dict[str, list[str]] = {}
     for position, slot in enumerate(references):
         groups.setdefault(_describe(slot), []).append(_image_label(position))

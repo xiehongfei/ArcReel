@@ -4,7 +4,7 @@ Agnes 经 apihub 网关提供 OpenAI 风格 Chat Completions。鉴权与 base_ur
 agnes_shared（Bearer 单 key + host/{/v1} 后缀容错），生成流水线直接复用 OpenAITextBackend：
 原生 ``response_format`` json_schema 优先，schema 不兼容或代理未真正强制 schema 时按需降级到
 Instructor（选择性降级）。本类只在构造期注入 Agnes 鉴权 / 默认模型 / provider 计费归因，
-并裁掉未实测的 vision 能力声明。
+vision 能力跟 registry 对齐。
 """
 
 from __future__ import annotations
@@ -14,7 +14,7 @@ from lib.providers import PROVIDER_AGNES
 from lib.text_backends.base import TextCapability
 from lib.text_backends.openai import OpenAITextBackend
 
-DEFAULT_MODEL = "agnes-2.0-flash"
+DEFAULT_MODEL = "agnes-2.5-flash"
 
 
 class AgnesTextBackend(OpenAITextBackend):
@@ -35,5 +35,14 @@ class AgnesTextBackend(OpenAITextBackend):
             base_url=agnes_base_url(base_url),
             provider_name=PROVIDER_AGNES,
         )
-        # agnes-2.0-flash 仅声明文本生成与结构化输出；vision 未实测，不纳入能力集（父类默认含 VISION）。
-        self._capabilities = {TextCapability.TEXT_GENERATION, TextCapability.STRUCTURED_OUTPUT}
+        # 能力跟 registry 对齐：未登记型号（自定义 model 名）不声明 vision。
+        self._capabilities = self._resolve_capabilities()
+
+    def _resolve_capabilities(self) -> set[TextCapability]:
+        from lib.config.registry import model_info_for
+
+        caps = {TextCapability.TEXT_GENERATION, TextCapability.STRUCTURED_OUTPUT}
+        info = model_info_for(PROVIDER_AGNES, self.model)
+        if info is not None and TextCapability.VISION in info.capabilities:
+            caps.add(TextCapability.VISION)
+        return caps

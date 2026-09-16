@@ -14,6 +14,12 @@ from __future__ import annotations
 # 默认 base（含 /v1）；用户可经配置覆盖 base_url 指向自建中转。
 AGNES_BASE_URL = "https://apihub.agnes-ai.com/v1"
 
+# 免费账户 RPM 20：创建成功后与每次进行中成功响应后均间隔 10 秒再查状态；
+# 可重试 HTTP 失败（429/503 等）等待 65 秒再打，略长于官方「等 1 分钟」。
+AGNES_POLL_INTERVAL_SECONDS = 10.0
+AGNES_RETRY_WAIT_SECONDS = 65
+AGNES_RETRY_BACKOFF_SECONDS: tuple[int, ...] = (65, 65)
+
 # 单一已知路径后缀，归一化 host 时剥除以容忍用户填入完整 base。
 _V1_SUFFIX = "/v1"
 

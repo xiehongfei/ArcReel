@@ -15,6 +15,7 @@ from pathlib import Path
 from lib.artifact_manifest import ArtifactBasis
 from lib.asset_types import ASSET_TYPES, normalize_asset_name
 from lib.content_digest import sha256_file
+from lib.grid.character_identity import GridCharacterContext
 from lib.grid.prompt_builder import project_grid_image_prompt
 from lib.prompt_utils import normalize_style, project_storyboard_image_prompt
 from lib.reference_video.request_projection import ResolvedReferenceAsset
@@ -194,17 +195,19 @@ def build_grid_composite_visual_basis(
     style: str,
     grid_aspect_ratio: str,
     references: Sequence[VisualReference] = (),
+    character_context: GridCharacterContext | None = None,
 ) -> ArtifactBasis:
     """Describe one grid composite without hashing its rendered provider prompt."""
 
     member_tuple = _validate_grid_members(members, rows=rows, columns=columns)
+    resolved_character_context = _resolve_grid_character_context(character_context, len(member_tuple))
     _require_string("style", style)
     return ArtifactBasis.build(
         "artifact-visual/grid-composite",
-        kind_version=1,
+        kind_version=2,
         inputs={
             "group_id": _require_non_empty("group_id", group_id),
-            "cells": _project_grid_cells(member_tuple),
+            "cells": _project_grid_cells(member_tuple, resolved_character_context),
             "layout": {
                 "rows": rows,
                 "columns": columns,
@@ -228,6 +231,7 @@ def build_grid_member_storyboard_visual_basis(
     member_aspect_ratio: str,
     references: Sequence[VisualReference] = (),
     source_composite_digest: str | None = None,
+    character_context: GridCharacterContext | None = None,
 ) -> ArtifactBasis:
     """Describe one split cell while preserving grid dependency locality.
 
@@ -238,15 +242,16 @@ def build_grid_member_storyboard_visual_basis(
     """
 
     member_tuple = _validate_grid_members(members, rows=rows, columns=columns)
+    resolved_character_context = _resolve_grid_character_context(character_context, len(member_tuple))
     if type(cell_index) is not int or not 0 <= cell_index < len(member_tuple):
         raise ValueError("cell_index must identify a content cell")
     _require_string("style", style)
     return ArtifactBasis.build(
         "artifact-visual/grid-member",
-        kind_version=1,
+        kind_version=2,
         inputs={
             "group_id": _require_non_empty("group_id", group_id),
-            "cell": _project_grid_cells(member_tuple)[cell_index],
+            "cell": _project_grid_cells(member_tuple, resolved_character_context)[cell_index],
             "layout": {
                 "rows": rows,
                 "columns": columns,
@@ -426,33 +431,39 @@ def _validate_grid_members(
     return member_tuple
 
 
-def _project_grid_cells(members: Sequence[GridStoryboardVisual]) -> list[dict[str, object]]:
+def _resolve_grid_character_context(
+    context: GridCharacterContext | None,
+    member_count: int,
+) -> GridCharacterContext:
+    resolved = context or GridCharacterContext(identities=(), cell_characters=((),) * member_count)
+    if len(resolved.cell_characters) != member_count:
+        raise ValueError("grid character context must contain one roster per member")
+    identity_names = [identity.name for identity in resolved.identities]
+    if len(set(identity_names)) != len(identity_names):
+        raise ValueError("grid character identities must be unique")
+    known_names = set(identity_names)
+    if any(name not in known_names for roster in resolved.cell_characters for name in roster):
+        raise ValueError("grid cell roster contains an unknown character identity")
+    return resolved
+
+
+def _project_grid_cells(
+    members: Sequence[GridStoryboardVisual],
+    character_context: GridCharacterContext,
+) -> list[dict[str, object]]:
+    descriptions = character_context.descriptions
     cells: list[dict[str, object]] = []
     for index, member in enumerate(members):
-        transition: dict[str, object] | None = None
-        if index:
-            previous = members[index - 1]
-            transition = {
-                "from_resource_id": previous.resource_id,
-                "action": _project_grid_action(previous.video_prompt),
-            }
+        roster = character_context.cell_characters[index]
         cells.append(
             {
                 "cell_index": index,
                 "resource_id": member.resource_id,
                 "image_prompt": project_grid_image_prompt(member.image_prompt),
-                "transition": transition,
+                "characters": [{"name": name, "description": descriptions[name]} for name in roster],
             }
         )
     return cells
-
-
-def _project_grid_action(video_prompt: object) -> str:
-    if video_prompt is None:
-        return ""
-    if isinstance(video_prompt, Mapping):
-        return str(video_prompt.get("action") or "")
-    return str(video_prompt)
 
 
 def _reference_evidence(references: Sequence[VisualReference]) -> list[dict[str, object]]:

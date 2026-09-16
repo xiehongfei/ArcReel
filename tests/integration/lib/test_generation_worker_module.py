@@ -996,20 +996,19 @@ class TestCapacityTable:
                 assert db_table.get(pid, lane) == env_table.get(pid, lane)
 
     def test_agnes_video_default_one_outranks_active_global_env(self, monkeypatch):
-        """真实注册表：Agnes 视频 lane 出厂钉死 1，即便部署把全局 VIDEO_MAX_WORKERS 调高也不解除。
+        """真实注册表：Agnes 图像/视频出厂钉死 1，即便部署把全局 MAX_WORKERS 调高也不解除。
 
-        这是本切片要的 503 规避保证——声明默认压过「活跃的」全局 env（而非仅压过缺省值）。
-        顺带验证两条隔离性质：声明只作用于 video lane（image 仍随全局默认）；钉死是 Agnes 专属，
+        声明默认压过「活跃的」全局 env（而非仅压过缺省值）。钉死是 Agnes 专属，
         未声明默认的视频供应商（ark）仍跟随全局 env。机制本身（声明默认 > 全局、用户值 > 声明默认、
         跨 from_env/from_db 一致）已由上面的合成 declared-* 测试覆盖，此处只钉真实条目的接线。
         """
-        monkeypatch.delenv("IMAGE_MAX_WORKERS", raising=False)
+        monkeypatch.setenv("IMAGE_MAX_WORKERS", "5")
         monkeypatch.setenv("VIDEO_MAX_WORKERS", "5")
 
         table = CapacityTable.from_env()
 
         assert table.get("agnes", "video") == 1  # 声明默认压过活跃的全局 5
-        assert table.get("agnes", "image") == 5  # 声明不外溢到未声明的 image lane
+        assert table.get("agnes", "image") == 1  # 图像出厂声明同样压过全局 5
         assert table.get("ark", "video") == 5  # 未声明默认的视频供应商仍跟随全局 env
 
 

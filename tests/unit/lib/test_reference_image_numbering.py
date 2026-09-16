@@ -52,6 +52,12 @@ class TestReferenceImagesDeclaration:
     def test_props_and_extra_images_have_their_own_types(self):
         assert reference_images_declaration([_sheet("prop", "怀表"), _EXTRA]) == "图1为道具参考图；图2为补充参考图。"
 
+    def test_can_name_each_logical_asset_without_exposing_mention_syntax(self):
+        references = [_sheet("character", "Emma"), _sheet("scene", "智库·办公区"), _EXTRA]
+        assert reference_images_declaration(references, include_logical_ids=True) == (
+            "图1为角色「Emma」参考图；图2为场景「智库·办公区」参考图；图3为补充参考图。"
+        )
+
     def test_empty_references_render_nothing(self):
         assert reference_images_declaration([]) == ""
 

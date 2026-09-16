@@ -54,6 +54,7 @@ _IMAGE_VISUAL_KINDS: dict[str, frozenset[str]] = {
     ),
     "grids": frozenset({"artifact-visual/grid-composite"}),
 }
+_GRID_VISUAL_KINDS = frozenset({"artifact-visual/grid-composite", "artifact-visual/grid-member"})
 
 
 def is_typed_media_resource(resource_type: str) -> bool:
@@ -113,7 +114,8 @@ def parse_image_version_basis(
         basis = ArtifactBasis.from_evidence_dict(raw)
     except (TypeError, ValueError) as exc:
         raise ValueError("version does not contain complete image artifact metadata") from exc
-    if basis.kind not in allowed_kinds or basis.kind_version != 1 or not isinstance(raw, Mapping):
+    allowed_versions = {1, 2} if basis.kind in _GRID_VISUAL_KINDS else {1}
+    if basis.kind not in allowed_kinds or basis.kind_version not in allowed_versions or not isinstance(raw, Mapping):
         raise ValueError("version does not contain complete image artifact metadata")
     inputs = raw.get("inputs")
     if not isinstance(inputs, Mapping) or not _image_basis_matches_resource(

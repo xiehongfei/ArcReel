@@ -23,7 +23,7 @@ from lib.video_backends.base import (
     VideoCapabilityError,
     VideoGenerationRequest,
 )
-from tests.fakes import bounded_poll_clock, captured_provider_job_ids
+from tests.fakes import FakeAsyncClock, bounded_poll_clock, captured_provider_job_ids, zero_jitter
 from tests.http_capture import capture_http, only_request, request_json
 
 _BASE_URL = "https://x/v1"
@@ -44,7 +44,7 @@ class _AgnesRoutes(NamedTuple):
 @contextmanager
 def _agnes_api(*, base_url: str = _BASE_URL) -> Generator[_AgnesRoutes]:
     host = base_url.removesuffix("/v1")
-    with capture_http() as router:
+    with capture_http() as router, bounded_poll_clock():
         yield _AgnesRoutes(
             submit=router.post(f"{base_url}/videos"),
             poll=router.get(url__regex=rf"^{re.escape(base_url)}/videos/[^/]+$"),
@@ -112,6 +112,18 @@ class TestCapabilities:
         assert caps.first_frame is True
         assert caps.last_frame is True
         assert caps.max_reference_images == 4
+
+    def test_video_25_capabilities_include_last_frame(self):
+        caps = AgnesVideoBackend.video_capabilities_for_model("agnes-video-2.5")
+        assert caps.first_frame is True
+        assert caps.last_frame is True
+        assert caps.max_reference_images == 8
+
+    def test_video_25_flash_capabilities_cap_reference_images_at_five(self):
+        caps = AgnesVideoBackend.video_capabilities_for_model("agnes-video-2.5-flash")
+        assert caps.first_frame is True
+        assert caps.last_frame is True
+        assert caps.max_reference_images == 5
 
 
 class TestNumFramesAndSize:
@@ -630,15 +642,126 @@ class TestSubmitResilience:
         assert result.task_id == "t-retry"
 
     async def test_submit_non_retryable_4xx_fails_fast(self, tmp_path: Path):
-        with _agnes_api() as routes, bounded_poll_clock():
+        clock = FakeAsyncClock()
+        with _agnes_api() as routes:
             routes.submit.mock(return_value=_json({"error": "bad request"}, status_code=400))
 
-            backend = AgnesVideoBackend(api_key="k", base_url=_BASE_URL)
+            backend = AgnesVideoBackend(api_key="k", base_url=_BASE_URL, clock=clock, jitter=zero_jitter)
             with pytest.raises(httpx.HTTPStatusError):
                 await backend.generate(_request(tmp_path))
 
             assert routes.submit.call_count == 1
             assert routes.poll.call_count == 0  # 4xx 在提交阶段失败，不该轮询
+            assert clock.sleeps == []
+
+    async def test_submit_401_fails_fast_without_wait(self, tmp_path: Path):
+        clock = FakeAsyncClock()
+        with _agnes_api() as routes:
+            routes.submit.mock(return_value=_json({"error": "unauthorized"}, status_code=401))
+
+            backend = AgnesVideoBackend(api_key="k", base_url=_BASE_URL, clock=clock, jitter=zero_jitter)
+            with pytest.raises(httpx.HTTPStatusError):
+                await backend.generate(_request(tmp_path))
+
+            assert routes.submit.call_count == 1
+            assert routes.poll.call_count == 0
+            assert clock.sleeps == []
+
+
+class TestRequestPacing:
+    async def test_waits_ten_seconds_before_first_status_query(self, tmp_path: Path):
+        clock = FakeAsyncClock()
+        with _agnes_api() as routes:
+            routes.submit.mock(return_value=_queued("t-first"))
+            routes.poll.mock(return_value=_json(_completed("t-first")))
+            routes.download.mock(return_value=httpx.Response(200, content=b"v"))
+
+            backend = AgnesVideoBackend(api_key="k", base_url=_BASE_URL, clock=clock, jitter=zero_jitter)
+            await backend.generate(_request(tmp_path))
+
+        assert routes.poll.call_count == 1
+        assert clock.sleeps == [10]
+
+    async def test_waits_ten_seconds_between_in_progress_polls(self, tmp_path: Path):
+        clock = FakeAsyncClock()
+        in_progress = _json({"task_id": "t3", "status": "in_progress", "progress": 40})
+        with _agnes_api() as routes:
+            routes.submit.mock(return_value=_queued("t3"))
+            routes.poll.mock(side_effect=[in_progress, _json(_completed("t3"))])
+            routes.download.mock(return_value=httpx.Response(200, content=b"v"))
+
+            backend = AgnesVideoBackend(api_key="k", base_url=_BASE_URL, clock=clock, jitter=zero_jitter)
+            await backend.generate(_request(tmp_path))
+
+        assert routes.poll.call_count == 2
+        assert clock.sleeps == [10, 10]
+
+    async def test_poll_429_waits_sixty_five_seconds(self, tmp_path: Path):
+        clock = FakeAsyncClock()
+        with _agnes_api() as routes:
+            routes.submit.mock(return_value=_queued("t-429"))
+            routes.poll.mock(
+                side_effect=[
+                    httpx.Response(429, json={"error": "rate_limit_exceeded"}),
+                    _json(_completed("t-429")),
+                ]
+            )
+            routes.download.mock(return_value=httpx.Response(200, content=b"v"))
+
+            backend = AgnesVideoBackend(api_key="k", base_url=_BASE_URL, clock=clock, jitter=zero_jitter)
+            await backend.generate(_request(tmp_path))
+
+        assert routes.poll.call_count == 2
+        assert clock.sleeps == [10, 65]
+
+    async def test_submit_429_waits_sixty_five_seconds(self, tmp_path: Path):
+        clock = FakeAsyncClock()
+        with _agnes_api() as routes:
+            routes.submit.mock(
+                side_effect=[httpx.Response(429, json={"error": "rate_limit_exceeded"}), _queued("t-429")]
+            )
+            routes.poll.mock(return_value=_json(_completed("t-429")))
+            routes.download.mock(return_value=httpx.Response(200, content=b"v"))
+
+            backend = AgnesVideoBackend(api_key="k", base_url=_BASE_URL, clock=clock, jitter=zero_jitter)
+            result = await backend.generate(_request(tmp_path))
+
+        assert result.task_id == "t-429"
+        assert routes.submit.call_count == 2
+        assert clock.sleeps == [65, 10]
+
+    async def test_submit_503_waits_sixty_five_seconds(self, tmp_path: Path):
+        clock = FakeAsyncClock()
+        with _agnes_api() as routes:
+            routes.submit.mock(side_effect=[httpx.Response(503, text="Service busy"), _queued("t-503")])
+            routes.poll.mock(return_value=_json(_completed("t-503")))
+            routes.download.mock(return_value=httpx.Response(200, content=b"v"))
+
+            backend = AgnesVideoBackend(api_key="k", base_url=_BASE_URL, clock=clock, jitter=zero_jitter)
+            await backend.generate(_request(tmp_path))
+
+        assert routes.submit.call_count == 2
+        assert clock.sleeps == [65, 10]
+
+    async def test_query_429_waits_sixty_five_seconds(self, tmp_path: Path):
+        clock = FakeAsyncClock()
+        with _agnes_api() as routes:
+            routes.submit.mock(return_value=_queued("t-query"))
+            routes.poll.mock(return_value=_json({"task_id": "t-query", "video_id": "vid-1", "status": "completed"}))
+            routes.query.mock(
+                side_effect=[
+                    httpx.Response(429, json={"error": "rate_limit_exceeded"}),
+                    _json({"url": "https://cdn.agnes/from-query.mp4"}),
+                ]
+            )
+            routes.download.mock(return_value=httpx.Response(200, content=b"v"))
+
+            backend = AgnesVideoBackend(api_key="k", base_url=_BASE_URL, clock=clock, jitter=zero_jitter)
+            result = await backend.generate(_request(tmp_path))
+
+        assert result.video_uri == "https://cdn.agnes/from-query.mp4"
+        assert routes.query.call_count == 2
+        assert clock.sleeps == [10, 65]
 
     async def test_submit_read_timeout_wraps_ambiguous(self, tmp_path: Path):
         with _agnes_api() as routes, bounded_poll_clock():
@@ -817,3 +940,187 @@ class TestPollErrorRedaction:
 
         assert "SECRETKEY" not in str(excinfo.value)
         assert excinfo.value.response.status_code == 403
+
+
+def _queued_25(video_id: str = "vid-25", task_id: str = "task-25", *, model: str = "agnes-video-2.5") -> httpx.Response:
+    return _json({"task_id": task_id, "video_id": video_id, "status": "queued", "model": model})
+
+
+def _completed_25(video_id: str = "vid-25", url: str = "https://cdn.agnes/out.mp4") -> dict:
+    return {
+        "video_id": video_id,
+        "status": "completed",
+        "seconds": "5",
+        "metadata": {"url": url},
+    }
+
+
+class TestVideo25:
+    """agnes-video-2.5：官方 Videos 兼容字段 + 独立尾帧 + /agnesapi 轮询。"""
+
+    def _backend(self) -> AgnesVideoBackend:
+        return AgnesVideoBackend(api_key="k", base_url=_GATEWAY_BASE_URL, model="agnes-video-2.5")
+
+    async def test_text_to_video_uses_official_fields(self, tmp_path: Path):
+        with _agnes_api(base_url=_GATEWAY_BASE_URL) as routes:
+            routes.submit.mock(return_value=_queued_25())
+            routes.query.mock(return_value=_json(_completed_25()))
+            routes.download.mock(return_value=httpx.Response(200, content=b"mp4-bytes"))
+
+            result = await self._backend().generate(_request(tmp_path, prompt="rainy city", resolution="720p", seed=11))
+
+        body = _sent_payload(routes)
+        assert body["model"] == "agnes-video-2.5"
+        assert body["prompt"] == "rainy city"
+        assert body["seconds"] == "5"
+        assert body["mode"] == "text"
+        assert body["size"] == "720P"
+        assert body["aspect_ratio"] == "9:16"
+        assert body["seed"] == 11
+        assert "width" not in body
+        assert "height" not in body
+        assert "num_frames" not in body
+        assert "frame_rate" not in body
+        assert routes.poll.call_count == 0
+        assert str(only_request(routes.query).url) == (
+            "https://apihub.agnes-ai.com/agnesapi?video_id=vid-25&model_name=agnes-video-2.5"
+        )
+        assert result.model == "agnes-video-2.5"
+        assert result.video_uri == "https://cdn.agnes/out.mp4"
+
+    async def test_last_frame_only_is_keyframe(self, tmp_path: Path):
+        end = _write_image(tmp_path / "e.png", b"end-bytes")
+
+        with _agnes_api(base_url=_GATEWAY_BASE_URL) as routes:
+            routes.submit.mock(return_value=_queued_25())
+            routes.query.mock(return_value=_json(_completed_25()))
+            routes.download.mock(return_value=httpx.Response(200, content=b"v"))
+
+            await self._backend().generate(_request(tmp_path, end_image=end, resolution="1080p"))
+
+        body = _sent_payload(routes)
+        assert body["mode"] == "keyframe"
+        assert body["size"] == "1080P"
+        assert "first_frame" not in body
+        assert body["last_frame"].startswith("data:image/png;base64,")
+        assert routes.submit.call_count == 1
+
+    async def test_first_and_last_frames_are_keyframe(self, tmp_path: Path):
+        start = _write_image(tmp_path / "s.png", b"start-bytes")
+        end = _write_image(tmp_path / "e.png", b"end-bytes")
+
+        with _agnes_api(base_url=_GATEWAY_BASE_URL) as routes:
+            routes.submit.mock(return_value=_queued_25())
+            routes.query.mock(return_value=_json(_completed_25()))
+            routes.download.mock(return_value=httpx.Response(200, content=b"v"))
+
+            await self._backend().generate(_request(tmp_path, start_image=start, end_image=end))
+
+        body = _sent_payload(routes)
+        assert body["mode"] == "keyframe"
+        assert body["first_frame"].startswith("data:image/png;base64,")
+        assert body["last_frame"].startswith("data:image/png;base64,")
+        assert "extra_body" not in body
+
+    async def test_reference_images_use_reference_mode(self, tmp_path: Path):
+        refs = [_write_image(tmp_path / f"r{i}.png", f"r{i}".encode()) for i in range(2)]
+
+        with _agnes_api(base_url=_GATEWAY_BASE_URL) as routes:
+            routes.submit.mock(return_value=_queued_25())
+            routes.query.mock(return_value=_json(_completed_25()))
+            routes.download.mock(return_value=httpx.Response(200, content=b"v"))
+
+            await self._backend().generate(_request(tmp_path, reference_images=refs))
+
+        body = _sent_payload(routes)
+        assert body["mode"] == "reference"
+        assert len(body["images"]) == 2
+        assert all(item.startswith("data:image/png;base64,") for item in body["images"])
+
+    @pytest.mark.parametrize("duration", [3, 13])
+    async def test_out_of_range_duration_fails_loud(self, tmp_path: Path, duration: int):
+        with _agnes_api(base_url=_GATEWAY_BASE_URL) as routes:
+            with pytest.raises(VideoCapabilityError) as ei:
+                await self._backend().generate(_request(tmp_path, duration_seconds=duration))
+
+            assert ei.value.code == "video_duration_not_supported"
+            assert routes.submit.call_count == 0
+
+    async def test_submit_without_video_id_fails_loud(self, tmp_path: Path):
+        with _agnes_api(base_url=_GATEWAY_BASE_URL) as routes:
+            routes.submit.mock(return_value=_queued("task-only"))
+            with pytest.raises(RuntimeError, match="缺少 video_id"):
+                await self._backend().generate(_request(tmp_path))
+
+            assert routes.query.call_count == 0
+            assert routes.poll.call_count == 0
+
+
+class TestVideo25Flash:
+    """agnes-video-2.5-flash：与 2.5 同契约，size 固定 720P、参考图上限 5。"""
+
+    def _backend(self) -> AgnesVideoBackend:
+        return AgnesVideoBackend(api_key="k", base_url=_GATEWAY_BASE_URL, model="agnes-video-2.5-flash")
+
+    async def test_text_to_video_forces_720p_and_polls_with_model_name(self, tmp_path: Path):
+        with _agnes_api(base_url=_GATEWAY_BASE_URL) as routes:
+            routes.submit.mock(return_value=_queued_25(model="agnes-video-2.5-flash"))
+            routes.query.mock(return_value=_json(_completed_25()))
+            routes.download.mock(return_value=httpx.Response(200, content=b"mp4-bytes"))
+
+            result = await self._backend().generate(
+                _request(tmp_path, prompt="neon street", resolution="1080p", seed=7)
+            )
+
+        body = _sent_payload(routes)
+        assert body["model"] == "agnes-video-2.5-flash"
+        assert body["prompt"] == "neon street"
+        assert body["seconds"] == "5"
+        assert body["mode"] == "text"
+        assert body["size"] == "720P"
+        assert body["aspect_ratio"] == "9:16"
+        assert body["seed"] == 7
+        assert str(only_request(routes.query).url) == (
+            "https://apihub.agnes-ai.com/agnesapi?video_id=vid-25&model_name=agnes-video-2.5-flash"
+        )
+        assert result.model == "agnes-video-2.5-flash"
+
+    async def test_last_frame_only_is_keyframe(self, tmp_path: Path):
+        end = _write_image(tmp_path / "e.png", b"end-bytes")
+
+        with _agnes_api(base_url=_GATEWAY_BASE_URL) as routes:
+            routes.submit.mock(return_value=_queued_25(model="agnes-video-2.5-flash"))
+            routes.query.mock(return_value=_json(_completed_25()))
+            routes.download.mock(return_value=httpx.Response(200, content=b"v"))
+
+            await self._backend().generate(_request(tmp_path, end_image=end, resolution="1080p"))
+
+        body = _sent_payload(routes)
+        assert body["mode"] == "keyframe"
+        assert body["size"] == "720P"
+        assert "first_frame" not in body
+        assert body["last_frame"].startswith("data:image/png;base64,")
+
+    async def test_reference_images_exceeded_at_six(self, tmp_path: Path):
+        refs = [_write_image(tmp_path / f"r{i}.png", f"r{i}".encode()) for i in range(6)]
+
+        with _agnes_api(base_url=_GATEWAY_BASE_URL) as routes:
+            with pytest.raises(VideoCapabilityError) as ei:
+                await self._backend().generate(_request(tmp_path, reference_images=refs))
+
+            assert ei.value.code == "video_reference_images_exceeded"
+            assert routes.submit.call_count == 0
+
+    async def test_five_reference_images_are_accepted(self, tmp_path: Path):
+        refs = [_write_image(tmp_path / f"r{i}.png", f"r{i}".encode()) for i in range(5)]
+
+        with _agnes_api(base_url=_GATEWAY_BASE_URL) as routes:
+            routes.submit.mock(return_value=_queued_25(model="agnes-video-2.5-flash"))
+            routes.query.mock(return_value=_json(_completed_25()))
+            routes.download.mock(return_value=httpx.Response(200, content=b"v"))
+
+            await self._backend().generate(_request(tmp_path, reference_images=refs))
+
+        body = _sent_payload(routes)
+        assert body["mode"] == "reference"
+        assert len(body["images"]) == 5

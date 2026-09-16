@@ -10,7 +10,7 @@ import asyncio
 import itertools
 import json
 import threading
-from collections.abc import AsyncIterator, Callable, Generator, Mapping
+from collections.abc import AsyncIterator, Callable, Generator, Iterator, Mapping
 from contextlib import contextmanager
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -605,6 +605,24 @@ def instructor_api_call_exhausted(cause: Exception) -> InstructorRetryException:
     )
     exc.__cause__ = cause
     return exc
+
+
+class FakeAsyncClock:
+    """轮询时钟替身：sleep 只记不等，monotonic 按给定序列或固定步长推进。"""
+
+    def __init__(self, times: list[float] | None = None, *, step: float = 1.0) -> None:
+        self._times: Iterator[float] = iter(times) if times is not None else itertools.count(0.0, step)
+        self.sleeps: list[float] = []
+
+    def monotonic(self) -> float:
+        return next(self._times)
+
+    async def sleep(self, delay: float) -> None:
+        self.sleeps.append(delay)
+
+
+def zero_jitter(_lo: float, _hi: float) -> float:
+    return 0.0
 
 
 @contextmanager

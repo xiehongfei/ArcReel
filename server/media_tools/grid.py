@@ -199,7 +199,7 @@ async def handle_generate_grid(
             script_filename=script_filename,
         )
         project_path = ctx.project_path
-        items, id_field, _, _, _ = get_storyboard_items(script)
+        items, id_field, char_field, _, _ = get_storyboard_items(script)
         aspect_ratio = video_aspect_ratio_of(project)
         style = project.get("style", "")
         resolver = active_artifact_currency_resolver(project_path, project)
@@ -366,6 +366,8 @@ async def handle_generate_grid(
                     style=style,
                     aspect_ratio=aspect_ratio,
                     grid_aspect_ratio=layout.grid_aspect_ratio,
+                    char_field=char_field,
+                    characters=project.get("characters"),
                 )
                 grid = next(
                     (

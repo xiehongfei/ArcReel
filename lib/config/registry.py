@@ -352,6 +352,22 @@ def _agnes_image_pricing(model_id: str, per_image: float) -> PerImageFlat:
     return PerImageFlat(rates={model_id: per_image}, default_model=model_id, currency="USD")
 
 
+# Agnes Image 2.5 Flash 按输出分辨率档位计费（刊例价）；不纳入限时 $0。
+def _agnes_image_25_pricing(model_id: str) -> PerImageByResolution:
+    return PerImageByResolution(
+        rates={
+            model_id: {
+                "1K": 0.010,
+                "2K": 0.018,
+                "3K": 0.021,
+                "4K": 0.024,
+            }
+        },
+        default_model=model_id,
+        currency="USD",
+    )
+
+
 # Agnes 文本费率（美元/百万 token），官方原价。
 def _agnes_text_pricing(model_id: str, input_rate: float, output_rate: float) -> PerToken:
     return PerToken(
@@ -368,6 +384,35 @@ def _agnes_video_pricing(model_id: str, per_second: float) -> PerSecondMatrix:
         default_model=model_id,
         dimensions="flat",
         currency="USD",
+    )
+
+
+# Agnes Video 2.5 按分辨率档位计费（刊例价）；1K 与 1080P 同价。Auto 未指定分辨率时按官方默认 720P。
+def _agnes_video_25_pricing(model_id: str) -> PerSecondMatrix:
+    return PerSecondMatrix(
+        rates={
+            model_id: {
+                ("720p", None): 0.025,
+                ("1080p", None): 0.040,
+                ("1k", None): 0.040,
+                ("2k", None): 0.055,
+            }
+        },
+        default_model=model_id,
+        dimensions="resolution_only",
+        currency="USD",
+        default_resolution="720p",
+    )
+
+
+# Agnes Video 2.5 Flash 仅 720P；刊例价 $0.025/s，不纳入限时 $0 促销。
+def _agnes_video_25_flash_pricing(model_id: str) -> PerSecondMatrix:
+    return PerSecondMatrix(
+        rates={model_id: {("720p", None): 0.025}},
+        default_model=model_id,
+        dimensions="resolution_only",
+        currency="USD",
+        default_resolution="720p",
     )
 
 
@@ -1353,19 +1398,37 @@ PROVIDER_REGISTRY: dict[str, ProviderMeta] = {
         secret_keys=["api_key"],
         models={
             # --- text ---
-            # agnes-2.0-flash：OpenAI 兼容 /v1/chat/completions，原生 response_format json_schema
-            # 结构化输出，失败再降级 Instructor（见 AgnesTextBackend）。
+            # agnes-2.5-flash：官方当前文本型号，OpenAI 兼容 /v1/chat/completions，原生
+            # response_format json_schema + image_url 图像理解。2.0 已废弃但仍可选手选。
+            "agnes-2.5-flash": ModelInfo(
+                display_name="Agnes 2.5 Flash",
+                media_type="text",
+                capabilities=["text_generation", "structured_output", "vision"],
+                default=True,
+                pricing=_agnes_text_pricing("agnes-2.5-flash", 0.05, 0.15),
+            ),
+            # agnes-2.0-flash：兼容保留。OpenAI 兼容 chat/completions，结构化输出；
+            # vision 未实测，不纳入能力集。
             "agnes-2.0-flash": ModelInfo(
                 display_name="Agnes 2.0 Flash",
                 media_type="text",
                 capabilities=["text_generation", "structured_output"],
-                default=True,
                 pricing=_agnes_text_pricing("agnes-2.0-flash", 0.03, 0.15),
             ),
             # --- image ---
+            # agnes-image-2.5-flash：与 2.1 同一 /images/generations 契约（T2I + I2I + 多图合成）。
+            # 官方已公开该型号；apihub LiteLLM 若未登记会 400 LLM Provider NOT provided。
+            # resolutions 仍是保守 UI 档位（backend 长边收口 2048）；刊例价按输出分辨率。
+            "agnes-image-2.5-flash": ModelInfo(
+                display_name="Agnes Image 2.5 Flash",
+                media_type="image",
+                capabilities=["text_to_image", "image_to_image"],
+                resolutions=["1K", "2K"],
+                pricing=_agnes_image_25_pricing("agnes-image-2.5-flash"),
+            ),
             # agnes-image-2.1-flash：OpenAI 兼容 /images/generations 单步同步，T2I + I2I。
-            # 仅注册 2.1；2.0 与 2.1 共用相同的价格和字段契约，model 目录收敛到 2.1。
-            # resolutions 是保守的 UI 档位；实际尺寸由 backend aspect_size 计算、与此无耦合。
+            # 当前默认：网关已登记。2.0 未单独登记（与 2.1 同契约）。resolutions 是保守 UI
+            # 档位；实际尺寸由 backend aspect_size 计算、与此无耦合。
             "agnes-image-2.1-flash": ModelInfo(
                 display_name="Agnes Image 2.1 Flash",
                 media_type="image",
@@ -1386,11 +1449,31 @@ PROVIDER_REGISTRY: dict[str, ProviderMeta] = {
                 resolutions=["480p", "720p", "1080p"],
                 pricing=_agnes_video_pricing("agnes-video-v2.0", 0.005),
             ),
+            # agnes-video-2.5：官方 OpenAI Videos 兼容异步 /v1/videos。mode=text/keyframe/reference；
+            # 首帧、尾帧可单独或成对使用；时长 4–12s；分辨率 720P/1080P/1K/2K。
+            "agnes-video-2.5": ModelInfo(
+                display_name="Agnes Video 2.5",
+                media_type="video",
+                capabilities=[],
+                supported_durations=list(range(4, 13)),
+                resolutions=["720p", "1080p", "1K", "2K"],
+                pricing=_agnes_video_25_pricing("agnes-video-2.5"),
+            ),
+            # agnes-video-2.5-flash：与 2.5 同一 Videos 契约（text/keyframe/reference、可单独尾帧），
+            # 但 size 仅 720P、参考图最多 5 张、不支持参考视频。
+            "agnes-video-2.5-flash": ModelInfo(
+                display_name="Agnes Video 2.5 Flash",
+                media_type="video",
+                capabilities=[],
+                supported_durations=list(range(4, 13)),
+                resolutions=["720p"],
+                pricing=_agnes_video_25_flash_pricing("agnes-video-2.5-flash"),
+            ),
         },
         default_base_url=AGNES_BASE_URL,
-        # Agnes 视频上游对并发敏感，出厂串行（默认 1）避免主动制造 503 Service busy；
-        # 用户可经 video_max_workers 覆盖。其余 lane 未声明，走全局默认。
-        default_concurrency={"video": 1},
+        # Agnes 上游对并发与 RPM 敏感，图像/视频出厂各 lane 串行，避免主动制造 503/429；
+        # 用户可经 image_max_workers / video_max_workers 覆盖。
+        default_concurrency={"image": 1, "video": 1},
     ),
 }
 

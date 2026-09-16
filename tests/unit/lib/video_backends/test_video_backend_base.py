@@ -1,7 +1,5 @@
 import asyncio
-import itertools
 import logging
-from collections.abc import Iterator
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
@@ -40,26 +38,9 @@ from lib.video_backends.base import (
     url_origin,
     with_artifact_retry,
 )
+from tests.fakes import FakeAsyncClock as _FakeClock
 from tests.fakes import bounded_poll_clock, captured_provider_job_ids
 from tests.http_capture import capture_http
-
-
-class _FakeClock:
-    """轮询时钟替身：sleep 只记不等，monotonic 按给定序列或固定步长推进。
-
-    不传 times 时表按 step 无限推进——终态判定失灵的回归会在若干轮内撞上 max_wait 抛
-    TimeoutError，而不是以近乎为零的真实耗时空转成挂起。
-    """
-
-    def __init__(self, times: list[float] | None = None, *, step: float = 1.0) -> None:
-        self._times: Iterator[float] = iter(times) if times is not None else itertools.count(0.0, step)
-        self.sleeps: list[float] = []
-
-    def monotonic(self) -> float:
-        return next(self._times)
-
-    async def sleep(self, delay: float) -> None:
-        self.sleeps.append(delay)
 
 
 def _http_status_error(status_code: int, *, text: str = "boom") -> httpx.HTTPStatusError:
@@ -398,6 +379,58 @@ class TestPollWithRetry:
 
         assert clock.sleeps == [5, 5]
         assert poll_fn.await_count == 3
+
+    async def test_retry_wait_seconds_replaces_exponential_backoff(self):
+        poll_fn = AsyncMock(side_effect=[_http_status_error(429), _http_status_error(503), "done"])
+        clock = _FakeClock(step=0)
+
+        result = await poll_with_retry(
+            poll_fn=poll_fn,
+            is_done=lambda r: r == "done",
+            is_failed=lambda _r: None,
+            max_wait=3600,
+            poll_interval=10,
+            retry_if=should_retry_poll,
+            retry_wait_seconds=65,
+            clock=clock,
+        )
+
+        assert result == "done"
+        assert clock.sleeps == [65, 65]
+
+    async def test_retry_wait_seconds_keeps_longer_retry_after(self):
+        poll_fn = AsyncMock(side_effect=[_http_status_error_with_headers(429, {"Retry-After": "90"}), "done"])
+        clock = _FakeClock(step=0)
+
+        await poll_with_retry(
+            poll_fn=poll_fn,
+            is_done=lambda r: r == "done",
+            is_failed=lambda _r: None,
+            max_wait=3600,
+            poll_interval=10,
+            retry_if=should_retry_poll,
+            retry_wait_seconds=65,
+            clock=clock,
+        )
+
+        assert clock.sleeps == [90]
+
+    async def test_retry_wait_seconds_ignores_shorter_retry_after(self):
+        poll_fn = AsyncMock(side_effect=[_http_status_error_with_headers(429, {"Retry-After": "37"}), "done"])
+        clock = _FakeClock(step=0)
+
+        await poll_with_retry(
+            poll_fn=poll_fn,
+            is_done=lambda r: r == "done",
+            is_failed=lambda _r: None,
+            max_wait=3600,
+            poll_interval=10,
+            retry_if=should_retry_poll,
+            retry_wait_seconds=65,
+            clock=clock,
+        )
+
+        assert clock.sleeps == [65]
 
 
 class TestNormalizeProviderStatus:

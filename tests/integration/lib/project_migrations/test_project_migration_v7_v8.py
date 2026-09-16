@@ -30,7 +30,9 @@ from lib.artifact_manifest import (
     ProjectArtifactManifestAdapter,
     compose_video_artifact_basis,
 )
+from lib.artifact_planner import TargetStatePlanner
 from lib.artifact_provenance import build_ad_episode_script_basis, build_episode_script_basis, build_script_plan_basis
+from lib.grid.character_identity import project_grid_character_context
 from lib.grid.layout import grid_aspect_ratio_for
 from lib.grid.models import GridGeneration, build_frame_chain
 from lib.narration_delivery import TtsSynthesisSettings, build_narration_audio_basis_from_canonical_text
@@ -1627,7 +1629,7 @@ def test_v7_activation_backfills_grid_composite_and_split_members(tmp_path: Path
         "grid_storyboard": True,
         "style": "水墨",
         "aspect_ratio": "9:16",
-        "characters": {},
+        "characters": {"阿黎": {"description": "银色短发"}},
         "scenes": {},
         "props": {},
         "products": {},
@@ -1638,7 +1640,7 @@ def test_v7_activation_backfills_grid_composite_and_split_members(tmp_path: Path
             "segment_id": resource_id,
             "image_prompt": {"scene": scene, "composition": {"shot_type": "Medium Shot"}},
             "video_prompt": {"action": action},
-            "characters_in_segment": [],
+            "characters_in_segment": ["阿黎"],
             "scenes": [],
             "props": [],
             "generated_assets": {
@@ -1680,6 +1682,8 @@ def test_v7_activation_backfills_grid_composite_and_split_members(tmp_path: Path
         (project_dir / "storyboards" / f"scene_{resource_id}.png").write_bytes(resource_id.encode())
 
     migrate_v7_to_v8(project_dir)
+    project["schema_version"] = CURRENT_SCHEMA_VERSION
+    _write_json(project_dir / "project.json", project)
 
     members = tuple(
         GridStoryboardVisual(
@@ -1689,6 +1693,11 @@ def test_v7_activation_backfills_grid_composite_and_split_members(tmp_path: Path
         )
         for item in items
     )
+    character_context = project_grid_character_context(
+        items,
+        char_field="characters_in_segment",
+        characters=project["characters"],
+    )
     composite = build_grid_composite_visual_basis(
         group_id=grid.id,
         members=members,
@@ -1696,6 +1705,7 @@ def test_v7_activation_backfills_grid_composite_and_split_members(tmp_path: Path
         columns=2,
         style="水墨",
         grid_aspect_ratio=grid_aspect_ratio_for(2, 2, "9:16"),
+        character_context=character_context,
     )
     entries = _stored_entries(project_dir)
     assert entries[ArtifactKey.episode_grid(1, grid.id).encode()]["basis_digest"] == composite.digest
@@ -1709,5 +1719,22 @@ def test_v7_activation_backfills_grid_composite_and_split_members(tmp_path: Path
             columns=2,
             style="水墨",
             member_aspect_ratio="9:16",
+            character_context=character_context,
         )
         assert entries[ArtifactKey.episode_storyboard(1, resource_id).encode()]["basis_digest"] == member.digest
+
+    grid_key = ArtifactKey.episode_grid(1, grid.id)
+    items[0]["video_prompt"]["action"] = "跃下屋顶"
+    _write_json(
+        project_dir / "scripts" / "episode_1.json",
+        {"episode": 1, "content_mode": "narration", "segments": items},
+    )
+    action_only_entry = TargetStatePlanner(project_dir).resolve_key(grid_key)
+    assert action_only_entry is not None
+    assert action_only_entry.basis_digest == composite.digest
+
+    project["characters"]["阿黎"]["description"] = "黑色长发"
+    _write_json(project_dir / "project.json", project)
+    changed_description_entry = TargetStatePlanner(project_dir).resolve_key(grid_key)
+    assert changed_description_entry is not None
+    assert changed_description_entry.basis_digest != composite.digest

@@ -16,6 +16,7 @@ from lib.artifact_manifest import (
     ProjectArtifactManifestAdapter,
     compose_video_artifact_basis,
 )
+from lib.grid.character_identity import GridCharacterContext, GridCharacterIdentity
 from lib.reference_video.request_projection import ResolvedReferenceAsset
 from lib.script_models import ReferenceResource
 from lib.visual_artifact_provenance import (
@@ -326,7 +327,7 @@ def test_grid_composite_and_member_bases_keep_member_changes_local(tmp_path: Pat
     assert member_basis(changed_second, 1).digest != second.digest
 
 
-def test_grid_member_tracks_transition_source_and_replaced_composite(tmp_path: Path) -> None:
+def test_grid_member_ignores_video_actions_and_tracks_replaced_composite(tmp_path: Path) -> None:
     composite = tmp_path / "grid.png"
     composite.write_bytes(b"grid-v1")
     members = _grid_members()
@@ -345,10 +346,10 @@ def test_grid_member_tracks_transition_source_and_replaced_composite(tmp_path: P
 
     first = build(members, 0)
     second = build(members, 1)
-    changed_transition = _grid_members(first_action="阿黎跃下屋顶")
+    changed_action = _grid_members(first_action="阿黎跃下屋顶")
 
-    assert build(changed_transition, 0).digest == first.digest
-    assert build(changed_transition, 1).digest != second.digest
+    assert build(changed_action, 0).digest == first.digest
+    assert build(changed_action, 1).digest == second.digest
 
     composite.write_bytes(b"grid-v2")
 
@@ -356,11 +357,11 @@ def test_grid_member_tracks_transition_source_and_replaced_composite(tmp_path: P
     assert build(members, 1).digest != second.digest
 
 
-def test_grid_composite_ignores_last_action_that_is_not_rendered(tmp_path: Path) -> None:
+def test_grid_composite_ignores_all_video_actions(tmp_path: Path) -> None:
     reference = tmp_path / "reference.png"
     reference.write_bytes(b"visual")
     members = _grid_members()
-    changed_last = (*members[:2], replace(members[2], video_prompt={"action": "另一动作"}))
+    changed_first = (replace(members[0], video_prompt={"action": "另一动作"}), *members[1:])
 
     def build(current_members: tuple[GridStoryboardVisual, ...]):
         return build_grid_composite_visual_basis(
@@ -373,7 +374,55 @@ def test_grid_composite_ignores_last_action_that_is_not_rendered(tmp_path: Path)
             references=(VisualReference(path=reference, role="asset_sheet"),),
         )
 
-    assert build(changed_last).digest == build(members).digest
+    assert build(changed_first).digest == build(members).digest
+
+
+def test_grid_bases_track_character_rosters_and_descriptions_locally(tmp_path: Path) -> None:
+    composite = tmp_path / "grid.png"
+    composite.write_bytes(b"grid-v1")
+    members = _grid_members()
+    first_context = GridCharacterContext(
+        identities=(
+            GridCharacterIdentity(name="阿黎", description="银色短发"),
+            GridCharacterIdentity(name="掌柜", description="黑色长须"),
+        ),
+        cell_characters=(("阿黎",), ("阿黎", "掌柜"), ()),
+    )
+    changed_context = GridCharacterContext(
+        identities=(
+            GridCharacterIdentity(name="阿黎", description="银色短发"),
+            GridCharacterIdentity(name="掌柜", description="白色长须"),
+        ),
+        cell_characters=(("阿黎",), ("阿黎", "掌柜"), ()),
+    )
+
+    def composite_basis(context: GridCharacterContext):
+        return build_grid_composite_visual_basis(
+            group_id="grid_1",
+            members=members,
+            rows=2,
+            columns=2,
+            style="水墨",
+            grid_aspect_ratio="1:1",
+            character_context=context,
+        )
+
+    def member_basis(context: GridCharacterContext, cell_index: int):
+        return build_grid_member_storyboard_visual_basis(
+            group_id="grid_1",
+            members=members,
+            cell_index=cell_index,
+            composite_image=composite,
+            rows=2,
+            columns=2,
+            style="水墨",
+            member_aspect_ratio="16:9",
+            character_context=context,
+        )
+
+    assert composite_basis(changed_context).digest != composite_basis(first_context).digest
+    assert member_basis(changed_context, 0).digest == member_basis(first_context, 0).digest
+    assert member_basis(changed_context, 1).digest != member_basis(first_context, 1).digest
 
 
 def test_grid_composite_tracks_only_the_aspect_ratio_sent_for_the_composite(tmp_path: Path) -> None:

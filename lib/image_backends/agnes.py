@@ -10,11 +10,17 @@ from __future__ import annotations
 import asyncio
 import base64
 import logging
+from collections.abc import Callable
 from pathlib import Path
 
 import httpx
 
-from lib.agnes_shared import agnes_base_url, agnes_headers, resolve_agnes_api_key
+from lib.agnes_shared import (
+    AGNES_RETRY_BACKOFF_SECONDS,
+    agnes_base_url,
+    agnes_headers,
+    resolve_agnes_api_key,
+)
 from lib.aspect_size import IMAGE_TIER_SHORT_EDGE, aspect_size, resolution_to_short_edge
 from lib.image_backends.base import (
     ImageCapability,
@@ -26,7 +32,7 @@ from lib.image_backends.base import (
 )
 from lib.logging_utils import format_kwargs_for_log
 from lib.providers import PROVIDER_AGNES
-from lib.retry import with_retry_async
+from lib.retry import DEFAULT_MAX_ATTEMPTS, AsyncClock, retry_async
 from lib.video_backends.base import should_retry_submit, submit_post, with_artifact_retry
 
 logger = logging.getLogger(__name__)
@@ -79,11 +85,15 @@ class AgnesImageBackend:
         model: str | None = None,
         base_url: str | None = None,
         http_timeout: float = 120.0,
+        clock: AsyncClock | None = None,
+        jitter: Callable[[float, float], float] | None = None,
     ) -> None:
         self._api_key = resolve_agnes_api_key(api_key)
         self._base_url = agnes_base_url(base_url)
         self._model = model or DEFAULT_MODEL
         self._http_timeout = http_timeout
+        self._clock = clock
+        self._jitter = jitter
 
     @property
     def name(self) -> str:
@@ -131,7 +141,6 @@ class AgnesImageBackend:
             image_uri=image_uri,
         )
 
-    @with_retry_async(retry_if=should_retry_submit)
     async def _submit(self, payload: dict) -> dict:
         """单步图像生成 POST（非幂等「建图 + 计费」），返回解析后的响应体。
 
@@ -139,22 +148,33 @@ class AgnesImageBackend:
         重复计费。submit_post 把歧义传输错误转 AmbiguousSubmitError 终态失败避免重复计费；
         >=400 落 body 日志 + 抛 HTTPStatusError，交 should_retry_submit 按状态码分流。
         """
-        logger.info(
-            "调用 %s 图片 API model=%s body=%s",
-            self.name,
-            self._model,
-            format_kwargs_for_log(_safe_body_for_log(payload)),
-        )
-        async with httpx.AsyncClient(timeout=self._http_timeout) as client:
-            resp = await submit_post(
-                lambda: client.post(
-                    f"{self._base_url}{_IMAGE_ENDPOINT}",
-                    json=payload,
-                    headers=agnes_headers(self._api_key),
-                ),
-                provider=PROVIDER_AGNES,
+
+        async def submit() -> dict:
+            logger.info(
+                "调用 %s 图片 API model=%s body=%s",
+                self.name,
+                self._model,
+                format_kwargs_for_log(_safe_body_for_log(payload)),
             )
-            return resp.json()
+            async with httpx.AsyncClient(timeout=self._http_timeout) as client:
+                resp = await submit_post(
+                    lambda: client.post(
+                        f"{self._base_url}{_IMAGE_ENDPOINT}",
+                        json=payload,
+                        headers=agnes_headers(self._api_key),
+                    ),
+                    provider=PROVIDER_AGNES,
+                )
+                return resp.json()
+
+        return await retry_async(
+            submit,
+            max_attempts=DEFAULT_MAX_ATTEMPTS,
+            backoff_seconds=AGNES_RETRY_BACKOFF_SECONDS,
+            retry_if=should_retry_submit,
+            clock=self._clock,
+            jitter=self._jitter,
+        )
 
     def _resolve_dimensions(self, request: ImageGenerationRequest) -> tuple[int, int]:
         """按「比例优先、清晰度其次」算出 (宽, 高)。

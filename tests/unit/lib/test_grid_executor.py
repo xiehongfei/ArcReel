@@ -238,6 +238,29 @@ class TestCollectGridReferenceImages:
         assert len(paths) == 1  # Deduplicated
         assert len(metadata) == 1  # Deduplicated
 
+    def test_caps_union_at_nine_unique_sheets(self, project_with_script):
+        project_data = json.loads((project_with_script / "project.json").read_text(encoding="utf-8"))
+        names = [f"hero{i}" for i in range(10)]
+        for name in names:
+            project_data["characters"][name] = {
+                "description": name,
+                "character_sheet": f"characters/{name}.png",
+            }
+            Image.new("RGB", (4, 4)).save(project_with_script / "characters" / f"{name}.png")
+        (project_with_script / "project.json").write_text(json.dumps(project_data))
+
+        script = json.loads((project_with_script / "scripts" / "episode_1.json").read_text(encoding="utf-8"))
+        script["segments"][0]["characters_in_segment"] = names
+        (project_with_script / "scripts" / "episode_1.json").write_text(json.dumps(script))
+        for name in names:
+            _register_sheet(project_with_script, "characters", name)
+
+        paths, metadata = _grid_reference_images(project_with_script, ["E1S01"])
+        assert paths is not None
+        assert len(paths) == 9
+        assert [Path(str(path)).stem for path in paths] == names[:9]
+        assert [item["name"] for item in metadata] == names[:9]
+
 
 class TestExecuteGridTask:
     @pytest.fixture
@@ -364,9 +387,9 @@ class TestExecuteGridTask:
             {"key": "ref_too_many_images", "params": {"count": 3, "model": "gpt-image-2", "max_count": 2}}
         ]
         prompt = captured[0]["prompt"]
-        assert prompt.startswith("Reference_Images: 图1、图2为角色参考图。")
-        assert "图1站在门口" in prompt
-        assert "图2站在门口" in prompt
+        assert prompt.startswith("Reference_Images: 图1为角色「hero1」参考图；图2为角色「hero2」参考图。")
+        assert "hero1（图1）站在门口" in prompt
+        assert "hero2（图2）站在门口" in prompt
         # 第 3 张没随请求发出，正文只留裸名，不指认一个不存在的图3
         assert "图3" not in prompt
         assert "hero3站在门口" in prompt
@@ -597,6 +620,8 @@ class TestExecuteGridTask:
             style="realistic",
             aspect_ratio="9:16",
             grid_aspect_ratio=grid_aspect_ratio_for(2, 2, "9:16"),
+            char_field="characters_in_segment",
+            characters=project.get("characters"),
         )
         assert captured_prompt == [expected]
         assert GridManager(project_with_script).get(grid_json.id).prompt == expected

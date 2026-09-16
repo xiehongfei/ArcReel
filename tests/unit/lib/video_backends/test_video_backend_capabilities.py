@@ -196,6 +196,8 @@ class TestVideoCapabilitiesForModel:
 #: 表放在本文件而非注册表测试里：音轨形态的真相源是 backend 的 VideoCapabilities，守卫应贴着真相源。
 _VIDEO_AUDIO_STANCES: dict[tuple[str, str], tuple[str, str]] = {
     ("agnes", "agnes-video-v2.0"): ("always_off", "always_off"),
+    ("agnes", "agnes-video-2.5"): ("always_off", "always_off"),
+    ("agnes", "agnes-video-2.5-flash"): ("always_off", "always_off"),
     ("ark", "doubao-seedance-1-5-pro-251215"): ("controllable", "controllable"),
     ("ark", "doubao-seedance-2-0-260128"): ("controllable", "controllable"),
     ("ark", "doubao-seedance-2-0-fast-260128"): ("controllable", "controllable"),

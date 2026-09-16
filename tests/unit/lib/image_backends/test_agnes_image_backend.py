@@ -19,7 +19,7 @@ from lib.image_backends.base import (
     ReferenceImage,
 )
 from lib.providers import PROVIDER_AGNES
-from tests.fakes import bounded_poll_clock
+from tests.fakes import FakeAsyncClock, bounded_poll_clock, zero_jitter
 from tests.http_capture import capture_http, only_request, request_json
 
 _ENDPOINT = "https://apihub.agnes-ai.com/v1/images/generations"
@@ -114,7 +114,20 @@ class TestTextToImage:
             b = AgnesImageBackend(api_key="sk")
             await b.generate(ImageGenerationRequest(prompt="x", output_path=tmp_path / "o.png"))
 
-        assert str(only_request(route).url) == _ENDPOINT
+        request = only_request(route)
+        assert str(request.url) == _ENDPOINT
+        assert request_json(request)["model"] == "agnes-image-2.1-flash"
+
+    async def test_explicit_25_flash_model_is_forwarded(self, tmp_path: Path):
+        download = AsyncMock()
+        with _generate_route(_img_response(), download) as route:
+            from lib.image_backends.agnes import AgnesImageBackend
+
+            b = AgnesImageBackend(api_key="sk", model="agnes-image-2.5-flash")
+            result = await b.generate(ImageGenerationRequest(prompt="x", output_path=tmp_path / "o.png"))
+
+        assert request_json(only_request(route))["model"] == "agnes-image-2.5-flash"
+        assert result.model == "agnes-image-2.5-flash"
 
 
 class TestDimensions:
@@ -291,15 +304,37 @@ class TestResponseHandling:
 class TestHttpErrors:
     async def test_400_surfaces_httpstatuserror_single_call(self, tmp_path: Path):
         download = AsyncMock()
+        clock = FakeAsyncClock()
         with _generate_route(httpx.Response(400, text="boom"), download) as route:
             from lib.image_backends.agnes import AgnesImageBackend
 
-            b = AgnesImageBackend(api_key="sk")
+            b = AgnesImageBackend(api_key="sk", clock=clock, jitter=zero_jitter)
             with pytest.raises(httpx.HTTPStatusError) as ei:
                 await b.generate(ImageGenerationRequest(prompt="p", output_path=tmp_path / "o.png"))
         assert ei.value.response.status_code == 400
         assert route.call_count == 1
         download.assert_not_called()
+        assert clock.sleeps == []
+
+    async def test_429_waits_sixty_five_seconds_then_retries(self, tmp_path: Path):
+        download = AsyncMock()
+        clock = FakeAsyncClock()
+        with capture_http() as router:
+            route = router.post(_ENDPOINT).mock(
+                side_effect=[
+                    httpx.Response(429, json={"error": "rate_limit_exceeded"}),
+                    _img_response(),
+                ]
+            )
+            with patch("lib.image_backends.agnes.download_image_to_path", download):
+                from lib.image_backends.agnes import AgnesImageBackend
+
+                b = AgnesImageBackend(api_key="sk", clock=clock, jitter=zero_jitter)
+                await b.generate(ImageGenerationRequest(prompt="p", output_path=tmp_path / "o.png"))
+
+        assert route.call_count == 2
+        assert clock.sleeps == [65]
+        download.assert_awaited_once()
 
 
 class TestRetryScope:

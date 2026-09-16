@@ -9,12 +9,15 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from math import gcd
 
+from lib.asset_types import asset_name_comparison_key
+from lib.grid.character_identity import GridCharacterContext, project_grid_character_context
 from lib.reference_image_numbering import (
     REFERENCE_IMAGES_KEY,
     ReferenceImageSlot,
+    mention_replacements,
     reference_images_declaration,
-    render_reference_mentions,
 )
+from lib.reference_video.text_parser import render_mentions
 
 
 def pending_grid_prompt_ids(scenes: Sequence[Mapping[str, object]], id_field: str) -> list[str]:
@@ -61,19 +64,39 @@ def project_grid_image_prompt(image_prompt: object) -> str | dict[str, object]:
     return {"scene": scene, "composition": composition}
 
 
-def _extract_image_desc(scene: dict, references: Sequence[ReferenceImageSlot] = ()) -> str:
+def _render_grid_mentions(
+    text: str,
+    references: Sequence[ReferenceImageSlot],
+    character_names: frozenset[str],
+) -> str:
+    replacements = mention_replacements(references)
+
+    def _replacement(name: str) -> str:
+        reference = replacements.get(name)
+        if name in character_names:
+            return f"{name}（{reference}）" if reference else name
+        return reference or name
+
+    return render_mentions(text, _replacement)
+
+
+def _extract_image_desc(
+    scene: dict,
+    references: Sequence[ReferenceImageSlot] = (),
+    character_names: frozenset[str] = frozenset(),
+) -> str:
     """Extract image description from a scene.
 
     If image_prompt is a dict, join scene + composition fields.
-    If string, return as-is. ``@[登记名]`` in the scene text is rendered against *references*.
+    If string, return as-is. Character mentions retain their logical name alongside 图N.
     """
     image_prompt = project_grid_image_prompt(scene.get("image_prompt", ""))
     if isinstance(image_prompt, str):
-        return render_reference_mentions(image_prompt, references)
+        return _render_grid_mentions(image_prompt, references, character_names)
     parts: list[str] = []
     scene_text = image_prompt["scene"]
     if scene_text:
-        parts.append(render_reference_mentions(str(scene_text), references))
+        parts.append(_render_grid_mentions(str(scene_text), references, character_names))
     composition = image_prompt["composition"]
     if isinstance(composition, Mapping):
         comp_parts = [f"{key}: {value}" for key, value in composition.items()]
@@ -82,17 +105,48 @@ def _extract_image_desc(scene: dict, references: Sequence[ReferenceImageSlot] = 
     return "；".join(parts) if parts else ""
 
 
-def _extract_action(scene: dict) -> str:
-    """Extract closing action from video_prompt.
+def _reference_character_names(references: Sequence[ReferenceImageSlot]) -> frozenset[str]:
+    return frozenset(
+        asset_name_comparison_key(slot.logical_id)
+        for slot in references
+        if slot.logical_type == "character" and slot.logical_id
+    )
 
-    If dict, return action field. If string, return as-is.
-    """
-    video_prompt = scene.get("video_prompt")
-    if video_prompt is None:
-        return ""
-    if isinstance(video_prompt, dict):
-        return str(video_prompt.get("action", ""))
-    return str(video_prompt)
+
+def _character_label(name: str, references: Sequence[ReferenceImageSlot]) -> str:
+    reference = mention_replacements(references).get(name)
+    return f"{name}（{reference}）" if reference else name
+
+
+def _append_character_identities(
+    lines: list[str],
+    context: GridCharacterContext,
+    references: Sequence[ReferenceImageSlot],
+) -> None:
+    if not context.identities:
+        return
+    lines.append("【角色身份】")
+    for identity in context.identities:
+        label = _character_label(identity.name, references)
+        suffix = f"：{identity.description}" if identity.description else ""
+        lines.append(f"- {label}{suffix}")
+    lines.append("- 各角色必须忠实于各自身份说明与参考图，面部、发型、体型、服装和配饰不得互换")
+    lines.append("")
+
+
+def _append_cell_roster(
+    lines: list[str],
+    roster: tuple[str, ...],
+    references: Sequence[ReferenceImageSlot],
+) -> None:
+    if not roster:
+        return
+    labels = "、".join(f"{_character_label(name, references)}1人" for name in roster)
+    lines.append(f"  本格角色：{labels}。")
+    if len(roster) == 1:
+        lines.append("  本格只出现上述角色1人，同一角色不得重复出现。")
+    else:
+        lines.append("  本格中上述角色各恰好1人，身份与外观不得复制、融合、替换或互换。")
 
 
 def _compute_panel_aspect(grid_aspect_ratio: str, rows: int, cols: int) -> str:
@@ -117,8 +171,11 @@ def build_grid_prompt(
     aspect_ratio: str = "16:9",
     grid_aspect_ratio: str | None = None,
     references: Sequence[ReferenceImageSlot] = (),
+    char_field: str | None = None,
+    characters: object = None,
+    character_context: GridCharacterContext | None = None,
 ) -> str:
-    """Assemble a grid image generation prompt with first-last frame chain structure.
+    """Assemble one static opening image per storyboard item into a grid prompt.
 
     Args:
         scenes: List of scene dicts with image_prompt and video_prompt fields.
@@ -127,8 +184,10 @@ def build_grid_prompt(
         cols: Number of columns in the grid.
         style: Style description for the grid.
         aspect_ratio: Aspect ratio for each cell (default "16:9").
-        references: The reference images sent with the request, in array order; they are
-            declared as 图N on the first line and addressed as such in the cell texts.
+        references: The reference images sent with the request, in array order.
+        char_field: Storyboard field containing the character roster for each cell.
+        characters: Project character definitions used as identity descriptions.
+        character_context: Precomputed identity projection shared with formal provenance.
 
     Returns:
         Assembled prompt string.
@@ -140,19 +199,19 @@ def build_grid_prompt(
         # max_cell_count 切块（见 lib.grid.layout.plan_grid_chunks），此处 fail loud。
         raise ValueError(f"分镜数 {n_scenes} 超过 {rows}×{cols} 宫格的画格数 {total}，分组应先切块再构建 prompt")
 
-    # Number of content cells: first frame + (n_scenes - 1) transitions + last first frame
-    # Cell 0: first scene opening
-    # Cells 1..n_scenes-2: transitions between consecutive scenes
-    # Cell n_scenes-1: last scene opening
-    # Remaining cells: placeholders
-    n_content = n_scenes  # 1 first + (n-2) transitions + 1 last = n
+    character_context = character_context or project_grid_character_context(
+        scenes, char_field=char_field, characters=characters
+    )
+    if len(character_context.cell_characters) != n_scenes:
+        raise ValueError("grid character context must contain one roster per scene")
+    character_names = character_context.character_names | _reference_character_names(references)
 
     effective_grid_ar = grid_aspect_ratio or aspect_ratio
     panel_ar = _compute_panel_aspect(effective_grid_ar, rows, cols)
 
     lines: list[str] = []
 
-    declaration = reference_images_declaration(references)
+    declaration = reference_images_declaration(references, include_logical_ids=True)
     if declaration:
         lines.append(f"{REFERENCE_IMAGES_KEY}: {declaration}")
         lines.append("")
@@ -170,15 +229,22 @@ def build_grid_prompt(
     lines.append(f"- 每个画格比例：{panel_ar}，所有画格大小完全相同")
     lines.append("- 画格之间无边框、无间隙、无留白，紧密排列")
     lines.append("- 不得合并画格、不得遗漏画格、不得错位排列")
-    lines.append("- 所有画格保持一致的角色外观、光线和色彩风格")
+    lines.append("- 同一角色在所有出镜画格中的面部、发型、体型、服装和配饰保持一致")
+    lines.append("- 同一场景在所有画格中的空间结构、主要陈设和固定物件保持一致")
+    lines.append("- 同一道具在所有画格中的形状、材质和标志性细节保持一致")
+    lines.append("- 所有内容画格保持统一的色彩与渲染风格；光线按各格描述变化，相邻格之间自然连续")
     lines.append("")
+
+    _append_character_identities(lines, character_context, references)
 
     # Frame chain rhythm
     lines.append("【帧链节奏】")
     lines.append("本宫格采用首尾帧链式结构：")
-    lines.append("- 格0 是第一个场景的开场画面")
-    lines.append(f"- 格1~格{n_content - 1} 是相邻场景的过渡帧（前一场景的结束 = 后一场景的开始）")
-    lines.append("- 相邻格之间应体现画面的自然过渡和动作延续")
+    lines.append("- 每个内容格只描绘对应场景 image_prompt 定义的一个静态时刻")
+    lines.append("- 格0 是第一个场景的开场静态画面")
+    if n_scenes > 1:
+        lines.append(f"- 格1~格{n_scenes - 1} 分别是对应后续场景的开场静态画面，同时作为前一场景的结束共享帧")
+    lines.append("- 不得在同一画格中并列绘制动作前后、过渡过程或同一角色的多个时间点")
     lines.append("")
 
     # Cell contents
@@ -193,24 +259,25 @@ def build_grid_prompt(
             # First scene opening
             scene = scenes[0]
             scene_id = scene.get(id_field, "")
-            image_desc = _extract_image_desc(scene, references)
+            image_desc = _extract_image_desc(scene, references, character_names)
             lines.append(f"格{cell_idx}（{position}）— {scene_id}开场：")
+            _append_cell_roster(lines, character_context.cell_characters[cell_idx], references)
             lines.append(f"  {image_desc}")
 
         elif cell_idx < n_scenes:
-            # Transition between scenes[cell_idx-1] and scenes[cell_idx]
+            # Shared frame: render only the next scene's opening state.
             prev_scene = scenes[cell_idx - 1]
             next_scene = scenes[cell_idx]
             prev_scene_id = prev_scene.get(id_field, "")
             next_scene_id = next_scene.get(id_field, "")
-            prev_action = _extract_action(prev_scene)
-            next_image_desc = _extract_image_desc(next_scene, references)
-            lines.append(f"格{cell_idx}（{position}）— {prev_scene_id}→{next_scene_id}过渡：")
-            lines.append(f"  {prev_action}，过渡到 {next_image_desc}")
+            next_image_desc = _extract_image_desc(next_scene, references, character_names)
+            lines.append(f"格{cell_idx}（{position}）— {prev_scene_id}→{next_scene_id}共享帧（{next_scene_id}开场）：")
+            _append_cell_roster(lines, character_context.cell_characters[cell_idx], references)
+            lines.append(f"  {next_image_desc}")
 
         else:
             # Placeholder
-            lines.append(f"格{cell_idx}（{position}）— 空占位：纯灰色背景，无任何内容")
+            lines.append(f"格{cell_idx}（{position}）— 空占位：中性灰填满这个画格，无人物、物件或文字")
 
     lines.append("")
 
@@ -220,17 +287,17 @@ def build_grid_prompt(
     lines.append("")
 
     # Negative constraints
-    lines.append("【负面约束】")
-    lines.append("禁止出现以下任何元素：")
-    lines.append("- 文字、字幕、标签、标题、数字编号、时间戳")
+    lines.append("【画面约束】")
+    lines.append("- 仅呈现各格内容明确要求的画内文字；不添加字幕、标签、标题、数字编号或时间戳")
     lines.append("- 水印、logo、签名")
     lines.append("- 白色边框、黑色边框、粗边框、装饰性边框")
     lines.append("- 分隔线、间隙、间距、留白、padding、margin")
-    lines.append("- 白色背景、纯色背景条")
+    placeholder_exception = "；明确指定为中性灰的画格除外" if n_scenes < total else ""
+    lines.append(f"- 内容画格之间不出现白色或纯色背景条{placeholder_exception}")
     lines.append("- 合并的画格、缺失的画格、错位的画格")
     lines.append("- 连续全景图（非分格）、单张大图")
     lines.append("- 模糊、低画质、噪点")
-    lines.append("- 拼贴感、蒙太奇拼接感")
+    lines.append("- 内容画格内部不出现二次分栏、照片拼贴或蒙太奇叠片")
     lines.append("- 画格大小不一致、画格比例不一致")
 
     return "\n".join(lines)

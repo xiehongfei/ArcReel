@@ -26,10 +26,12 @@ from lib.artifact_manifest import (
 )
 from lib.artifact_version_provenance import IMAGE_ARTIFACT_BASIS_FIELD
 from lib.async_thread import run_noninterruptible_sync
+from lib.grid.character_identity import GridCharacterContext, project_grid_character_context
 from lib.grid.models import GridGeneration
 from lib.grid_manager import GridManager
 from lib.path_safety import safe_join
 from lib.project_manager import get_project_manager
+from lib.storyboard_sequence import get_storyboard_items
 from lib.version_manager import StagedVersionCommit, VersionManager
 from lib.visual_artifact_provenance import (
     GridStoryboardVisual,
@@ -338,14 +340,18 @@ async def apply_grid_split(
                 nonlocal source_entry, source_key, source_status
                 source_key, source_entry, source_status = _registered_grid_source()
 
-                current_items, current_id_field, _kind = resolve_items(current_script)
+                current_items, current_id_field, char_field, _scene_field, _prop_field = get_storyboard_items(
+                    current_script
+                )
                 item_by_id = {
                     str(item.get(current_id_field)): item for item in current_items if isinstance(item, Mapping)
                 }
                 members: tuple[GridStoryboardVisual, ...] | None = None
+                character_context: GridCharacterContext | None = None
                 if len(set(grid.scene_ids)) == len(grid.scene_ids) and all(
                     resource_id in item_by_id for resource_id in grid.scene_ids
                 ):
+                    ordered_items = [item_by_id[resource_id] for resource_id in grid.scene_ids]
                     members = tuple(
                         GridStoryboardVisual(
                             resource_id=resource_id,
@@ -353,6 +359,11 @@ async def apply_grid_split(
                             video_prompt=item_by_id[resource_id].get("video_prompt"),
                         )
                         for resource_id in grid.scene_ids
+                    )
+                    character_context = project_grid_character_context(
+                        ordered_items,
+                        char_field=char_field,
+                        characters=current_project.get("characters"),
                     )
 
                 manifest_entries.clear()
@@ -385,7 +396,7 @@ async def apply_grid_split(
                             )
                         )
                         version_metadata_by_resource[resource_id][IMAGE_ARTIFACT_BASIS_FIELD] = basis.to_evidence_dict()
-                elif members is not None and references is not None:
+                elif members is not None and character_context is not None and references is not None:
                     for cell_index, resource_id, cell_rel in cell_assignments:
                         try:
                             basis = build_grid_member_storyboard_visual_basis(
@@ -399,6 +410,7 @@ async def apply_grid_split(
                                 member_aspect_ratio=member_ratio,
                                 references=references,
                                 source_composite_digest=composite_digest,
+                                character_context=character_context,
                             )
                         except (OSError, TypeError, ValueError):
                             continue

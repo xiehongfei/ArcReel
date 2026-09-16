@@ -38,13 +38,16 @@ from lib.schema_guards import is_str
 # 内部常量：防崩 / 反向 / 布局 / 风格前缀
 # ---------------------------------------------------------------------------
 
-_CHARACTER_LAYOUT = "横版 16:9 三视图，纯白背景：正面 / 正侧（90° 侧视图）/ 背面水平排列。"
+_CHARACTER_LAYOUT = (
+    "横版 16:9，纯白背景：左侧为人脸特写（头肩近景、正视镜头），"
+    "右侧为全身三视图（正面 / 正侧（90° 侧视图）/ 背面）水平排列。"
+)
 _SCENE_LAYOUT = "单张环境全景建立镜头。"
 _PROP_LAYOUT = "单张道具资产图，纯净浅灰背景。"
 _PRODUCT_LAYOUT = "单张商品资产图，纯净浅灰背景、均匀棚拍布光。"
 
 # 正向防崩（按资产类型差异化）。
-_CHARACTER_GUARD = "三个面板中角色面部、发型、服装、配饰完全一致。"
+_CHARACTER_GUARD = "人脸特写与三个全身视图中角色面部、发型、服装、配饰完全一致。"
 # 场景 description 由剧本提取，常包含人物动作与剧情事件，仅靠末尾的反向提示词不足以抵消
 # 描述中的正向叙述，因此在正向语句中再声明一次无人。道具是纯文生图、description 描述的是
 # 物件本身，layout 也已限定纯净背景，不存在同类冲突，只需反向提示词；商品另有实拍
@@ -53,7 +56,8 @@ _SCENE_GUARD = "画面中没有人物出镜。"
 # 衍生资产图是对本体资产图的图片编辑，守卫句限定「只改被描述到的部分」：版式与其余外观
 # 保持不变，否则同一角色的两种形态会在分镜里长成两个人。
 _CHARACTER_DERIVATIVE_GUARD = (
-    "保持原图的三视图版式（正面 / 正侧 / 背面水平排列）、构图、比例、取景与纯白背景不变；"
+    "保持原图版式（左侧人脸特写、右侧全身三视图正面 / 正侧 / 背面水平排列）、"
+    "构图、比例、取景与纯白背景不变；"
     "除上述变化外，角色的面部、发型、体型及其余外观一律与原图保持一致。"
 )
 _PROP_GUARD = ""
@@ -102,7 +106,7 @@ def _style_prefix(style: str = "", style_description: str = "") -> str:
 
 
 def build_character_prompt(name: str, description: str, style: str = "", style_description: str = "") -> str:
-    """角色资产图 prompt（三视图 16:9）。"""
+    """角色资产图 prompt（人脸特写 + 全身三视图，16:9）。"""
     style_block = _style_prefix(style, style_description)
     return (
         f"{style_block}"
@@ -117,7 +121,7 @@ def build_character_prompt(name: str, description: str, style: str = "", style_d
 def build_character_derivative_prompt(description: str) -> str:
     """角色衍生资产图 prompt：对本体资产图的一次编辑指令。
 
-    衍生只写相对本体的外观变化，其余一切（三视图版式、构图、未被描述改动的外观）由
+    衍生只写相对本体的外观变化，其余一切（人脸特写加全身三视图版式、构图、未被描述改动的外观）由
     守卫句钉住；不注入项目画风——画风已由被编辑的本体资产图自身承载。
     """
     return f"{description}\n\n{_CHARACTER_DERIVATIVE_GUARD}\n\n{_NEGATIVE_TAIL_CHARACTER}"

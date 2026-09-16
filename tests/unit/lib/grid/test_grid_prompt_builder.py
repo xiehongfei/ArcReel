@@ -4,7 +4,6 @@ import pytest
 
 from lib.grid.prompt_builder import (
     _compute_panel_aspect,
-    _extract_action,
     _extract_image_desc,
     build_grid_prompt,
     pending_grid_prompt_ids,
@@ -73,27 +72,6 @@ class TestPendingGridPromptIds:
         assert pending_grid_prompt_ids(scenes, "scene_id") == ["S2", "S3", "S4"]
 
 
-class TestExtractAction:
-    def test_dict_video_prompt_returns_action(self):
-        scene = {"video_prompt": {"action": "walks away", "camera_motion": "pan"}}
-        result = _extract_action(scene)
-        assert result == "walks away"
-
-    def test_string_video_prompt_returns_as_is(self):
-        scene = {"video_prompt": "character runs fast"}
-        result = _extract_action(scene)
-        assert result == "character runs fast"
-
-    def test_dict_missing_action_returns_empty(self):
-        scene = {"video_prompt": {"camera_motion": "zoom"}}
-        result = _extract_action(scene)
-        assert result == ""
-
-    def test_pending_video_prompt_returns_empty(self):
-        assert _extract_action({"video_prompt": None}) == ""
-        assert _extract_action({}) == ""
-
-
 class TestComputePanelAspect:
     def test_grid_16_9_2x2(self):
         assert _compute_panel_aspect("16:9", 2, 2) == "16:9"
@@ -115,9 +93,10 @@ class TestComputePanelAspect:
 
 
 class TestBuildGridPrompt:
-    def _scene(self, sid, scene_text, action):
+    def _scene(self, sid, scene_text, action, characters=()):
         return {
             "scene_id": sid,
+            "characters_in_scene": list(characters),
             "image_prompt": {
                 "scene": scene_text,
                 "composition": {"shot_type": "medium", "lighting": "natural", "ambiance": "calm"},
@@ -155,12 +134,52 @@ class TestBuildGridPrompt:
             ),
             VisualReference(path=Path("scenes/酒馆.png"), role="asset_sheet", logical_type="scene", logical_id="酒馆"),
         ]
+        scenes[0]["video_prompt"]["action"] = "@[角色A]抬手，@[路人]后退"
         prompt = build_grid_prompt(scenes=scenes, id_field="scene_id", rows=2, cols=2, style="x", references=references)
-        assert prompt.startswith("Reference_Images: 图1为角色参考图；图2为场景参考图。\n\n你是一位专业的分镜画师。")
-        assert "图1在s1" in prompt
-        assert "图1与路人对视" in prompt
+        assert prompt.startswith(
+            "Reference_Images: 图1为角色「角色A」参考图；图2为场景「酒馆」参考图。\n\n你是一位专业的分镜画师。"
+        )
+        assert "角色A（图1）在s1" in prompt
+        assert "角色A（图1）与路人对视" in prompt
+        assert "角色A抬手，路人后退" not in prompt
         assert "@[" not in prompt
-        assert "角色A" not in prompt.split("\n", 1)[1]
+
+    def test_each_cell_uses_only_its_own_static_image_prompt(self):
+        scenes = [self._scene(f"S{i}", f"scene{i}", f"action{i}") for i in range(1, 5)]
+        prompt = build_grid_prompt(scenes=scenes, id_field="scene_id", rows=2, cols=2, style="x")
+
+        assert "S1→S2共享帧（S2开场）" in prompt
+        assert "S3→S4共享帧（S4开场）" in prompt
+        assert all(f"scene{i}" in prompt for i in range(1, 5))
+        assert all(f"action{i}" not in prompt for i in range(1, 5))
+        assert "过渡到" not in prompt
+
+    def test_character_identities_and_per_cell_unique_rosters(self):
+        scenes = [
+            self._scene("S1", "@[子墨]在左侧，@[骆宾王]在右侧", "unused", ("子墨", "骆宾王")),
+            self._scene("S2", "@[子墨]独自捧书", "unused", ("子墨",)),
+        ]
+        characters = {
+            "子墨": {"description": "短而整齐的头发，现代校服"},
+            "骆宾王": {"description": "束发，唐代蓝袍"},
+        }
+        prompt = build_grid_prompt(
+            scenes=scenes,
+            id_field="scene_id",
+            rows=2,
+            cols=2,
+            style="x",
+            char_field="characters_in_scene",
+            characters=characters,
+        )
+
+        assert prompt.count("短而整齐的头发，现代校服") == 1
+        assert prompt.count("束发，唐代蓝袍") == 1
+        assert "本格角色：子墨1人、骆宾王1人。" in prompt
+        assert "本格中上述角色各恰好1人" in prompt
+        assert "本格角色：子墨1人。" in prompt
+        assert "本格只出现上述角色1人" in prompt
+        assert "子墨在左侧，骆宾王在右侧" in prompt
 
     def test_string_prompts(self):
         scenes = [{"scene_id": f"S{i}", "image_prompt": f"text{i}", "video_prompt": f"vid{i}"} for i in range(1, 5)]
@@ -185,14 +204,36 @@ class TestBuildGridPrompt:
         prompt = build_grid_prompt(scenes=scenes, id_field="scene_id", rows=2, cols=2, style="cyberpunk neon")
         assert "cyberpunk neon" in prompt
 
-    def test_negative_constraints_present(self):
+    def test_visual_constraints_are_scoped_without_internal_contradictions(self):
         scenes = [self._scene(f"S{i}", f"s{i}", f"a{i}") for i in range(1, 5)]
         prompt = build_grid_prompt(scenes=scenes, id_field="scene_id", rows=2, cols=2, style="realistic")
-        assert "禁止出现以下任何元素" in prompt
+        assert "仅呈现各格内容明确要求的画内文字" in prompt
+        assert "内容画格内部不出现二次分栏" in prompt
         assert "合并的画格" in prompt
         assert "缺失的画格" in prompt
         assert "白色边框" in prompt
         assert "画格大小不一致" in prompt
+        assert "文字、字幕、标签、标题、数字编号、时间戳" not in prompt
+        assert "白色背景、纯色背景条" not in prompt
+        assert "拼贴感、蒙太奇拼接感" not in prompt
+
+        prompt_with_placeholder = build_grid_prompt(
+            scenes=scenes[:3],
+            id_field="scene_id",
+            rows=2,
+            cols=2,
+            style="realistic",
+        )
+        assert "明确指定为中性灰的画格除外" in prompt_with_placeholder
+
+    def test_continuity_constraints_distinguish_identity_space_and_lighting(self):
+        scenes = [self._scene(f"S{i}", f"s{i}", f"a{i}") for i in range(1, 5)]
+        prompt = build_grid_prompt(scenes=scenes, id_field="scene_id", rows=2, cols=2, style="realistic")
+        assert "同一角色" in prompt
+        assert "同一场景" in prompt
+        assert "同一道具" in prompt
+        assert "光线按各格描述变化，相邻格之间自然连续" in prompt
+        assert "所有画格保持一致的角色外观、光线和色彩风格" not in prompt
 
     def test_no_placeholders_when_exact_fit(self):
         # 4 scenes, 2x2 grid -> no placeholders needed (4 content cells: open, trans, trans, close)

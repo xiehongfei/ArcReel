@@ -3,6 +3,7 @@ from pathlib import Path
 from lib.prompt_builders import (
     append_image_negative_tail,
     append_video_negative_tail,
+    build_character_derivative_prompt,
     build_character_prompt,
     build_product_prompt,
     build_prop_prompt,
@@ -25,6 +26,25 @@ class TestCharacterPrompt:
         assert "黑发，冷静神态。" in prompt
         assert "古风" in prompt
         assert "Cinematic, low-key lighting" in prompt
+
+    def test_layout_is_face_closeup_plus_full_body_turnaround(self):
+        prompt = build_character_prompt("张三", "短发青年")
+        assert "人脸特写" in prompt
+        assert "全身三视图" in prompt
+        assert "正面" in prompt
+        assert "正侧" in prompt
+        assert "背面" in prompt
+
+
+class TestCharacterDerivativePrompt:
+    def test_preserves_closeup_plus_full_body_turnaround_layout(self):
+        prompt = build_character_derivative_prompt("换上黑色重甲")
+        assert "换上黑色重甲" in prompt
+        assert "人脸特写" in prompt
+        assert "全身三视图" in prompt
+        assert "正面" in prompt
+        assert "正侧" in prompt
+        assert "背面" in prompt
 
 
 class TestScenePromptAndPropPrompt:

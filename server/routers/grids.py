@@ -114,7 +114,7 @@ async def generate_grid(
     script = _load_admitted_grid_script(project_name, project, req.script_file, episode)
     project_path = get_project_manager().get_project_path(project_name)
 
-    items, id_field, _, _, _ = get_storyboard_items(script)
+    items, id_field, char_field, _, _ = get_storyboard_items(script)
     aspect_ratio = video_aspect_ratio_of(project)
     # style 同样允许显式 null，须显式判空而非依赖 dict.get 的默认值
     raw_style = project.get("style")
@@ -184,6 +184,8 @@ async def generate_grid(
                 style=style,
                 aspect_ratio=aspect_ratio,
                 grid_aspect_ratio=chunk_layout.grid_aspect_ratio,
+                char_field=char_field,
+                characters=project.get("characters"),
             )
 
             grid.prompt = prompt
