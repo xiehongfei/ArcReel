@@ -17,7 +17,7 @@ from lib.asset_types import ASSET_TYPES, normalize_asset_name
 from lib.content_digest import sha256_file
 from lib.grid.character_identity import GridCharacterContext
 from lib.grid.prompt_builder import project_grid_image_prompt
-from lib.prompt_utils import normalize_style, project_storyboard_image_prompt
+from lib.prompt_utils import project_storyboard_image_prompt
 from lib.reference_video.request_projection import ResolvedReferenceAsset
 from lib.reference_video.text_parser import strip_speech_marks
 
@@ -391,7 +391,7 @@ def build_reference_video_artifact_visual_basis(
         inputs={
             "unit_id": unit_id,
             "visual_lines": visual_lines,
-            "style": normalize_style(style),
+            "style": style or "",
             "canvas": {"aspect_ratio": _require_non_empty("aspect_ratio", aspect_ratio)},
             "request_references": _reference_evidence(references),
         },

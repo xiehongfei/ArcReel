@@ -780,8 +780,7 @@ _SCRIPT_PLAN_CANDIDATES = list(
 def _load_project_modes(project_name: str) -> tuple[str, str | None]:
     """走 ProjectManager.load_project，读出 (content_mode, generation_mode) 两轴。
 
-    复用 load_project 以获得文件锁和 _migrate_legacy_style 迁移；两轴都是项目级字段，
-    草稿文件名不随集号变化。项目不存在时返回 ("drama", None)，由调用方走 content_mode-only 分支。
+    两轴都是项目级字段，草稿文件名不随集号变化。项目不存在时返回 ("drama", None)，由调用方走 content_mode-only 分支。
     """
     try:
         data = get_project_manager().load_project(project_name)
@@ -1016,16 +1015,18 @@ async def upload_style_image(project_name: str, _t: Translator, file: UploadFile
         output_path, style_filename = await asyncio.to_thread(_sync_prepare)
 
         # 调用 TextGenerator 分析风格（自动追踪用量）
+        from lib.prompt_templates.builtin import builtin_templates
         from lib.providers import CallPurpose
         from lib.text_backends.base import ImageInput, TextGenerationRequest, TextTaskType
-        from lib.text_backends.prompts import STYLE_ANALYSIS_PROMPT
         from lib.text_generator import TextGenerator
 
         generator = await TextGenerator.create(
             TextTaskType.STYLE_ANALYSIS, project_name, purpose=CallPurpose.STYLE_ANALYSIS
         )
         result = await generator.generate(
-            TextGenerationRequest(prompt=STYLE_ANALYSIS_PROMPT, images=[ImageInput(path=output_path)]),
+            TextGenerationRequest(
+                prompt=builtin_templates.render("text/style_analysis"), images=[ImageInput(path=output_path)]
+            ),
             project_name=project_name,
         )
         style_description = result.text

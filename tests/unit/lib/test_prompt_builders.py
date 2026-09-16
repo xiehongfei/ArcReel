@@ -1,8 +1,8 @@
 from pathlib import Path
 
+import pytest
+
 from lib.prompt_builders import (
-    append_image_negative_tail,
-    append_video_negative_tail,
     build_character_derivative_prompt,
     build_character_prompt,
     build_product_prompt,
@@ -24,7 +24,9 @@ class TestCharacterPrompt:
         )
         assert "姜月茴" in prompt
         assert "黑发，冷静神态。" in prompt
-        assert "古风" in prompt
+        assert "Style: 古风" in prompt
+        assert "Visual style: Cinematic, low-key lighting" in prompt
+        assert prompt.endswith("Avoid: 水印、多余文字、Logo")
         assert "Cinematic, low-key lighting" in prompt
 
     def test_layout_is_face_closeup_plus_full_body_turnaround(self):
@@ -66,63 +68,31 @@ class TestFigureExclusion:
     """展示环境或物件的图种排除人物；画面主体本身是人物的图种不排除。"""
 
     # 断言完整片段而非「人物」二字：正文里的普通描述也可能出现该词，按关键词断言会误判。
-    _EXCLUSION = "画面避免：出镜人物"
+    _EXCLUSION = "Avoid: 出镜人物"
 
     def test_environment_and_object_sheets_exclude_people(self):
         assert self._EXCLUSION in build_scene_prompt("祠堂", "昏暗古朴")
         assert self._EXCLUSION in build_prop_prompt("玉佩", "古朴温润")
         assert self._EXCLUSION in build_product_prompt("护手霜", "白色管装，哑光质感")
 
+    def test_exclusion_survives_a_description_that_repeats_it(self):
+        prompt = build_scene_prompt("祠堂", "昏暗古朴，无出镜人物、无声响。")
+        assert prompt.endswith("Avoid: 出镜人物、水印、多余文字、Logo")
+
     def test_character_and_storyboard_keep_people(self):
-        # 四类资产的反向提示词各自定义而非共用，避免把人物排除项误加到主体为人物的图种上。
         assert self._EXCLUSION not in build_character_prompt("张三", "短发青年")
-        assert self._EXCLUSION not in append_image_negative_tail("林清坐在窗边木桌前")
+        assert self._EXCLUSION not in render_storyboard_image_prompt("林清坐在窗边木桌前")
 
 
-class TestVideoNegativeTail:
-    def test_appends_when_missing(self):
-        result = append_video_negative_tail("林清缓缓抬头")
-        assert result.startswith("林清缓缓抬头")
-        assert result != "林清缓缓抬头"
-
-    def test_idempotent(self):
-        once = append_video_negative_tail("林清缓缓抬头")
-        twice = append_video_negative_tail(once)
-        assert once == twice
-
-    def test_handles_empty_input(self):
-        assert append_video_negative_tail("")
-
-    def test_handles_whitespace_only_input(self):
-        expected = append_video_negative_tail("")
-        for blank in ("   ", "\n\n", "\t \n"):
-            assert append_video_negative_tail(blank) == expected
-
-
-class TestImageNegativeTail:
-    def test_appends_when_missing(self):
-        result = append_image_negative_tail("林清坐在窗边木桌前")
-        assert result.startswith("林清坐在窗边木桌前")
-        assert result != "林清坐在窗边木桌前"
+class TestStoryboardImageAvoidLine:
+    def test_text_form_ends_with_one_image_avoid_line(self):
+        assert (
+            render_storyboard_image_prompt("林清坐在窗边木桌前") == "林清坐在窗边木桌前\n\nAvoid: 水印、多余文字、Logo"
+        )
 
     def test_idempotent(self):
-        once = append_image_negative_tail("林清坐在窗边木桌前")
-        twice = append_image_negative_tail(once)
-        assert once == twice
-
-    def test_handles_empty_and_whitespace_input(self):
-        expected = append_image_negative_tail("")
-        for blank in ("", "   ", "\n\n", "\t \n"):
-            assert append_image_negative_tail(blank) == expected
-
-
-class TestNegativeTailsAreAvoidKeys:
-    def test_image_and_video_tails_are_avoid_lines(self):
-        assert append_image_negative_tail("") == "Avoid: 水印、多余文字、Logo"
-        assert append_video_negative_tail("") == "Avoid: BGM、文字字幕、水印"
-
-    def test_text_form_appends_one_avoid_line(self):
-        assert append_video_negative_tail("林清缓缓抬头") == "林清缓缓抬头\n\nAvoid: BGM、文字字幕、水印"
+        once = render_storyboard_image_prompt("林清坐在窗边木桌前")
+        assert render_storyboard_image_prompt(once) == once
 
 
 def _sheet(asset_type: str, name: str) -> VisualReference:
@@ -147,6 +117,22 @@ _STRUCTURED = {
 
 class TestRenderStoryboardImagePrompt:
     """图N 编号由实际发出的参考图列表机械派生，对全部图像后端同一口径。"""
+
+    @pytest.mark.parametrize("prompt", [_STRUCTURED, _SCENE])
+    def test_both_forms_share_style_block_and_wrappers_survive_text_roundtrip(self, prompt):
+        references = [_sheet("character", "林清")]
+        rendered = render_storyboard_image_prompt(
+            prompt, style="Anime", style_description="cinematic", references=references
+        )
+        assert rendered.startswith("Style: Anime\nVisual style: cinematic\nReference_Images:")
+        assert (
+            render_storyboard_image_prompt(
+                rendered, style="Anime", style_description="cinematic", references=references
+            )
+            == rendered
+        )
+        for label in ("Style:", "Visual style:", "Reference_Images:", "Avoid:"):
+            assert rendered.count(label) == 1
 
     def test_structured_prompt_declares_types_between_style_and_scene_and_numbers_mentions(self):
         references = [
@@ -224,3 +210,47 @@ class TestRenderStoryboardImagePrompt:
             render_storyboard_image_prompt(once, style="Anime", style_description="cinematic", references=references)
             == once
         )
+
+
+class TestTextFormRerenderAfterStyleFieldsChange:
+    """纯文本形态回贴后项目风格字段才补齐，再渲染时每条风格声明仍只出现一次。"""
+
+    @pytest.mark.parametrize(
+        ("first", "then"),
+        [
+            ({"style": "水墨"}, {"style": "水墨", "style_description": "留白写意"}),
+            ({"style_description": "留白写意"}, {"style": "水墨", "style_description": "留白写意"}),
+        ],
+        ids=["description-added", "style-added"],
+    )
+    def test_each_style_declaration_appears_once(self, first, then):
+        once = render_storyboard_image_prompt("林清坐在窗边木桌前", **first)
+        again = render_storyboard_image_prompt(once, **then)
+        lines = again.split("\n")
+        assert lines.count("Style: 水墨") == 1
+        assert lines.count("Visual style: 留白写意") == 1
+        assert lines.count("Avoid: 水印、多余文字、Logo") == 1
+        assert render_storyboard_image_prompt(again, **then) == again
+
+    def test_legacy_text_with_description_first_is_not_stacked(self):
+        legacy = "Visual style: 留白写意\n\nStyle: 水墨\n\n林清坐在窗边木桌前\n\nAvoid: 水印、多余文字、Logo"
+        rendered = render_storyboard_image_prompt(legacy, style="水墨", style_description="留白写意")
+        assert rendered == legacy
+
+
+def test_product_sheet_preserves_product_and_ignores_project_style():
+    prompt = build_product_prompt("护手霜", "白色管装", "水彩", "柔和笔触")
+    assert "商品「护手霜」的标准资产图。" in prompt
+    assert "logo、文字、配色、材质、比例与结构不得改变或臆造" in prompt
+    assert "包装上印刷的人像图案属于商品外观，须原样保留。" in prompt
+    assert "水彩" not in prompt
+    assert "柔和笔触" not in prompt
+    assert prompt.endswith("Avoid: 出镜人物、水印、多余文字、Logo")
+
+
+def test_derivative_keeps_reference_layout_and_has_no_style_block():
+    prompt = build_character_derivative_prompt("衣服变为黑色")
+    assert prompt.startswith("衣服变为黑色")
+    assert "保持原图版式（左侧人脸特写、右侧全身三视图" in prompt
+    assert "Style:" not in prompt
+    assert prompt.endswith("Avoid: 水印、多余文字、Logo")

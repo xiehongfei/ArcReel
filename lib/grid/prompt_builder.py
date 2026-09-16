@@ -1,5 +1,6 @@
 """Grid prompt builder for grid-image-to-video feature.
 
+整段提示词由 ``storyboard/grid`` 模版渲染，本模块产出各格槽位值。
 参考图与分镜图同一口径：prompt 首行为 ``Reference_Images`` 类型声明，各格正文里的 ``@[登记名]``
 按最终参考图列表的序位换成「图N」（见 :mod:`lib.reference_image_numbering`）。
 """
@@ -11,8 +12,9 @@ from math import gcd
 
 from lib.asset_types import asset_name_comparison_key
 from lib.grid.character_identity import GridCharacterContext, project_grid_character_context
+from lib.prompt_style import normalize_style_value
+from lib.prompt_templates.builtin import builtin_templates
 from lib.reference_image_numbering import (
-    REFERENCE_IMAGES_KEY,
     ReferenceImageSlot,
     mention_replacements,
     reference_images_declaration,
@@ -149,6 +151,19 @@ def _append_cell_roster(
         lines.append("  本格中上述角色各恰好1人，身份与外观不得复制、融合、替换或互换。")
 
 
+def _extract_action(scene: dict) -> str:
+    """Extract closing action from video_prompt.
+
+    If dict, return action field. If string, return as-is.
+    """
+    video_prompt = scene.get("video_prompt")
+    if video_prompt is None:
+        return ""
+    if isinstance(video_prompt, dict):
+        return str(video_prompt.get("action", ""))
+    return str(video_prompt)
+
+
 def _compute_panel_aspect(grid_aspect_ratio: str, rows: int, cols: int) -> str:
     """从整体宫格比例推算单格比例。
 
@@ -168,6 +183,7 @@ def build_grid_prompt(
     rows: int,
     cols: int,
     style: str,
+    style_description: str,
     aspect_ratio: str = "16:9",
     grid_aspect_ratio: str | None = None,
     references: Sequence[ReferenceImageSlot] = (),
@@ -175,14 +191,15 @@ def build_grid_prompt(
     characters: object = None,
     character_context: GridCharacterContext | None = None,
 ) -> str:
-    """Assemble one static opening image per storyboard item into a grid prompt.
+    """Render the grid image prompt with first-last frame chain structure.
 
     Args:
         scenes: List of scene dicts with image_prompt and video_prompt fields.
         id_field: Key in each scene dict for the scene ID.
         rows: Number of rows in the grid.
         cols: Number of columns in the grid.
-        style: Style description for the grid.
+        style: Project style.
+        style_description: Project style description.
         aspect_ratio: Aspect ratio for each cell (default "16:9").
         references: The reference images sent with the request, in array order.
         char_field: Storyboard field containing the character roster for each cell.
@@ -190,7 +207,7 @@ def build_grid_prompt(
         character_context: Precomputed identity projection shared with formal provenance.
 
     Returns:
-        Assembled prompt string.
+        The prompt rendered from the ``storyboard/grid`` template.
     """
     total = rows * cols
     n_scenes = len(scenes)
@@ -207,97 +224,51 @@ def build_grid_prompt(
     character_names = character_context.character_names | _reference_character_names(references)
 
     effective_grid_ar = grid_aspect_ratio or aspect_ratio
-    panel_ar = _compute_panel_aspect(effective_grid_ar, rows, cols)
+    first = scenes[0]
 
-    lines: list[str] = []
+    def _roster(idx: int) -> str:
+        roster_lines: list[str] = []
+        _append_cell_roster(roster_lines, character_context.cell_characters[idx], references)
+        return "\n".join(roster_lines)
 
-    declaration = reference_images_declaration(references, include_logical_ids=True)
-    if declaration:
-        lines.append(f"{REFERENCE_IMAGES_KEY}: {declaration}")
-        lines.append("")
+    transitions = [
+        {
+            **_cell_position(idx, cols),
+            "from_id": str(scenes[idx - 1].get(id_field, "")),
+            "to_id": str(scenes[idx].get(id_field, "")),
+            "action": _render_grid_mentions(_extract_action(scenes[idx - 1]), references, character_names),
+            "description": _extract_image_desc(scenes[idx], references, character_names),
+            "roster": _roster(idx),
+        }
+        for idx in range(1, n_scenes)
+    ]
+    placeholders = [_cell_position(idx, cols) for idx in range(n_scenes, total)]
 
-    # Header
-    lines.append(
-        f"你是一位专业的分镜画师。请严格按照 {rows}×{cols} 宫格布局生成一张包含恰好 {total} 个等大画格的联合图。"
+    identity_lines: list[str] = []
+    _append_character_identities(identity_lines, character_context, references)
+    character_identities = "\n".join(identity_lines)
+
+    return builtin_templates.render(
+        "storyboard/grid",
+        reference_images=reference_images_declaration(references, include_logical_ids=True) or None,
+        rows=rows,
+        cols=cols,
+        cell_count=total,
+        grid_aspect_ratio=effective_grid_ar,
+        panel_aspect_ratio=_compute_panel_aspect(effective_grid_ar, rows, cols),
+        last_chain_cell=n_scenes - 1,
+        opening={
+            "scene_id": str(first.get(id_field, "")),
+            "description": _extract_image_desc(first, references, character_names),
+            "roster": _roster(0),
+        },
+        transitions=transitions,
+        placeholders=placeholders,
+        style=normalize_style_value(style),
+        style_description=normalize_style_value(style_description),
+        character_identities=character_identities,
     )
-    lines.append("")
 
-    # Layout requirements
-    lines.append("【布局要求】")
-    lines.append(f"- 恰好 {rows} 行 {cols} 列，共 {total} 个画格，阅读顺序：从左到右，从上到下")
-    lines.append(f"- 整体图片比例：{effective_grid_ar}")
-    lines.append(f"- 每个画格比例：{panel_ar}，所有画格大小完全相同")
-    lines.append("- 画格之间无边框、无间隙、无留白，紧密排列")
-    lines.append("- 不得合并画格、不得遗漏画格、不得错位排列")
-    lines.append("- 同一角色在所有出镜画格中的面部、发型、体型、服装和配饰保持一致")
-    lines.append("- 同一场景在所有画格中的空间结构、主要陈设和固定物件保持一致")
-    lines.append("- 同一道具在所有画格中的形状、材质和标志性细节保持一致")
-    lines.append("- 所有内容画格保持统一的色彩与渲染风格；光线按各格描述变化，相邻格之间自然连续")
-    lines.append("")
 
-    _append_character_identities(lines, character_context, references)
-
-    # Frame chain rhythm
-    lines.append("【帧链节奏】")
-    lines.append("本宫格采用首尾帧链式结构：")
-    lines.append("- 每个内容格只描绘对应场景 image_prompt 定义的一个静态时刻")
-    lines.append("- 格0 是第一个场景的开场静态画面")
-    if n_scenes > 1:
-        lines.append(f"- 格1~格{n_scenes - 1} 分别是对应后续场景的开场静态画面，同时作为前一场景的结束共享帧")
-    lines.append("- 不得在同一画格中并列绘制动作前后、过渡过程或同一角色的多个时间点")
-    lines.append("")
-
-    # Cell contents
-    lines.append("【各格内容】")
-
-    for cell_idx in range(total):
-        row_num = cell_idx // cols + 1
-        col_num = cell_idx % cols + 1
-        position = f"row{row_num} col{col_num}"
-
-        if cell_idx == 0:
-            # First scene opening
-            scene = scenes[0]
-            scene_id = scene.get(id_field, "")
-            image_desc = _extract_image_desc(scene, references, character_names)
-            lines.append(f"格{cell_idx}（{position}）— {scene_id}开场：")
-            _append_cell_roster(lines, character_context.cell_characters[cell_idx], references)
-            lines.append(f"  {image_desc}")
-
-        elif cell_idx < n_scenes:
-            # Shared frame: render only the next scene's opening state.
-            prev_scene = scenes[cell_idx - 1]
-            next_scene = scenes[cell_idx]
-            prev_scene_id = prev_scene.get(id_field, "")
-            next_scene_id = next_scene.get(id_field, "")
-            next_image_desc = _extract_image_desc(next_scene, references, character_names)
-            lines.append(f"格{cell_idx}（{position}）— {prev_scene_id}→{next_scene_id}共享帧（{next_scene_id}开场）：")
-            _append_cell_roster(lines, character_context.cell_characters[cell_idx], references)
-            lines.append(f"  {next_image_desc}")
-
-        else:
-            # Placeholder
-            lines.append(f"格{cell_idx}（{position}）— 空占位：中性灰填满这个画格，无人物、物件或文字")
-
-    lines.append("")
-
-    # Style requirements
-    lines.append("【风格要求】")
-    lines.append(style)
-    lines.append("")
-
-    # Negative constraints
-    lines.append("【画面约束】")
-    lines.append("- 仅呈现各格内容明确要求的画内文字；不添加字幕、标签、标题、数字编号或时间戳")
-    lines.append("- 水印、logo、签名")
-    lines.append("- 白色边框、黑色边框、粗边框、装饰性边框")
-    lines.append("- 分隔线、间隙、间距、留白、padding、margin")
-    placeholder_exception = "；明确指定为中性灰的画格除外" if n_scenes < total else ""
-    lines.append(f"- 内容画格之间不出现白色或纯色背景条{placeholder_exception}")
-    lines.append("- 合并的画格、缺失的画格、错位的画格")
-    lines.append("- 连续全景图（非分格）、单张大图")
-    lines.append("- 模糊、低画质、噪点")
-    lines.append("- 内容画格内部不出现二次分栏、照片拼贴或蒙太奇叠片")
-    lines.append("- 画格大小不一致、画格比例不一致")
-
-    return "\n".join(lines)
+def _cell_position(index: int, cols: int) -> dict[str, int]:
+    return {"index": index, "row": index // cols + 1, "col": index % cols + 1}
