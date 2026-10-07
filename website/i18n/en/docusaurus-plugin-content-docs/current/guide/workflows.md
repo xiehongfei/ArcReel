@@ -219,7 +219,9 @@ Uses a single storyboard image as the video input.
 
 Multi-grid storyboards are not a separate generation mode but an image-generation method within Storyboard mode. It generates multiple shots from the same passage together on one or more multi-grid storyboards, then automatically splits each grid into an individual storyboard image for each shot and generates each video separately. The video model still receives the individual storyboard image after splitting.
 
-Multi-grid storyboards automatically use square 2×2 / 3×3 grids based on the number of shots. Each cell uses the same aspect ratio as the project video; when there are more shots, they are divided across multiple multi-grid storyboards according to the grid capacity. Denser 4×4 / 5×5 grids are available only when the image model's resolution tier is configured as 4K—the more cells a multi-grid storyboard contains, the lower the resolution of each cell, and dense grids at lower resolution tiers will degrade downstream video quality.
+Groups containing characters use at most a 2×2 grid per image to preserve facial detail and reduce identity confusion. Groups without characters use 2×2 / 3×3 grids, with 4×4 / 5×5 available at a configured image resolution of 4K. Each cell uses the project's video aspect ratio. Shots exceeding the grid capacity are split across multiple images, and previews and cost estimates reflect that count. Using four-cell grids for character groups may increase image counts and costs.
+
+Each cell depicts only its shot's static first frame, without carrying the previous shot's full action into the next cell. Bound character assets govern face shape, facial proportions, apparent age, body proportions, and clothing; costume changes require the corresponding derivative asset. Existing grids retain their layout. Regenerating by group applies the new four-cell planning rule.
 
 #### Advantages {#grid-storyboard-pros}
 

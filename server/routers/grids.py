@@ -149,7 +149,7 @@ async def generate_grid(
         # 超上限分组切为多张宫格批次（末批不足一档时落小档 + 占位格），
         # 切块与预览、费用估算、SDK 工具同源（plan_grid_chunks）；
         # 空分组是唯一的空产出，此时连旧记录清理也一并跳过。
-        plans = plan_grid_chunks(group, aspect_ratio, allow_large_grid=allow_large_grid)
+        plans = plan_grid_chunks(group, aspect_ratio, allow_large_grid=allow_large_grid, char_field=char_field)
         if not plans:
             continue
 

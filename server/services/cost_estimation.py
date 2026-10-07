@@ -501,12 +501,12 @@ class CostEstimationService:
             episode_video = video_pricing["i2v"]
 
             try:
-                raw_segments, id_key, _, _, _ = get_storyboard_items(script)
+                raw_segments, id_key, char_field, _, _ = get_storyboard_items(script)
             except ScriptEditError as exc:
                 # 单集脏脚本(segments/scenes 键损坏)不应让整个项目费用估算 5xx;降级把该集
                 # 估算为 0(raw_segments=[]) + warning 让运维知道,UI 仍能展示其他正常集的估算。
                 logger.warning("费用估算跳过脏脚本 %s: %s", script_file, exc)
-                raw_segments, id_key = [], "segment_id"
+                raw_segments, id_key, char_field = [], "segment_id", None
 
             # 宫格装配：预计算每个 segment 的图片分摊费用。份额以条目在 ``raw_segments`` 中的
             # 位置为身份，与下方实付均摊同口径（理由见该处）；分组由
@@ -519,7 +519,9 @@ class CostEstimationService:
                     n = len(group)
                     # 宫格张数与实际入队同源（plan_grid_chunks）：超上限分组按切块后的
                     # 张数计费，避免估算与执行漂移。
-                    plans = plan_grid_chunks(group, aspect_ratio, allow_large_grid=grid_allow_large)
+                    plans = plan_grid_chunks(
+                        group, aspect_ratio, allow_large_grid=grid_allow_large, char_field=char_field
+                    )
                     if plans:
                         per_scene_cost = round(grid_image_unit_cost[0] * len(plans) / n, 6)
                         for offset_in_group in range(n):

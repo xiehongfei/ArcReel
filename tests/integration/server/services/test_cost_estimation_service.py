@@ -2161,10 +2161,12 @@ class TestCostEstimationService:
         # 集合计 = 满张单价 0.09 USD
         assert result["episodes"][0]["totals"]["estimate"]["image"]["USD"] == pytest.approx(0.09, abs=1e-4)
 
-    async def test_grid_estimate_counts_every_chunk_of_oversized_group(self, db_factory):
+    @pytest.mark.parametrize(("has_characters", "expected_grids"), [(False, 2), (True, 3)])
+    async def test_grid_estimate_counts_every_chunk_of_oversized_group(
+        self, db_factory, has_characters, expected_grids
+    ):
         """超过单张格数上限的分组按切块后的张数计价，与入队实际产出的宫格张数一致。"""
         from lib.db.repositories.custom_provider_repo import CustomProviderRepository
-        from lib.grid.layout import plan_grid_chunks
 
         async with db_factory() as session:
             await CustomProviderRepository(session).create_provider(
@@ -2188,7 +2190,7 @@ class TestCostEstimationService:
         resolver = ConfigResolver(db_factory)
         service = CostEstimationService(resolver, db_factory)
 
-        seg_ids = [f"E1S{i:03d}" for i in range(1, 13)]  # 12 scenes，非 4K 上限 9 → 切 2 张
+        seg_ids = [f"E1S{i:03d}" for i in range(1, 13)]
         project_data = {
             "title": "Test",
             "content_mode": "narration",
@@ -2199,11 +2201,12 @@ class TestCostEstimationService:
             "episodes": [{"episode": 1, "title": "Ep1", "script_file": "ep1.json"}],
         }
         scripts = {"ep1.json": _make_script(1, seg_ids, [6] * 12)}
+        if has_characters:
+            for segment in scripts["ep1.json"]["segments"]:
+                segment["characters_in_segment"] = ["主角"]
 
         result = await service.compute(project_data, scripts, project_name="test-grid-oversized")
 
-        expected_grids = len(plan_grid_chunks(seg_ids, "9:16", allow_large_grid=False))
-        assert expected_grids == 2
         assert result["episodes"][0]["totals"]["estimate"]["image"]["USD"] == pytest.approx(
             0.09 * expected_grids, abs=1e-4
         )

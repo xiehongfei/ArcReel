@@ -40,6 +40,19 @@ beforeEach(() => {
 });
 
 describe("GridPreviewView 的档位与批次预览", () => {
+  it("含角色分组按四宫格估算，即使供应商支持大宫格", async () => {
+    vi.spyOn(API, "getGridCapability").mockResolvedValue({
+      large_grid_allowed: true,
+      max_cell_count: 25,
+    });
+    const segments = makeSegments(9);
+    segments[5].characters_in_segment = ["角色甲"];
+    renderView(segments);
+
+    await waitFor(() => expect(screen.getByText(/^3 批 · 9 格/)).toBeInTheDocument());
+    expect(screen.getByText(/2×2/)).toBeInTheDocument();
+  });
+
   it("放行大宫格时按 5×5 切块，批次数取实际入队张数", async () => {
     vi.spyOn(API, "getGridCapability").mockResolvedValue({
       large_grid_allowed: true,

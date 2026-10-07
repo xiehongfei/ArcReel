@@ -95,3 +95,17 @@ export function computeGridSize(
   const batchCount = count > cellCount ? Math.ceil(count / cellCount) : 1;
   return { gridSize, rows: side, cols: side, cellCount, batchCount };
 }
+
+/** 含角色的分组封顶四宫格，与后端 plan_grid_chunks 的角色容量规则一致。 */
+export function computeGroupGridSize(
+  group: readonly {
+    characters_in_scene?: readonly string[];
+    characters_in_segment?: readonly string[];
+  }[],
+  maxCellCount: number = FALLBACK_MAX_CELL_COUNT,
+): GridLayout {
+  const hasCharacters = group.some(
+    (item) => (item.characters_in_scene?.length ?? item.characters_in_segment?.length ?? 0) > 0,
+  );
+  return computeGridSize(group.length, hasCharacters ? Math.min(maxCellCount, 4) : maxCellCount);
+}

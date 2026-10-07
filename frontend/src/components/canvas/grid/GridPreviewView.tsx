@@ -3,7 +3,7 @@ import { Loader2, Sparkles } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import { API } from "@/api";
 import { useAppStore } from "@/stores/app-store";
-import { groupBySegmentBreak, computeGridSize, matchGridsForGroup } from "@/utils/grid-layout";
+import { groupBySegmentBreak, computeGroupGridSize, matchGridsForGroup } from "@/utils/grid-layout";
 import { GridPreviewPanel } from "@/components/canvas/timeline/GridPreviewPanel";
 import type { GridGeneration } from "@/types/grid";
 import type { NarrationSegment, DramaScene } from "@/types";
@@ -43,7 +43,7 @@ export function GridPreviewView({
   const [refreshKey, setRefreshKey] = useState(0);
   const [generatingGroups, setGeneratingGroups] = useState<Set<string>>(new Set());
   // 单张宫格的格数上限由后端给：4×4 / 5×5 的 4K 门控要经供应商解析才能定，前端自行推导
-  // 必然与入队口径漂移。取不到时 computeGridSize 用保守默认值。
+  // 必然与入队口径漂移。取不到时 computeGroupGridSize 用保守默认值。
   const [maxCellCount, setMaxCellCount] = useState<number | undefined>(undefined);
 
   const groups = useMemo(() => groupBySegmentBreak(segments), [segments]);
@@ -107,7 +107,7 @@ export function GridPreviewView({
   const stats = useMemo(() => {
     // 一个分组超过单张格数上限时后端会切成多张宫格,批次数按实际入队张数累计
     const batches = groups.reduce(
-      (sum, group) => sum + computeGridSize(group.length, maxCellCount).batchCount,
+      (sum, group) => sum + computeGroupGridSize(group, maxCellCount).batchCount,
       0,
     );
     const cells = segments.length;
@@ -160,7 +160,7 @@ export function GridPreviewView({
 
       <div className="flex flex-col gap-3">
         {groups.map((group, idx) => {
-          const layout = computeGridSize(group.length, maxCellCount);
+          const layout = computeGroupGridSize(group, maxCellCount);
           const ids = getGridIdsForGroup(group);
           const groupKey = group
             .map((s) => getSegmentId(s, contentMode))

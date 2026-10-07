@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { computeGridSize, matchGridsForGroup } from "./grid-layout";
+import { computeGridSize, computeGroupGridSize, matchGridsForGroup } from "./grid-layout";
 
 interface FakeGrid {
   id: string;
@@ -68,6 +68,18 @@ describe("computeGridSize", () => {
       batchCount: 0,
     });
   });
+});
+
+describe("computeGroupGridSize", () => {
+  it.each(["characters_in_scene", "characters_in_segment"] as const)(
+    "caps %s groups at four cells without changing scenery capacity",
+    (field) => {
+      const group = Array.from({ length: 9 }, () => ({ [field]: ["角色甲"] }));
+      expect(computeGroupGridSize(group, 25)).toMatchObject({ gridSize: "grid_4", batchCount: 3 });
+      const empty = Array.from({ length: 9 }, () => ({ [field]: [] }));
+      expect(computeGroupGridSize(empty, 25)).toMatchObject({ gridSize: "grid_9", batchCount: 1 });
+    },
+  );
 });
 
 describe("matchGridsForGroup", () => {

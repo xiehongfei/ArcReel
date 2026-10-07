@@ -139,7 +139,7 @@ def _list_groups(
     分块与实际入队同源（``plan_grid_chunks``）：超上限分组展示的宫格张数与档位
     即实际生成的张数与档位。
     """
-    items, id_field, _, _, _ = get_storyboard_items(script)
+    items, id_field, char_field, _, _ = get_storyboard_items(script)
     aspect_ratio = video_aspect_ratio_of(project)
     groups = group_scenes_by_segment_break(items, id_field)
     if scene_ids is not None:
@@ -148,7 +148,7 @@ def _list_groups(
     lines = [f"共 {len(groups)} 个分组："]
     for i, group in enumerate(groups):
         ids = [item[id_field] for item in group]
-        plans = plan_grid_chunks(group, aspect_ratio, allow_large_grid=allow_large_grid)
+        plans = plan_grid_chunks(group, aspect_ratio, allow_large_grid=allow_large_grid, char_field=char_field)
         status = _describe_plans(plans)
         lines.append(f"  组 {i + 1}: {ids[0]}..{ids[-1]} ({len(ids)} 分镜) → {status}")
     return lines
@@ -312,7 +312,9 @@ async def handle_generate_grid(
         report_ids_by_grid: dict[str, list[str]] = {}
         grid_id_by_result: dict[str, str] = {}
         for group, target_ids in selected_groups:
-            for chunk, layout in plan_grid_chunks(group, aspect_ratio, allow_large_grid=allow_large_grid):
+            for chunk, layout in plan_grid_chunks(
+                group, aspect_ratio, allow_large_grid=allow_large_grid, char_field=char_field
+            ):
                 chunk_ids = [item[id_field] for item in chunk]
                 report_ids = [scene_id for scene_id in chunk_ids if scene_id in target_ids]
                 if not report_ids:

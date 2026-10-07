@@ -130,6 +130,24 @@ class TestCalculateGridLayout:
 
 
 class TestPlanGridChunks:
+    @pytest.mark.parametrize("char_field", ["characters_in_scene", "characters_in_segment"])
+    @pytest.mark.parametrize("allow_large", [False, True])
+    def test_character_groups_use_small_grids_without_losing_scenes(self, char_field, allow_large):
+        scenes = [{"id": i, char_field: ["角色A"] if i == 5 else []} for i in range(9)]
+        plans = plan_grid_chunks(scenes, "16:9", allow_large_grid=allow_large, char_field=char_field)
+        assert [(len(chunk), layout.grid_size) for chunk, layout in plans] == [
+            (4, "grid_4"),
+            (4, "grid_4"),
+            (1, "grid_4"),
+        ]
+        assert [scene for chunk, _ in plans for scene in chunk] == scenes
+
+    def test_empty_character_rosters_keep_scenery_grid_capacity(self):
+        scenes = [{"id": i, "characters_in_scene": []} for i in range(9)]
+        plans = plan_grid_chunks(scenes, "16:9", char_field="characters_in_scene")
+        assert len(plans) == 1
+        assert plans[0][1].grid_size == "grid_9"
+
     def test_empty_group_returns_no_plans(self):
         assert plan_grid_chunks([], "16:9") == []
 

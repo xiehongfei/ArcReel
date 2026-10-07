@@ -107,14 +107,24 @@ async def test_generate_grid_list_only_respects_4k_gate(
     assert forbidden not in text
 
 
+@pytest.mark.parametrize(
+    ("has_characters", "expected"),
+    [(False, "2 张宫格: grid_9 (3×3) + grid_4 (2×2)"), (True, "3 张宫格: grid_4 (2×2) + grid_4 (2×2) + grid_4 (2×2)")],
+)
 async def test_generate_grid_list_only_shows_split_for_oversized_group(
-    fake_ctx: ToolContext, monkeypatch: pytest.MonkeyPatch
+    fake_ctx: ToolContext, monkeypatch: pytest.MonkeyPatch, has_characters: bool, expected: str
 ) -> None:
     # 超过单张格数上限的分组，预览按切块后的张数与档位展示，与实际入队同源
     fake_ctx.pm.project_payload["generation_mode"] = "storyboard"
     fake_ctx.pm.project_payload["grid_storyboard"] = True
     fake_ctx.pm.script_payload["segments"] = [
-        {"segment_id": f"E1S{i:02d}", "image_prompt": "p", "segment_break": False} for i in range(1, 13)
+        {
+            "segment_id": f"E1S{i:02d}",
+            "image_prompt": "p",
+            "segment_break": False,
+            "characters_in_segment": ["主角"] if has_characters else [],
+        }
+        for i in range(1, 13)
     ]
 
     async def _gate(_project: dict) -> bool:
@@ -125,7 +135,7 @@ async def test_generate_grid_list_only_shows_split_for_oversized_group(
     out = await call(tool_obj, {"script": "episode_1.json", "list_only": True})
     assert out.get("is_error") is not True
     text = out["content"][0]["text"]
-    assert "2 张宫格: grid_9 (3×3) + grid_4 (2×2)" in text
+    assert expected in text
 
 
 async def test_generate_grid_falls_back_on_null_aspect_ratio(
