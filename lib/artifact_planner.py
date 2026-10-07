@@ -40,7 +40,6 @@ from lib.asset_derivatives import (
 )
 from lib.asset_types import ASSET_SPECS, DERIVATIVES_FIELD, AssetSpec, asset_name_comparison_key
 from lib.episode_paths import episode_source_relpath
-from lib.grid.character_identity import GridCharacterContext, project_grid_character_context
 from lib.grid.layout import grid_aspect_ratio_for
 from lib.grid.models import GridGeneration
 from lib.media_artifact_currency import build_current_audio_artifact_basis, build_current_video_artifact_basis
@@ -63,6 +62,11 @@ from lib.speech_presentation import (
     PresentationMedia,
     materialize_speech_presentation,
     presentation_artifact_paths,
+)
+from lib.storyboard_character_identity import (
+    GridCharacterContext,
+    project_character_context,
+    project_grid_character_context,
 )
 from lib.storyboard_sequence import get_storyboard_items
 from lib.version_manager import VersionManager
@@ -659,6 +663,11 @@ class TargetStatePlanner:
                         style_description=style_description,
                         aspect_ratio=aspect_ratio,
                         references=references,
+                        character_context=project_character_context(
+                            [item],
+                            char_field=char_field,
+                            characters=self.project.get("characters"),
+                        ),
                     )
                 except (OSError, TypeError, ValueError):
                     continue

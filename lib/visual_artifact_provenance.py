@@ -15,11 +15,11 @@ from pathlib import Path
 from lib.artifact_manifest import ArtifactBasis
 from lib.asset_types import ASSET_TYPES, normalize_asset_name
 from lib.content_digest import sha256_file
-from lib.grid.character_identity import GridCharacterContext
 from lib.grid.prompt_builder import project_grid_image_prompt
 from lib.prompt_utils import project_storyboard_image_prompt
 from lib.reference_video.request_projection import ResolvedReferenceAsset
 from lib.reference_video.text_parser import strip_speech_marks
+from lib.storyboard_character_identity import CharacterContext, GridCharacterContext
 
 
 @dataclass(frozen=True, slots=True)
@@ -160,6 +160,7 @@ def build_storyboard_image_visual_basis(
     aspect_ratio: str,
     style_description: str = "",
     references: Sequence[VisualReference] = (),
+    character_context: CharacterContext | None = None,
 ) -> ArtifactBasis:
     """Describe one ordinary storyboard image and its actual ordered image inputs."""
 
@@ -169,11 +170,13 @@ def build_storyboard_image_visual_basis(
     if image_prompt is None:
         raise ValueError("image_prompt is pending; a storyboard image has no visual basis yet")
     prompt, style_input = project_storyboard_image_prompt(image_prompt, style)
+    resolved_character_context = _resolve_storyboard_character_context(character_context)
     inputs: dict[str, object] = {
         "resource_id": identity,
         "image_prompt": prompt,
         "canvas": {"aspect_ratio": _require_non_empty("aspect_ratio", aspect_ratio)},
         "references": _reference_evidence(references),
+        "characters": _project_storyboard_characters(resolved_character_context),
     }
     if style_input or not isinstance(prompt, str):
         inputs["style"] = style_input
@@ -181,7 +184,7 @@ def build_storyboard_image_visual_basis(
         inputs["style_description"] = normalized_description
     return ArtifactBasis.build(
         "artifact-visual/storyboard-image",
-        kind_version=1,
+        kind_version=2,
         inputs=inputs,
     )
 
@@ -410,6 +413,26 @@ def _reference_visual_lines(text: str) -> list[str]:
         if line:
             lines.append(line)
     return lines
+
+
+def _resolve_storyboard_character_context(context: CharacterContext | None) -> CharacterContext:
+    resolved = context or CharacterContext(identities=(), cell_characters=())
+    if len(resolved.cell_characters) > 1:
+        raise ValueError("storyboard character context must contain at most one roster")
+    identity_names = [identity.name for identity in resolved.identities]
+    if len(set(identity_names)) != len(identity_names):
+        raise ValueError("storyboard character identities must be unique")
+    known_names = set(identity_names)
+    roster = resolved.cell_characters[0] if resolved.cell_characters else ()
+    if any(name not in known_names for name in roster):
+        raise ValueError("storyboard roster contains an unknown character identity")
+    return resolved
+
+
+def _project_storyboard_characters(context: CharacterContext) -> list[dict[str, object]]:
+    descriptions = context.descriptions
+    roster = context.cell_characters[0] if context.cell_characters else ()
+    return [{"name": name, "description": descriptions[name]} for name in roster]
 
 
 def _validate_grid_members(

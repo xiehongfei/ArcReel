@@ -26,11 +26,11 @@ from lib.artifact_manifest import (
 )
 from lib.artifact_version_provenance import IMAGE_ARTIFACT_BASIS_FIELD
 from lib.async_thread import run_noninterruptible_sync
-from lib.grid.character_identity import GridCharacterContext, project_grid_character_context
 from lib.grid.models import GridGeneration
 from lib.grid_manager import GridManager
 from lib.path_safety import safe_join
 from lib.project_manager import get_project_manager
+from lib.storyboard_character_identity import GridCharacterContext, project_grid_character_context
 from lib.storyboard_sequence import get_storyboard_items
 from lib.version_manager import StagedVersionCommit, VersionManager
 from lib.visual_artifact_provenance import (

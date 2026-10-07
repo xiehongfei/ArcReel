@@ -27,6 +27,7 @@ from lib.prompt_builders import render_storyboard_image_prompt
 from lib.prompt_utils import render_storyboard_video_prompt
 from lib.reference_image_numbering import ReferenceImageClamp, clamp_reference_images
 from lib.script_models import resolve_content_mode
+from lib.storyboard_character_identity import project_character_context
 from lib.storyboard_sequence import find_storyboard_item, get_storyboard_items
 from server.services.generation_context import ImageLaneRequest, resolve_generation_context
 from server.services.generation_tasks import collect_storyboard_references
@@ -127,18 +128,18 @@ async def preview_item_prompts(
     ``projects`` 供工具运行时把已解析的 ProjectManager 注入进来（REST 路由用进程默认实例）。
     """
 
-    def _load() -> tuple[dict[str, Any], Path, dict[str, Any], dict[str, Any], str]:
+    def _load() -> tuple[dict[str, Any], Path, dict[str, Any], dict[str, Any], str, str | None]:
         manager = projects if projects is not None else get_project_manager()
         project = manager.load_project(project_name)
         project_path = manager.get_project_path(project_name)
         script = manager.load_script(project_name, script_file)
-        items, id_field, *_ = get_storyboard_items(script)
+        items, id_field, char_field, *_ = get_storyboard_items(script)
         resolved = find_storyboard_item(items, id_field, item_id)
         if resolved is None:
             raise ScriptItemNotFound(item_id)
-        return project, project_path, script, resolved[0], resolve_content_mode(script, project)
+        return project, project_path, script, resolved[0], resolve_content_mode(script, project), char_field
 
-    project, project_path, script, item, content_mode = await asyncio.to_thread(_load)
+    project, project_path, script, item, content_mode, char_field = await asyncio.to_thread(_load)
     # 声音绑定按项目当前的视频能力档解析（非 drama 或无声一律 None），与执行期同一判据。
     voice_characters = await resolve_voice_context(project, content_mode)
 
@@ -188,6 +189,11 @@ async def preview_item_prompts(
     def _render_both() -> ItemPromptPreview:
         style = project.get("style", "")
         style_description = project.get("style_description", "")
+        character_context = project_character_context(
+            [item],
+            char_field=char_field,
+            characters=project.get("characters"),
+        )
         image = _render(
             item.get("image_prompt"),
             lambda prompt: render_storyboard_image_prompt(
@@ -195,6 +201,7 @@ async def preview_item_prompts(
                 style=style if isinstance(style, str) else "",
                 style_description=style_description if isinstance(style_description, str) else "",
                 references=_storyboard_references(),
+                character_context=character_context,
             ),
         )
         if image.text is not None and image_warnings:

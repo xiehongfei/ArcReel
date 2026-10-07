@@ -4,7 +4,6 @@ import pytest
 
 from lib.grid.prompt_builder import (
     _compute_panel_aspect,
-    _extract_action,
     _extract_image_desc,
     build_grid_prompt,
     pending_grid_prompt_ids,
@@ -73,27 +72,6 @@ class TestPendingGridPromptIds:
         assert pending_grid_prompt_ids(scenes, "scene_id") == ["S2", "S3", "S4"]
 
 
-class TestExtractAction:
-    def test_dict_video_prompt_returns_action(self):
-        scene = {"video_prompt": {"action": "walks away", "camera_motion": "pan"}}
-        result = _extract_action(scene)
-        assert result == "walks away"
-
-    def test_string_video_prompt_returns_as_is(self):
-        scene = {"video_prompt": "character runs fast"}
-        result = _extract_action(scene)
-        assert result == "character runs fast"
-
-    def test_dict_missing_action_returns_empty(self):
-        scene = {"video_prompt": {"camera_motion": "zoom"}}
-        result = _extract_action(scene)
-        assert result == ""
-
-    def test_pending_video_prompt_returns_empty(self):
-        assert _extract_action({"video_prompt": None}) == ""
-        assert _extract_action({}) == ""
-
-
 class TestComputePanelAspect:
     def test_grid_16_9_2x2(self):
         assert _compute_panel_aspect("16:9", 2, 2) == "16:9"
@@ -140,6 +118,42 @@ class TestBuildGridPrompt:
         assert "scene1" in prompt
         assert "scene4" in prompt
 
+    @pytest.mark.parametrize(
+        "action", [{"action": "@[角色A]举起书本然后跑向门口"}, "@[角色A]举起书本然后跑向门口", None]
+    )
+    def test_cells_only_use_their_own_first_frame(self, action):
+        scenes = [
+            self._scene("S1", "@[角色A]坐在书桌前", "unused", ("角色A",)),
+            self._scene("S2", "@[角色B]独自站在门口", "unused", ("角色B",)),
+        ]
+        scenes[0]["video_prompt"] = action
+        prompt = build_grid_prompt(
+            scenes=scenes,
+            id_field="scene_id",
+            rows=2,
+            cols=2,
+            style="",
+            style_description="",
+            char_field="characters_in_scene",
+        )
+        cells = prompt.split("【各格内容】\n", 1)[1]
+        second = cells.split("格1（row1 col2）", 1)[1].split("格2（row2 col1）", 1)[0]
+        assert "角色B独自站在门口" in second
+        assert "角色A" not in second
+        assert "举起书本" not in prompt
+        assert cells.count("角色A坐在书桌前") == 1
+        assert cells.count("角色B独自站在门口") == 1
+        changed = [dict(scene, video_prompt={"action": "另一段视频动作"}) for scene in scenes]
+        assert prompt == build_grid_prompt(
+            scenes=changed,
+            id_field="scene_id",
+            rows=2,
+            cols=2,
+            style="",
+            style_description="",
+            char_field="characters_in_scene",
+        )
+
     def test_includes_placeholders(self):
         scenes = [self._scene(f"S{i}", f"s{i}", f"a{i}") for i in range(1, 6)]
         prompt = build_grid_prompt(
@@ -169,7 +183,7 @@ class TestBuildGridPrompt:
         )
         assert "角色A（图1）在s1" in prompt
         assert "角色A（图1）与路人对视" in prompt
-        assert "角色A（图1）抬手，路人后退" in prompt
+        assert "抬手，路人后退" not in prompt
         assert "@[" not in prompt
 
     def test_character_identities_and_per_cell_unique_rosters(self):
@@ -192,12 +206,13 @@ class TestBuildGridPrompt:
             characters=characters,
         )
 
-        assert prompt.count("短而整齐的头发，现代校服") == 1
-        assert prompt.count("束发，唐代蓝袍") == 1
-        assert "本格角色：子墨1人、骆宾王1人。" in prompt
-        assert "本格中上述角色各恰好1人" in prompt
-        assert "本格角色：子墨1人。" in prompt
-        assert "本格只出现上述角色1人" in prompt
+        assert "短而整齐的头发，现代校服" not in prompt
+        assert "束发，唐代蓝袍" not in prompt
+        assert "脸型、眼形、眼距、鼻口比例、发际线和头身比例" in prompt
+        assert "本格主体：子墨、骆宾王。" in prompt
+        assert "每个可见角色只出现一个独立主体" in prompt
+        assert "本格主体：子墨。" in prompt
+        assert "采用参考图外观" in prompt
         assert "子墨在左侧，骆宾王在右侧" in prompt
 
     def test_string_prompts(self):
@@ -282,7 +297,7 @@ class TestBuildGridPrompt:
         )
         cells = prompt.split("【各格内容】\n", 1)[1].split("\n\n", 1)[0].splitlines()
         assert cells == [
-            "格0（row1 col1）— S1开场：",
+            "格0（row1 col1）— S1首帧：",
             "  s1；ambiance: calm，lighting: natural，shot_type: medium",
             "格1（row1 col2）— 空占位：纯灰色背景，无任何内容",
             "格2（row2 col1）— 空占位：纯灰色背景，无任何内容",
@@ -290,7 +305,7 @@ class TestBuildGridPrompt:
         ]
 
     def test_no_placeholders_when_exact_fit(self):
-        # 4 scenes, 2x2 grid -> no placeholders needed (4 content cells: open, trans, trans, close)
+        # Four scenes fill four first-frame cells without placeholders.
         scenes = [self._scene(f"S{i}", f"s{i}", f"a{i}") for i in range(1, 5)]
         prompt = build_grid_prompt(
             scenes=scenes, id_field="scene_id", rows=2, cols=2, style="realistic", style_description=""

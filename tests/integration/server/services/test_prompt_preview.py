@@ -126,6 +126,8 @@ class TestPreviewMatchesExecution:
         await generation_tasks.execute_video_task("demo", ITEM_ID, {"script_file": "episode_1.json"})
 
         assert preview.video.text == generator.video_calls[0]["prompt"]
+        assert preview.video.text is not None
+        assert preview.video.text.count("First_Frame_Continuity: 全程严格继承输入首帧") == 1
 
     async def test_drama_text_form_video_prompt_keeps_utterance_speech(self, tmp_path, monkeypatch):
         """文本形态不承载台词：发声序列仍由 utterances 决定，渲染层照常注入。"""
@@ -192,7 +194,14 @@ class TestPreviewMatchesExecution:
         assert text is not None
         assert (
             "Reference_Images: 图1为角色参考图；图2为场景参考图；图3为道具参考图；图4为上一分镜图，只参考构图与色调。\n"
-            "Scene: 图1站在图2门口，手里握着图3，身后是无名路人\n"
+            "【角色身份】\n"
+            "- Alice（图1）\n"
+            "- 已绑定参考图的角色必须严格保持各自参考图中的脸型、眼形、眼距、鼻口比例、发际线和头身比例；面部、发型、体型、服装和配饰不得互换\n"
+            "\n"
+            "本镜角色：Alice（图1）1人。\n"
+            "本镜只出现上述角色1人，同一角色不得重复出现。\n"
+            "\n"
+            "Scene: Alice（图1）站在图2门口，手里握着图3，身后是无名路人\n"
         ) in text
         assert text == generator.image_calls[0]["prompt"]
 
@@ -216,6 +225,7 @@ class TestPreviewMatchesExecution:
         assert preview.video.is_text_form
         assert text.startswith(body)
         assert text == generator.video_calls[0]["prompt"]
+        assert text.count("First_Frame_Continuity: 全程严格继承输入首帧") == 1
 
     async def test_rendering_a_preview_text_again_does_not_duplicate_injections(self, tmp_path, monkeypatch):
         """结构化 → 文本以当前渲染结果为初值：再渲染一次不叠出第二份风格与反向约束。"""

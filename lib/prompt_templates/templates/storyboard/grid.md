@@ -3,7 +3,7 @@ id: storyboard/grid
 category: storyboard
 title: 宫格联合图
 description: >-
-  把一组分镜按首尾帧链画进一张宫格联合图，生成后按画格切回各分镜。
+  把一组分镜的静态首帧按顺序画进一张宫格联合图，每格与一个分镜一一对应，生成后按画格切回各分镜。
   画格等大、无边框、无间隙、不合并不遗漏已由布局要求正面写明，Avoid 行只追加布局要求没覆盖到的
   反面形态（边框、间隙或留白、合并 / 缺失 / 错位、连续全景），不再重复质量词、拼贴感、
   纯色背景条与画格大小比例。
@@ -16,9 +16,7 @@ slots:
   cell_count: 画格总数
   grid_aspect_ratio: 整张联合图的比例
   panel_aspect_ratio: 单个画格的比例，由整图比例与行列数算出
-  last_chain_cell: 帧链最后一格的序号
-  opening: 格0 的开场分镜（scene_id、description、roster）
-  transitions: 过渡格列表（index、row、col、from_id、to_id、action、description、roster）
+  cells: 静态首帧列表（index、row、col、scene_id、description、roster）
   placeholders: 空占位格列表（index、row、col）
   character_identities: 角色身份段（预渲染，无角色时为空）
   style: 项目画风
@@ -41,17 +39,21 @@ Reference_Images: {{ reference_images }}
 
 {% if character_identities %}
 {{ character_identities }}
+
+【外观优先级】
+- 已绑定的角色资产图是人物外观依据：脸部结构、年龄感、发型、头身比例、默认服装与配饰以各自参考图为准，不把不同角色的造型分配给对方。
+- 本格正文只决定动作准备、位置、视线、表情与道具互动；若正文外观措辞与角色参考图冲突，采用参考图外观。换装以本格明确绑定的衍生角色资产为准，不自行设计新衣服。
+- 全局风格用于环境、光照和整体呈现，不得覆盖角色参考图的造型，不得统一重塑面孔、放大眼睛或把成年角色幼态化。角色设计图中的多个视角是同一身份，不是多个人。
 {% endif %}
-【帧链节奏】
-本宫格采用首尾帧链式结构：
-- 格0 是第一个场景的开场画面
-- 格1~格{{ last_chain_cell }} 是相邻场景的过渡帧（前一场景的结束 = 后一场景的开始）
-- 相邻格之间应体现画面的自然过渡和动作延续
+【逐格首帧】
+- 每格只画对应分镜主要动作开始前的一个静态瞬间，严格按下方编号与位置一一对应。
+- 不把动作过程拆成额外画格，不重演上一格的动作，不移动后续画格来容纳额外画面。
+- 每格只使用本格角色清单与画面内容，不把相邻格人物带入本格；切换人物或景别不代表两镜人物必须同框。
+- 同一时空的角色外观、空间关系与光照保持连贯，但不强制把前一镜结束与后一镜开始合并为同一个画面。
+- 全息、透明、发光等效果只改变呈现方式，不改变被投影角色的脸部结构、年龄感或身体比例。
+- 成图前逐格核对镜头归属、主体数量和身份：无漏格、增格、错位，无错穿服装、面孔混合或成年角色幼态化。
 
 【各格内容】
-格0（row1 col1）— {{ opening.scene_id }}开场：
-{% if opening.roster %}{{ opening.roster }}
-{% endif %}  {{ opening.description }}
 {{ partial("storyboard/grid/lists/cells") }}
 
 {{ partial("shared/style") }}

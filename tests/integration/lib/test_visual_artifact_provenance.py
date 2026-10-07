@@ -19,6 +19,7 @@ from lib.artifact_manifest import (
 from lib.grid.character_identity import GridCharacterContext, GridCharacterIdentity
 from lib.reference_video.request_projection import ResolvedReferenceAsset
 from lib.script_models import ReferenceResource
+from lib.storyboard_character_identity import CharacterContext, CharacterIdentity
 from lib.visual_artifact_provenance import (
     GridStoryboardVisual,
     VisualReference,
@@ -216,19 +217,71 @@ def test_storyboard_text_basis_tracks_the_style_sent_to_the_request(tmp_path: Pa
     assert changed_description.digest != first.digest
 
 
+def test_storyboard_image_basis_tracks_character_roster_and_description(tmp_path: Path) -> None:
+    reference = tmp_path / "reference.png"
+    reference.write_bytes(b"visual")
+
+    kwargs = {
+        "resource_id": "E1S01",
+        "image_prompt": "阿黎站在雨中",
+        "style": "水墨",
+        "aspect_ratio": "16:9",
+        "references": (VisualReference(path=reference, role="asset_sheet"),),
+    }
+    first = build_storyboard_image_visual_basis(
+        **kwargs,
+        character_context=CharacterContext(
+            identities=(CharacterIdentity(name="阿黎", description="银色短发"),),
+            cell_characters=(("阿黎",),),
+        ),
+    )
+    changed_description = build_storyboard_image_visual_basis(
+        **kwargs,
+        character_context=CharacterContext(
+            identities=(CharacterIdentity(name="阿黎", description="黑色长发"),),
+            cell_characters=(("阿黎",),),
+        ),
+    )
+    changed_roster = build_storyboard_image_visual_basis(
+        **kwargs,
+        character_context=CharacterContext(
+            identities=(
+                CharacterIdentity(name="阿黎", description="银色短发"),
+                CharacterIdentity(name="掌柜", description="黑色长须"),
+            ),
+            cell_characters=(("阿黎", "掌柜"),),
+        ),
+    )
+    video_action_only = build_storyboard_image_visual_basis(
+        **kwargs,
+        character_context=CharacterContext(
+            identities=(CharacterIdentity(name="阿黎", description="银色短发"),),
+            cell_characters=(("阿黎",),),
+        ),
+    )
+
+    assert first.kind_version == 2
+    inputs = first.to_evidence_dict()["inputs"]
+    assert isinstance(inputs, dict)
+    assert inputs["characters"] == [{"name": "阿黎", "description": "银色短发"}]
+    assert changed_description.digest != first.digest
+    assert changed_roster.digest != first.digest
+    assert video_action_only.digest == first.digest
+
+
 @pytest.mark.parametrize(
     ("image_prompt", "video_prompt", "image_digest", "video_digest"),
     [
         (
             "雨中街道",
             "人物起身",
-            "sha256-v1:0e573ee810f39f19d7c6e05fcfa9ef80b9a90fc728e756caa4786c9f0c1480b3",
+            "sha256-v1:11839d2defc7b7f25bcb83f3eea8d38bbfd4f93dd41d06d36d0cc5a51ccd7591",
             "sha256-v1:add7a26ec062bc2eff5f7e0294f4d26aaf23412eb7f47b7c21fdd495461ac07d",
         ),
         (
             {"scene": "雨中街道"},
             {"action": "人物起身", "camera_motion": "Static"},
-            "sha256-v1:fa09211c127b7370deb2de5f700375776a690f988fa3576942cccbad8e30c85d",
+            "sha256-v1:57b99f8179caa7024b4eca4a56b719929341a2e5f43e8fca3b46b1c2a598cc05",
             "sha256-v1:8ab3fec948727d862f38788fae4faf9546344dd36421d46af8d3d6ebd8080d89",
         ),
     ],

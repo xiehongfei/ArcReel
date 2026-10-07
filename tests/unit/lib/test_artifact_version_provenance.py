@@ -40,3 +40,21 @@ def test_grid_member_versions_remain_restorable(kind_version: int) -> None:
         )
         == basis
     )
+
+
+@pytest.mark.parametrize("kind_version", [1, 2])
+def test_storyboard_image_versions_remain_restorable(kind_version: int) -> None:
+    basis = ArtifactBasis.build(
+        "artifact-visual/storyboard-image",
+        kind_version=kind_version,
+        inputs={"resource_id": "E1S01"},
+    )
+
+    assert (
+        parse_image_version_basis(
+            "storyboards",
+            "E1S01",
+            {IMAGE_ARTIFACT_BASIS_FIELD: basis.to_evidence_dict()},
+        )
+        == basis
+    )

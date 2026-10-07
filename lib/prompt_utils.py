@@ -45,7 +45,13 @@ CAMERA_MOTIONS: list[str] = list(get_args(CameraMotion))
 
 
 def image_prompt_to_yaml(
-    image_prompt: dict, project_style: str, *, reference_images: str = "", style_description: str = ""
+    image_prompt: dict,
+    project_style: str,
+    *,
+    reference_images: str = "",
+    style_description: str = "",
+    character_identities: str = "",
+    character_roster: str = "",
 ) -> str:
     """
     将 imagePrompt 结构转换为 YAML 格式字符串
@@ -64,9 +70,12 @@ def image_prompt_to_yaml(
         reference_images: 参考图类型声明行的值（``lib.reference_image_numbering``），非空时作为
             ``Reference_Images`` 键插在风格块与 ``Scene`` 之间
         style_description: 项目风格描述
+        character_identities: 角色身份表，插在参考图声明与 ``Scene`` 之间
+        character_roster: 本镜角色清单，紧随身份表
 
     Returns:
-        YAML 格式字符串，键序 Style / Visual style / Reference_Images / Scene / Composition / Avoid
+        YAML 格式字符串，键序 Style / Visual style / Reference_Images / Scene / Composition / Avoid；
+        角色身份表与本镜清单是插在声明与 Scene 之间的纯文本，不进入 YAML 键。
     """
     ordered: dict[str, Any] = {"Scene": image_prompt["scene"]}
     ordered["Composition"] = {
@@ -80,6 +89,8 @@ def image_prompt_to_yaml(
             style=normalize_style_value(project_style),
             style_description=normalize_style_value(style_description),
             reference_images=yaml_section({REFERENCE_IMAGES_KEY: reference_images}) if reference_images else "",
+            character_identities=character_identities,
+            character_roster=character_roster,
             structured_body=_dump_prompt_yaml(ordered).rstrip(),
             text_body="",
         )

@@ -45,6 +45,31 @@ class TestBuildPrompt:
         assert "\n\n村口黄昏的长镜头\n\n" in out
         assert out.endswith("\n\nAvoid: 水印、多余文字、Logo")
 
+    def test_character_identity_without_reference_slots(self) -> None:
+        from server.media_tools.storyboards import _build_prompt
+
+        segment = {
+            "segment_id": "E1S02",
+            "characters_in_segment": ["Alice"],
+            "image_prompt": {
+                "scene": "@[Alice]站在村口",
+                "composition": {"shot_type": "Medium Shot", "lighting": "暖光", "ambiance": "薄雾"},
+            },
+        }
+        out = _build_prompt(
+            segment,
+            "真人电视剧风格",
+            "Soft light",
+            "segment_id",
+            char_field="characters_in_segment",
+            characters={"Alice": {"description": "hero"}},
+        )
+
+        assert "【角色身份】\n- Alice\n" in out
+        assert "本镜角色：Alice1人。\n本镜只出现上述角色1人，同一角色不得重复出现。\n" in out
+        assert "Scene: Alice站在村口\n" in out
+        assert "（图" not in out
+
 
 async def test_generate_storyboards_happy(fake_ctx: ToolContext, monkeypatch) -> None:
     from server.media_tools import storyboards as mod

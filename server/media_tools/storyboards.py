@@ -33,6 +33,7 @@ from lib.reference_catalog import build_reference_catalog
 from lib.resource_paths import resource_relative_path
 from lib.script_models import get_generated_assets, resolve_content_mode
 from lib.script_skeleton import ensure_route_skeleton
+from lib.storyboard_character_identity import project_character_context
 from lib.storyboard_sequence import (
     build_storyboard_dependency_plan,
     get_storyboard_items,
@@ -92,11 +93,23 @@ def _build_prompt(
     style: str,
     style_description: str,
     id_field: str,
+    *,
+    char_field: str | None = None,
+    characters: object = None,
 ) -> str:
     image_prompt = segment.get("image_prompt", "")
     if not image_prompt:
         raise ValueError(f"分镜 {segment[id_field]} 缺少 image_prompt 字段")
-    return render_storyboard_image_prompt(image_prompt, style=style, style_description=style_description)
+    return render_storyboard_image_prompt(
+        image_prompt,
+        style=style,
+        style_description=style_description,
+        character_context=project_character_context(
+            [segment],
+            char_field=char_field,
+            characters=characters,
+        ),
+    )
 
 
 async def handle_generate_storyboards(ctx: ToolContext, args: dict[str, Any]) -> ToolOutcome[Any]:
@@ -123,7 +136,7 @@ async def handle_generate_storyboards(ctx: ToolContext, args: dict[str, Any]) ->
                 script, resolve_content_mode(script, project_data), project_data.get("generation_mode")
             )
 
-        items, id_field, _char_field, _scene_field, _prop_field = get_storyboard_items(script)
+        items, id_field, char_field, _scene_field, _prop_field = get_storyboard_items(script)
         resolver = active_artifact_currency_resolver(project_dir, project_data)
         episode = (
             resolve_artifact_episode(
@@ -172,7 +185,14 @@ async def handle_generate_storyboards(ctx: ToolContext, args: dict[str, Any]) ->
                 )
                 continue
             try:
-                _build_prompt(item, style, style_description, id_field)
+                _build_prompt(
+                    item,
+                    style,
+                    style_description,
+                    id_field,
+                    char_field=char_field,
+                    characters=project_data.get("characters"),
+                )
             except (KeyError, TypeError, ValueError) as exc:
                 builder.block(
                     state.unit_id,

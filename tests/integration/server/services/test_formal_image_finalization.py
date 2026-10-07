@@ -346,6 +346,7 @@ class TestGenerationTasks:
         tmp_path,
         monkeypatch,
     ):
+        from lib.storyboard_character_identity import project_character_context
         from lib.visual_artifact_provenance import VisualReference, build_storyboard_image_visual_basis
 
         project_path = prepare_files(tmp_path)
@@ -388,6 +389,11 @@ class TestGenerationTasks:
                     logical_type="storyboard",
                     logical_id="E1S01",
                 ),
+            ),
+            character_context=project_character_context(
+                [fake_pm.script["segments"][1]],
+                char_field="characters_in_segment",
+                characters=fake_pm.project["characters"],
             ),
         )
         captured_basis: list[ArtifactBasis] = []

@@ -113,6 +113,11 @@ from lib.script_models import resolve_content_mode
 from lib.script_skeleton import SKELETON_ENTITY_TYPES, SKELETON_ITEM_LABEL_KEYS, resolve_script_kind
 from lib.speech_artifact_provenance import build_video_duration_basis
 from lib.speech_composition import SpeechAdmissionError, admit_script_unit
+from lib.storyboard_character_identity import (
+    CharacterContext,
+    project_character_context,
+    project_grid_character_context,
+)
 from lib.storyboard_sequence import (
     find_storyboard_item,
     get_storyboard_items,
@@ -391,11 +396,16 @@ def _normalize_storyboard_prompt(
     style: str,
     style_description: str = "",
     references: Sequence[ReferenceImageSlot] = (),
+    character_context: CharacterContext | None = None,
 ) -> str:
     """Render one semantic storyboard prompt through the shared provider projection."""
 
     return render_storyboard_image_prompt(
-        prompt, style=style, style_description=style_description, references=references
+        prompt,
+        style=style,
+        style_description=style_description,
+        references=references,
+        character_context=character_context,
     )
 
 
@@ -733,6 +743,37 @@ class StoryboardReferenceSet:
             visual_references=self.visual_references[: clamp.kept],
             warnings=(warning,),
         )
+
+
+def collect_storyboard_character_references(
+    project: dict,
+    project_path: Path,
+    script: dict[str, Any],
+    resource_id: str,
+    *,
+    currency_resolver: ArtifactCurrencyResolver,
+    formal_claims: list[ArtifactInputClaim] | None = None,
+) -> StoryboardReferenceSet:
+    """按分镜角色名单收集本体或衍生资产图，不收集其他类型参考图。"""
+    items, id_field, char_field, scene_field, prop_field = get_storyboard_items(script)
+    resolved = find_storyboard_item(items, id_field, resource_id)
+    if resolved is None:
+        raise ValueError(f"scene/segment not found: {resource_id}")
+    item = resolved[0]
+    character_item = {char_field: item.get(char_field, [])} if char_field is not None else {}
+    visuals: list[VisualReference] = []
+    references, _ = _collect_sheet_references(
+        project,
+        project_path,
+        [character_item],
+        char_field=char_field,
+        scene_field=scene_field,
+        prop_field=prop_field,
+        visual_references=visuals,
+        currency_resolver=currency_resolver,
+        formal_claims=formal_claims,
+    )
+    return StoryboardReferenceSet(item=item, provider_references=list(references), visual_references=visuals)
 
 
 def collect_storyboard_references(
@@ -1672,6 +1713,7 @@ class _StoryboardImageInputs:
     project_path: Path
     style: str
     style_description: str
+    char_field: str | None
     currency_resolver: ArtifactCurrencyResolver
     claims: list[ArtifactInputClaim]
     references: StoryboardReferenceSet
@@ -1696,6 +1738,7 @@ async def execute_storyboard_task(
         _project = get_project_manager().load_project(project_name)
         _project_path = get_project_manager().get_project_path(project_name)
         _script = get_project_manager().load_script(project_name, script_file)
+        _, _, _char_field, _, _ = get_storyboard_items(_script)
         _script_input = resolve_usable_episode_script_input(
             project_path=_project_path,
             project=_project,
@@ -1724,6 +1767,7 @@ async def execute_storyboard_task(
             project_path=_project_path,
             style=_style,
             style_description=_style_description,
+            char_field=_char_field,
             currency_resolver=_currency_resolver,
             claims=_formal_claims,
             references=_references,
@@ -1748,8 +1792,17 @@ async def execute_storyboard_task(
         _assembled = inputs.references
         _sent = _assembled.clamped(context.image.max_reference_images, model=context.image.backend_model)
         _semantic_prompt = _assembled.item.get("image_prompt")
+        _character_context = project_character_context(
+            [_assembled.item],
+            char_field=inputs.char_field,
+            characters=inputs.project.get("characters"),
+        )
         _prompt_text = _normalize_storyboard_prompt(
-            _semantic_prompt, inputs.style, inputs.style_description, references=_sent.visual_references
+            _semantic_prompt,
+            inputs.style,
+            inputs.style_description,
+            references=_sent.visual_references,
+            character_context=_character_context,
         )
         # 依据与 claim 按完整装配集冻结登记，供应商只收裁剪后的前几张：与目标态规划器同口径。
         _frozen = freeze_image_references(_assembled.provider_references or None, _assembled.visual_references)
@@ -1768,6 +1821,7 @@ async def execute_storyboard_task(
                 style_description=inputs.style_description,
                 aspect_ratio=get_aspect_ratio(project, "storyboards"),
                 references=_frozen.visual_references,
+                character_context=_character_context,
             )
         except BaseException:
             _frozen.cleanup()
@@ -3264,7 +3318,6 @@ async def execute_grid_task(
     2. Generate the joint image via MediaGenerator (versioned as resource_type "grids")
     3. Mark completed and split the requested cells before the task settles
     """
-    from lib.grid.character_identity import project_grid_character_context
     from lib.grid.layout import GRID_FALLBACK_RESOLUTION, grid_aspect_ratio_for
     from lib.grid.prompt_builder import build_grid_prompt
     from lib.grid_manager import GridManager

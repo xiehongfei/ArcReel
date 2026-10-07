@@ -10,6 +10,7 @@ import pytest
 from lib.artifact_activation import active_artifact_currency_resolver
 from lib.artifact_manifest import ArtifactKey, ArtifactStatus, ProjectArtifactManifestAdapter
 from lib.image_backends.vidu import ViduImageBackend
+from lib.storyboard_character_identity import project_character_context
 from lib.visual_artifact_provenance import VisualReference, build_storyboard_image_visual_basis
 from server.services import generation_context, generation_tasks
 from tests.fakes import hook_claim_recheck
@@ -32,7 +33,19 @@ CLAMPED_PROMPT = (
     "Style: Anime\n"
     "Visual style: cinematic\n"
     "Reference_Images: 图1、图2、图3、图4、图5、图6为角色参考图；图7为场景参考图。\n"
-    "Scene: 图1握着玉佩立在图7门口\n"
+    "【角色身份】\n"
+    "- Alice（图1）\n"
+    "- 配角1（图2）\n"
+    "- 配角2（图3）\n"
+    "- 配角3（图4）\n"
+    "- 配角4（图5）\n"
+    "- 配角5（图6）\n"
+    "- 已绑定参考图的角色必须严格保持各自参考图中的脸型、眼形、眼距、鼻口比例、发际线和头身比例；面部、发型、体型、服装和配饰不得互换\n"
+    "\n"
+    "本镜角色：Alice（图1）1人、配角1（图2）1人、配角2（图3）1人、配角3（图4）1人、配角4（图5）1人、配角5（图6）1人。\n"
+    "本镜中上述角色各恰好1人，身份与外观不得复制、融合、替换或互换。\n"
+    "\n"
+    "Scene: Alice（图1）握着玉佩立在图7门口\n"
     "Composition:\n  shot_type: Medium Shot\n  lighting: 暖光\n  ambiance: 薄雾\n"
     "Avoid: 水印、多余文字、Logo"
 )
@@ -75,6 +88,11 @@ def _expected_basis(project_path: Path, pm: _FakePM):
         style_description="cinematic",
         aspect_ratio="9:16",
         references=references,
+        character_context=project_character_context(
+            [pm.script["segments"][1]],
+            char_field="characters_in_segment",
+            characters=pm.project["characters"],
+        ),
     )
 
 
@@ -144,7 +162,7 @@ class TestStoryboardReferenceClamping:
 
         assert len(call["reference_images"]) == 8
         assert "图7为场景参考图；图8为道具参考图。" in call["prompt"]
-        assert "图1握着图8立在图7门口" in call["prompt"]
+        assert "Alice（图1）握着图8立在图7门口" in call["prompt"]
         # 没丢图就没有 warning：结果不带该键，任务列表不会给用户空提示
         assert "warnings" not in result
 

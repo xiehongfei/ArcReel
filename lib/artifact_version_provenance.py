@@ -114,7 +114,9 @@ def parse_image_version_basis(
         basis = ArtifactBasis.from_evidence_dict(raw)
     except (TypeError, ValueError) as exc:
         raise ValueError("version does not contain complete image artifact metadata") from exc
-    allowed_versions = {1, 2} if basis.kind in _GRID_VISUAL_KINDS else {1}
+    allowed_versions = (
+        {1, 2} if basis.kind in _GRID_VISUAL_KINDS or basis.kind == "artifact-visual/storyboard-image" else {1}
+    )
     if basis.kind not in allowed_kinds or basis.kind_version not in allowed_versions or not isinstance(raw, Mapping):
         raise ValueError("version does not contain complete image artifact metadata")
     inputs = raw.get("inputs")

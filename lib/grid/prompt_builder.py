@@ -10,16 +10,20 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from math import gcd
 
-from lib.asset_types import asset_name_comparison_key
-from lib.grid.character_identity import GridCharacterContext, project_grid_character_context
 from lib.prompt_style import normalize_style_value
 from lib.prompt_templates.builtin import builtin_templates
 from lib.reference_image_numbering import (
     ReferenceImageSlot,
-    mention_replacements,
     reference_images_declaration,
 )
-from lib.reference_video.text_parser import render_mentions
+from lib.storyboard_character_identity import GridCharacterContext, project_grid_character_context
+from lib.storyboard_character_prompt import (
+    GRID_ROSTER_UNIT,
+    append_character_identities,
+    append_character_roster,
+    reference_character_names,
+    render_character_mentions,
+)
 
 
 def pending_grid_prompt_ids(scenes: Sequence[Mapping[str, object]], id_field: str) -> list[str]:
@@ -71,15 +75,7 @@ def _render_grid_mentions(
     references: Sequence[ReferenceImageSlot],
     character_names: frozenset[str],
 ) -> str:
-    replacements = mention_replacements(references)
-
-    def _replacement(name: str) -> str:
-        reference = replacements.get(name)
-        if name in character_names:
-            return f"{name}（{reference}）" if reference else name
-        return reference or name
-
-    return render_mentions(text, _replacement)
+    return render_character_mentions(text, references, character_names)
 
 
 def _extract_image_desc(
@@ -105,63 +101,6 @@ def _extract_image_desc(
         if comp_parts:
             parts.append("，".join(comp_parts))
     return "；".join(parts) if parts else ""
-
-
-def _reference_character_names(references: Sequence[ReferenceImageSlot]) -> frozenset[str]:
-    return frozenset(
-        asset_name_comparison_key(slot.logical_id)
-        for slot in references
-        if slot.logical_type == "character" and slot.logical_id
-    )
-
-
-def _character_label(name: str, references: Sequence[ReferenceImageSlot]) -> str:
-    reference = mention_replacements(references).get(name)
-    return f"{name}（{reference}）" if reference else name
-
-
-def _append_character_identities(
-    lines: list[str],
-    context: GridCharacterContext,
-    references: Sequence[ReferenceImageSlot],
-) -> None:
-    if not context.identities:
-        return
-    lines.append("【角色身份】")
-    for identity in context.identities:
-        label = _character_label(identity.name, references)
-        suffix = f"：{identity.description}" if identity.description else ""
-        lines.append(f"- {label}{suffix}")
-    lines.append("- 各角色必须忠实于各自身份说明与参考图，面部、发型、体型、服装和配饰不得互换")
-    lines.append("")
-
-
-def _append_cell_roster(
-    lines: list[str],
-    roster: tuple[str, ...],
-    references: Sequence[ReferenceImageSlot],
-) -> None:
-    if not roster:
-        return
-    labels = "、".join(f"{_character_label(name, references)}1人" for name in roster)
-    lines.append(f"  本格角色：{labels}。")
-    if len(roster) == 1:
-        lines.append("  本格只出现上述角色1人，同一角色不得重复出现。")
-    else:
-        lines.append("  本格中上述角色各恰好1人，身份与外观不得复制、融合、替换或互换。")
-
-
-def _extract_action(scene: dict) -> str:
-    """Extract closing action from video_prompt.
-
-    If dict, return action field. If string, return as-is.
-    """
-    video_prompt = scene.get("video_prompt")
-    if video_prompt is None:
-        return ""
-    if isinstance(video_prompt, dict):
-        return str(video_prompt.get("action", ""))
-    return str(video_prompt)
 
 
 def _compute_panel_aspect(grid_aspect_ratio: str, rows: int, cols: int) -> str:
@@ -191,10 +130,10 @@ def build_grid_prompt(
     characters: object = None,
     character_context: GridCharacterContext | None = None,
 ) -> str:
-    """Render the grid image prompt with first-last frame chain structure.
+    """Render one static first frame per storyboard item, in script order.
 
     Args:
-        scenes: List of scene dicts with image_prompt and video_prompt fields.
+        scenes: List of scene dicts with image_prompt fields; video actions are not rendered.
         id_field: Key in each scene dict for the scene ID.
         rows: Number of rows in the grid.
         cols: Number of columns in the grid.
@@ -203,7 +142,7 @@ def build_grid_prompt(
         aspect_ratio: Aspect ratio for each cell (default "16:9").
         references: The reference images sent with the request, in array order.
         char_field: Storyboard field containing the character roster for each cell.
-        characters: Project character definitions used as identity descriptions.
+        characters: Project character definitions for identity projection; descriptions are not rendered.
         character_context: Precomputed identity projection shared with formal provenance.
 
     Returns:
@@ -221,31 +160,34 @@ def build_grid_prompt(
     )
     if len(character_context.cell_characters) != n_scenes:
         raise ValueError("grid character context must contain one roster per scene")
-    character_names = character_context.character_names | _reference_character_names(references)
+    character_names = character_context.character_names | reference_character_names(references)
 
     effective_grid_ar = grid_aspect_ratio or aspect_ratio
-    first = scenes[0]
 
     def _roster(idx: int) -> str:
         roster_lines: list[str] = []
-        _append_cell_roster(roster_lines, character_context.cell_characters[idx], references)
+        append_character_roster(
+            roster_lines,
+            character_context.cell_characters[idx],
+            references,
+            unit=GRID_ROSTER_UNIT,
+            indent="  ",
+        )
         return "\n".join(roster_lines)
 
-    transitions = [
+    cells = [
         {
             **_cell_position(idx, cols),
-            "from_id": str(scenes[idx - 1].get(id_field, "")),
-            "to_id": str(scenes[idx].get(id_field, "")),
-            "action": _render_grid_mentions(_extract_action(scenes[idx - 1]), references, character_names),
+            "scene_id": str(scenes[idx].get(id_field, "")),
             "description": _extract_image_desc(scenes[idx], references, character_names),
             "roster": _roster(idx),
         }
-        for idx in range(1, n_scenes)
+        for idx in range(n_scenes)
     ]
     placeholders = [_cell_position(idx, cols) for idx in range(n_scenes, total)]
 
     identity_lines: list[str] = []
-    _append_character_identities(identity_lines, character_context, references)
+    append_character_identities(identity_lines, character_context, references)
     character_identities = "\n".join(identity_lines)
 
     return builtin_templates.render(
@@ -256,13 +198,7 @@ def build_grid_prompt(
         cell_count=total,
         grid_aspect_ratio=effective_grid_ar,
         panel_aspect_ratio=_compute_panel_aspect(effective_grid_ar, rows, cols),
-        last_chain_cell=n_scenes - 1,
-        opening={
-            "scene_id": str(first.get(id_field, "")),
-            "description": _extract_image_desc(first, references, character_names),
-            "roster": _roster(0),
-        },
-        transitions=transitions,
+        cells=cells,
         placeholders=placeholders,
         style=normalize_style_value(style),
         style_description=normalize_style_value(style_description),
