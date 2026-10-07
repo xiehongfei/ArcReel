@@ -208,11 +208,6 @@ class TestScreenplaySourceKind:
     只断言语义关键词在场 / 缺席，不锁逐字措辞、不测 LLM 提取质量。
     """
 
-    @staticmethod
-    def _squash(text: str) -> str:
-        """去除全部空白字符，用于跨缩进比较。"""
-        return "".join(text.split())
-
     def _normalize_prompt(self, source_kind: str, **overrides) -> str:
         kwargs = {
             "novel_text": "【第1集】角色甲：「你好」",
@@ -237,6 +232,8 @@ class TestScreenplaySourceKind:
         assert "characters_in_scene" in prompt
         assert "utterances" in prompt
         assert "source_text" in prompt
+        assert "小说转为视听内容" in prompt
+        assert "成品剧本边界" not in prompt
 
     def test_normalize_novel_releases_voiceover_by_context(self):
         # novel 源画外音克制放开——由语境判断产出，不一律禁用、不预设规则白名单、不作兜底
@@ -256,6 +253,11 @@ class TestScreenplaySourceKind:
         assert "utterances" in prompt
         assert "source_text" in prompt
         assert "改编" not in prompt
+        assert "成品剧本边界" in prompt
+        assert "小说转为视听内容" not in prompt
+        assert "逐字保留优先于节奏、目标时长和连续性优化" in prompt
+        assert "未标为台词或画外音的心理叙述不得转入口播" in prompt
+        assert "跨镜拼接后的 text 必须还原原文正文" in prompt
 
     def test_normalize_screenplay_language_rule_exempts_verbatim_fields(self):
         # 逐字字段与资产引用须排除在目标语言要求外，否则与逐字提取冲突或与已登记资产失配。
@@ -305,6 +307,7 @@ class TestScreenplaySourceKind:
         assert "\n- **segment_break**：改编时自行判断：地点 / 时间跳转或场景切换后的第一个分镜标「是」" in novel
         assert "\n- **segment_break**：沿用剧本自带的场次 / 场景切换" in screenplay
         assert "不要重新切碎作者的场次" not in novel
+        assert "场次不等于生成镜头" in screenplay
 
     def test_normalize_duration_rule_splits_into_three_sub_items(self):
         prompt = self._normalize_prompt("novel", episode_target_duration=90)
@@ -313,6 +316,9 @@ class TestScreenplaySourceKind:
         assert [line.split("：", 1)[0] for line in lines] == ["  - 档位", "  - 口播下界", "  - 单集目标"]
         assert "默认 8 秒" in lines[0]
         assert "不低于" in lines[1]
+        assert "超过最长 8 秒" in lines[1]
+        assert "拆成连续分镜" in lines[1]
+        assert "取最长档即可" not in section
         assert "本集成片目标时长约 90 秒" in lines[2]
         assert "保存时会另有提示" not in prompt
 
@@ -416,14 +422,18 @@ class TestScreenplaySourceKind:
     def test_normalize_appends_instructions_after_single_blank_line(self):
         for source_kind in ("novel", "screenplay"):
             prompt = self._normalize_prompt(source_kind, instructions="多用近景。\n少用旁白。")
-            assert prompt.endswith("画面切换。\n\n# 附加指令\n多用近景。\n少用旁白。")
             plain = self._normalize_prompt(source_kind)
+            assert prompt == plain + "\n\n# 附加指令\n多用近景。\n少用旁白。"
             assert "# 附加指令" not in plain
             assert plain == self._normalize_prompt(source_kind, instructions="")
 
     def test_normalize_injects_pacing(self):
-        # script_plan 无条件提供开篇节奏建议。
-        assert "开篇~4秒承担钩子职能" in self._squash(self._normalize_prompt("novel"))
+        for source_kind in ("novel", "screenplay"):
+            prompt = self._normalize_prompt(source_kind)
+            assert "分集节奏（按题材、受众与既定内容选择）" in prompt
+            assert "开篇 ~4 秒承担钩子职能" not in prompt
+            assert "叙事与连续性检查" in prompt
+            assert "开始状态 → 主要动作 → 结束状态" in prompt
 
 
 class TestOverviewPrompt:
@@ -473,7 +483,7 @@ class TestDramaDurationSpeechLowerBound:
     """drama script_plan 时长指引的「台词口播时长」单向下界软指引（生成期，纯 prompt 软约束）。
 
     语速从 lib.speech_rate 单一真相源按项目 source_language 注入；drama prompt 内不写死语速数字。
-    单向：画面 / 留白可把时长撑长，台词永不把时长压短；空 utterances 无下界、行为同今日。
+    单向：画面 / 留白可把时长撑长，台词永不把时长压短；空 utterances 仍需估算动作时间。
     narration / ad / prompt_authoring 视觉层不受影响。只断言语义关键词与注入值，不锁逐字措辞。
     """
 
@@ -605,7 +615,11 @@ class TestPromptAuthoringPromptGuards:
 
     def test_drama_prompt_injects_pacing(self, monkeypatch, tmp_path):
         monkeypatch.setenv("ARCREEL_PROFILE_DIR", str(tmp_path / "missing-profile"))
-        assert "开篇~4秒承担钩子职能" in self._squash(self._drama_prompt())
+        prompt = self._drama_prompt()
+        assert "分集节奏（按题材、受众与既定内容选择）" in prompt
+        assert "image_prompt 是起始状态" in prompt
+        assert "video_prompt 是状态变化" in prompt
+        assert "不要改动分镜内容" in prompt
 
     @pytest.mark.parametrize("instructions", [None, "", "末镜保留雨声。"])
     def test_narration_instructions_are_an_optional_section(self, instructions):
