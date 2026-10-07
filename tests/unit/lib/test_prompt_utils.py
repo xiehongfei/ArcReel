@@ -86,8 +86,8 @@ class TestPromptUtils:
         assert parsed_a["Action"] == "抬头观察"
         assert parsed_a["Dialogue"][0]["Speaker"] == "姜月茴"
         assert "Dialogue" not in parsed_b
-        # 反向约束以 Avoid 键收尾：有对话时置于 Dialogue 之后
-        assert list(parsed_a)[-2:] == ["Dialogue", "Avoid"]
+        # 首帧继承与反向约束位于动作、发声正文之后。
+        assert list(parsed_a)[-3:] == ["Dialogue", "First_Frame_Continuity", "Avoid"]
         assert list(parsed_b)[-1] == "Avoid"
         assert parsed_a["Avoid"] == "BGM、文字字幕、水印、Logo"
 
@@ -288,11 +288,18 @@ class TestRenderStoryboardVideoPrompt:
         assert "Voice_Style: 低沉沙哑" in rendered
         assert "Line: 你来了。" in rendered
 
+    @pytest.mark.parametrize("content_mode", ["narration", "drama", "ad"])
     @pytest.mark.parametrize("prompt", ["镜头缓缓推近", {"action": "起身", "camera_motion": "Static"}])
-    def test_both_forms_exclude_logos_and_keep_one_avoid_line_on_rerender(self, prompt):
-        rendered = self._render(prompt)
+    def test_both_forms_preserve_first_frame_and_deduplicate_constraints(self, prompt, content_mode):
+        rendered = self._render(prompt, content_mode=content_mode)
+        assert (
+            "First_Frame_Continuity: 全程严格继承输入首帧的视觉风格、角色身份、脸型、眼形、眼距、鼻口比例、"
+            "发际线、发型、头身比例、服装与材质表现。动作、表情、运镜和视角变化不得重新设计人物或改变画风，"
+            "不得在动漫、真人实拍或其他视觉风格之间切换。" in rendered
+        )
         assert rendered.endswith("Avoid: BGM、文字字幕、水印、Logo")
-        assert self._render(rendered) == rendered
+        assert self._render(rendered, content_mode=content_mode) == rendered
+        assert rendered.count("First_Frame_Continuity:") == 1
         assert rendered.count("Avoid:") == 1
 
     @pytest.mark.parametrize(
