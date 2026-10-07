@@ -42,7 +42,7 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 # Lease 丢失超过 ``lease_ttl * _ORPHAN_RESCAN_LEASE_LOST_MULT`` 才认为是真切换 owner
 # （另一个 worker 进程曾持过 lease 且写入了新 orphan），需要重扫；短 flap（续约抖动）
@@ -62,8 +62,10 @@ from lib.generation_queue import (
     get_generation_queue,
     resolve_video_execution_for_queued_task,
 )
+from lib.generation_result import GenerationAction, problem_from_task_failure
 from lib.image_backends.base import ImageCapabilityError
 from lib.narration_delivery import NarratedVideoDurationBlockedError
+from lib.providers import AGNES_RETRY_MIN_INTERVAL_SEC, PROVIDER_AGNES
 from lib.reference_compression import ReferencePayloadFloorError
 from lib.reference_video.execution_checkpoint import (
     ReferenceExecutionIdentityError,
@@ -72,12 +74,59 @@ from lib.reference_video.execution_checkpoint import (
     cleanup_staged_provider_media,
 )
 from lib.reference_video.request_projection import ReferenceProjectionBlockedError
+from lib.retry import NonRetryableError
 from lib.script_editor import ScriptEditError
 from lib.task_failure import encode_failure
 from lib.video_backends.base import ArtifactDownloadError, ProviderRejectedError, VideoCapabilityError
 
+# 可自动重试的生成失败：每满该次数把任务排到队尾，避免反复占队头阻塞其他任务。
+FAILURE_REQUEUE_THRESHOLD = 2
+
+_TERMINAL_GENERATION_FAILURE_TYPES = (
+    ScriptEditError,
+    ApiError,
+    ProviderRejectedError,
+    ArtifactDownloadError,
+    ImageCapabilityError,
+    VideoCapabilityError,
+    ReferencePayloadFloorError,
+    VideoBucketCapabilityError,
+    ReferenceProjectionBlockedError,
+    NarratedVideoDurationBlockedError,
+    ReferenceExecutionIdentityError,
+    DeclarativeRuntimeError,
+    NonRetryableError,
+)
+
+
+def should_auto_requeue_after_failure(exc: Exception, task: dict[str, Any]) -> bool:
+    """可自动回队的失败：未向供应商建单，且不是确定性输入/能力拒绝。
+
+    已有 ``provider_job_id`` 说明供应商侧可能已经收单计费，再走普通执行会重复提交。
+    确定性 4xx、能力不足、剧本编辑失败等重跑也不会好，保持终态失败让用户改输入。
+    已带机器可读 action 的生成问题（``generation_problem:`` 信封）按其判定：只有 ``retry``
+    回队，``fix_input`` 等重跑同样不会变好，继续回队只会空转并重复产生模型调用费用。
+    """
+    if task.get("provider_job_id"):
+        return False
+    if isinstance(exc, _TERMINAL_GENERATION_FAILURE_TYPES):
+        return False
+    return problem_from_task_failure(str(exc)).action is GenerationAction.RETRY
+
+
+def retry_after_for_failed_provider(provider_id: str, *, now: datetime | None = None) -> datetime | None:
+    """Agnes 失败回队必须冷却 30s；其他供应商立即可以再领。"""
+    if provider_id != PROVIDER_AGNES:
+        return None
+    return (now or datetime.now(UTC)) + timedelta(seconds=AGNES_RETRY_MIN_INTERVAL_SEC)
+
+
 # Default provider used when a task payload does not specify one.
 DEFAULT_PROVIDER = "gemini-aistudio"
+
+# 池满回队日志节流：claim/requeue 频率跟 poll cycle 走，同一 (provider, media_type)
+# 至多每分钟打一条，避免 NULL 投影兜底路径每 cycle 刷屏。
+_POOL_FULL_LOG_INTERVAL_SECONDS = 60.0
 
 
 def _non_resumable_video_providers() -> frozenset[str]:
@@ -544,6 +593,7 @@ class GenerationWorker:
         self._constructed_at = datetime.now(UTC)
         self._startup_settled: bool = False
         self._lease_lost_monotonic: float | None = None
+        self._pool_full_logged_at: dict[tuple[str, str], float] = {}
 
     # ------------------------------------------------------------------
     # Capacity management
@@ -679,6 +729,21 @@ class GenerationWorker:
             if (cap := self._capacity.get(pid, media_type)) > 0 and not self._slots.has_room(pid, media_type, cap)
         )
 
+    def _log_pool_full_requeue(self, provider_id: str, media_type: str, task_id: str) -> None:
+        """池满回队日志：每 (provider, media_type) 至多 1 分钟一条，不改变 claim/requeue 步长。"""
+        key = (provider_id, media_type)
+        now = time.monotonic()
+        last = self._pool_full_logged_at.get(key)
+        if last is not None and now - last < _POOL_FULL_LOG_INTERVAL_SECONDS:
+            return
+        self._pool_full_logged_at[key] = now
+        logger.info(
+            "供应商 %s 的 %s 池满，task %s 回队等待下一 cycle",
+            provider_id,
+            media_type,
+            task_id,
+        )
+
     async def _claim_tasks(self) -> bool:
         """Claim tasks from queue and route to per-provider slots.
 
@@ -735,12 +800,7 @@ class GenerationWorker:
                     # → 回队让下次 cycle 再试（FIFO 顺序由 queued_at 维持）。绝不能
                     # mark_failed：入队后 provider_id 才被派生，资料完整的任务也可能
                     # 因部署窗口 / 解析失败而 NULL，这条路径必须保持可重试。
-                    logger.info(
-                        "供应商 %s 的 %s 池满，task %s 回队等待下一 cycle",
-                        provider_id,
-                        media_type,
-                        task["task_id"],
-                    )
+                    self._log_pool_full_requeue(provider_id, media_type, task["task_id"])
                     # 回队前把重派生的 provider 刷回投影列：走到这里说明存量投影与现值
                     # 分裂（NULL 兜底，或入队后剧本参考集 / 供应商配置被改），不刷新的话
                     # 存量值躲过 pool_full 的 SQL 过滤，之后每个 cycle 都重复
@@ -926,7 +986,36 @@ class GenerationWorker:
             return
         except Exception as exc:
             logger.exception("任务失败 %s (type=%s, provider=%s)", task_id, task_type, provider_id)
-            rows = await asyncio.shield(self.queue.mark_task_failed(task_id, _encode_task_failure_message(exc)))
+            error_message = _encode_task_failure_message(exc)
+            if should_auto_requeue_after_failure(exc, task):
+                next_fail_count = int(task.get("fail_count") or 0) + 1
+                to_back = next_fail_count % FAILURE_REQUEUE_THRESHOLD == 0
+                rows = await asyncio.shield(
+                    self.queue.requeue_after_failure(
+                        task_id,
+                        error_message,
+                        fail_count=next_fail_count,
+                        to_back=to_back,
+                        retry_after=retry_after_for_failed_provider(provider_id),
+                    )
+                )
+                if rows == 0:
+                    await asyncio.shield(self.queue.mark_task_cancelled(task_id, cancelled_by="user"))
+                    return
+                if to_back:
+                    logger.warning(
+                        "任务 %s 已失败 %d 次，排到队尾继续重试",
+                        task_id,
+                        next_fail_count,
+                    )
+                else:
+                    logger.warning(
+                        "任务 %s 第 %d 次失败，回队后即将重试",
+                        task_id,
+                        next_fail_count,
+                    )
+                return
+            rows = await asyncio.shield(self.queue.mark_task_failed(task_id, error_message))
             if rows == 0:
                 # 外部已抢先翻 cancelling → 落地 cancelled 终态
                 await asyncio.shield(self.queue.mark_task_cancelled(task_id, cancelled_by="user"))

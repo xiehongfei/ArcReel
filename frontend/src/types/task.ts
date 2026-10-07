@@ -44,6 +44,10 @@ export interface TaskItem {
   started_at: string | null;
   finished_at: string | null;
   updated_at: string;
+  /** 可自动重试的生成失败次数；每满 2 次会排到队尾。缺省视为 0。 */
+  fail_count?: number;
+  /** 最早可再次领取的时刻。Agnes 失败回队会写成当前时间 + 30s。 */
+  retry_after?: string | null;
 }
 
 export interface TaskStats {

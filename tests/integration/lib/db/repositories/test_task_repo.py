@@ -459,6 +459,160 @@ class TestTaskRepository:
         queued = await repo.get(task["task_id"])
         assert queued["status"] == "queued"
 
+    async def test_requeue_after_failure_keeps_place_then_moves_to_back(self, db_session):
+        repo = TaskRepository(db_session)
+        first = await repo.enqueue(
+            project_name="demo",
+            task_type="video",
+            media_type="video",
+            resource_id="E1S01",
+            payload={},
+        )
+        second = await repo.enqueue(
+            project_name="demo",
+            task_type="video",
+            media_type="video",
+            resource_id="E1S02",
+            payload={},
+        )
+        claimed = await repo.claim_next("video")
+        assert claimed["task_id"] == first["task_id"]
+        original_queued_at = claimed["queued_at"]
+
+        affected = await repo.requeue_after_failure(claimed["task_id"], "timeout", fail_count=1, to_back=False)
+        assert affected == 1
+        row = await repo.get(claimed["task_id"])
+        assert row["status"] == "queued"
+        assert row["fail_count"] == 1
+        assert row["queued_at"] == original_queued_at
+        assert row["started_at"] is None
+        assert row["error_message"] == "timeout"
+
+        claimed_again = await repo.claim_next("video")
+        assert claimed_again["task_id"] == first["task_id"]
+        affected = await repo.requeue_after_failure(
+            claimed_again["task_id"], "timeout again", fail_count=2, to_back=True
+        )
+        assert affected == 1
+        row = await repo.get(first["task_id"])
+        assert row["status"] == "queued"
+        assert row["fail_count"] == 2
+        assert row["queued_at"] > original_queued_at
+
+        next_claimed = await repo.claim_next("video")
+        assert next_claimed["task_id"] == second["task_id"]
+
+    async def test_requeue_after_failure_ignores_non_running(self, db_session):
+        repo = TaskRepository(db_session)
+        task = await repo.enqueue(
+            project_name="demo",
+            task_type="video",
+            media_type="video",
+            resource_id="E1S01",
+            payload={},
+        )
+        affected = await repo.requeue_after_failure(task["task_id"], "timeout", fail_count=1, to_back=False)
+        assert affected == 0
+        row = await repo.get(task["task_id"])
+        assert row["status"] == "queued"
+        assert row["fail_count"] == 0
+
+    async def test_requeue_after_failure_clears_execution_checkpoint(self, db_session):
+        repo = TaskRepository(db_session)
+        task = await repo.enqueue(
+            project_name="demo",
+            task_type="video",
+            media_type="video",
+            resource_id="E1S01",
+            payload={},
+        )
+        await repo.claim_next("video")
+        await repo.persist_execution_checkpoint(task["task_id"], '{"schema_version":1}', "agnes")
+
+        affected = await repo.requeue_after_failure(task["task_id"], "timeout", fail_count=1, to_back=False)
+        assert affected == 1
+        queued = await repo.get(task["task_id"])
+        assert queued["execution_checkpoint_json"] is None
+
+        claimed = await repo.claim_next("video")
+        assert claimed["task_id"] == task["task_id"]
+        await repo.persist_execution_checkpoint(task["task_id"], '{"schema_version":2}', "agnes")
+        refreshed = await repo.get(task["task_id"])
+        assert refreshed["execution_checkpoint_json"] == '{"schema_version":2}'
+
+    async def test_claim_next_skips_future_retry_after(self, db_session):
+        from datetime import timedelta
+
+        from lib.db.base import utc_now
+
+        repo = TaskRepository(db_session)
+        waiting = await repo.enqueue(
+            project_name="demo",
+            task_type="video",
+            media_type="video",
+            resource_id="E1S01",
+            payload={},
+        )
+        ready = await repo.enqueue(
+            project_name="demo",
+            task_type="video",
+            media_type="video",
+            resource_id="E1S02",
+            payload={},
+        )
+        claimed = await repo.claim_next("video")
+        assert claimed["task_id"] == waiting["task_id"]
+        later = utc_now() + timedelta(seconds=30)
+        await repo.requeue_after_failure(waiting["task_id"], "timeout", fail_count=1, to_back=False, retry_after=later)
+
+        claimed = await repo.claim_next("video")
+        assert claimed["task_id"] == ready["task_id"]
+        assert await repo.claim_next("video") is None
+        waiting_row = await repo.get(waiting["task_id"])
+        assert waiting_row["status"] == "queued"
+        assert waiting_row["retry_after"] is not None
+
+    async def test_claim_next_agnes_retry_spaces_sibling_retries(self, db_session):
+        from datetime import UTC, datetime
+
+        from lib.db.base import utc_now
+        from lib.providers import AGNES_RETRY_MIN_INTERVAL_SEC, PROVIDER_AGNES
+
+        repo = TaskRepository(db_session)
+        first = await repo.enqueue(
+            project_name="demo",
+            task_type="video",
+            media_type="video",
+            resource_id="E1S01",
+            payload={},
+            provider_id=PROVIDER_AGNES,
+        )
+        second = await repo.enqueue(
+            project_name="demo",
+            task_type="video",
+            media_type="video",
+            resource_id="E1S02",
+            payload={},
+            provider_id=PROVIDER_AGNES,
+        )
+        now = utc_now()
+        assert (await repo.claim_next("video"))["task_id"] == first["task_id"]
+        assert (await repo.claim_next("video"))["task_id"] == second["task_id"]
+        await repo.requeue_after_failure(first["task_id"], "timeout", fail_count=1, to_back=False, retry_after=now)
+        await repo.requeue_after_failure(second["task_id"], "timeout", fail_count=1, to_back=False, retry_after=now)
+
+        claimed = await repo.claim_next("video")
+        assert claimed["task_id"] == first["task_id"]
+        sibling = await repo.get(second["task_id"])
+        assert sibling["status"] == "queued"
+        assert sibling["retry_after"] is not None
+        parsed = datetime.fromisoformat(sibling["retry_after"])
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=UTC)
+        wait = (parsed - now).total_seconds()
+        assert wait >= AGNES_RETRY_MIN_INTERVAL_SEC - 0.5
+        assert await repo.claim_next("video") is None
+
     async def test_worker_lease(self, db_session):
         repo = TaskRepository(db_session)
 

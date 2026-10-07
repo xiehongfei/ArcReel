@@ -469,6 +469,9 @@ export default {
   // Task status & cancellation flow
   'generating_status': 'Generating...',
   'queued_status': 'Queued',
+  'task_retry_soon': 'Failed {{count}} time(s); retrying soon',
+  'task_retry_queued': 'Failed {{count}} time(s); moved to the back of the queue',
+  'task_retry_wait': 'Failed {{count}} time(s); retrying in {{seconds}}s',
   'completed_status': 'Completed',
   'failed_status': 'Failed',
   'cancelled_status': 'Cancelled',

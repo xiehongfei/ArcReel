@@ -462,6 +462,9 @@ export default {
   // Trạng thái tác vụ & luồng hủy
   'generating_status': 'Đang tạo...',
   'queued_status': 'Đang chờ',
+  'task_retry_soon': 'Đã thất bại {{count}} lần, sẽ thử lại ngay',
+  'task_retry_queued': 'Đã thất bại {{count}} lần, đã chuyển xuống cuối hàng đợi',
+  'task_retry_wait': 'Đã thất bại {{count}} lần, thử lại sau {{seconds}} giây',
   'completed_status': 'Hoàn tất',
   'failed_status': 'Thất bại',
   'cancelled_status': 'Đã hủy',

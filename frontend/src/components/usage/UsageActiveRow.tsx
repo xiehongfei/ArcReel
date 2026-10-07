@@ -61,8 +61,15 @@ export function UsageActiveRow({
     : purpose
       ? t(purpose)
       : "—";
+  const failCount = task?.fail_count ?? 0;
+  const retryAfterMs = task?.retry_after ? Date.parse(task.retry_after) : Number.NaN;
+  const retryWaitSec = Number.isFinite(retryAfterMs) ? Math.max(0, Math.ceil((retryAfterMs - now) / 1000)) : 0;
   const statusText = task
-    ? (task.error_message ?? t(TASK_STATUS_KEYS[task.status]))
+    ? task.status === "queued" && failCount > 0
+      ? retryWaitSec > 0
+        ? t("task_retry_wait", { count: failCount, seconds: retryWaitSec })
+        : t(failCount % 2 === 0 ? "task_retry_queued" : "task_retry_soon", { count: failCount })
+      : (task.error_message ?? t(TASK_STATUS_KEYS[task.status]))
     : t("usage_status_pending");
 
   return (

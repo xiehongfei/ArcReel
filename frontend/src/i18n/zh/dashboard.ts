@@ -469,6 +469,9 @@ export default {
   // 任务状态与取消流程
   'generating_status': '生成中...',
   'queued_status': '排队中',
+  'task_retry_soon': '已失败 {{count}} 次，即将重试',
+  'task_retry_queued': '已失败 {{count}} 次，已排到队尾',
+  'task_retry_wait': '已失败 {{count}} 次，{{seconds}} 秒后重试',
   'completed_status': '已完成',
   'failed_status': '失败',
   'cancelled_status': '已取消',

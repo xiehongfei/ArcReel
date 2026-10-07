@@ -21,6 +21,9 @@ PROVIDER_KLING = "kling"
 PROVIDER_AGNES = "agnes"
 PROVIDER_ANTHROPIC = "anthropic"
 
+# Agnes 失败回队后，两次调用至少间隔这么多秒（同一任务冷却，且同队列重试互相错开）。
+AGNES_RETRY_MIN_INTERVAL_SEC = 30
+
 CallType = Literal["image", "video", "text", "audio"]
 CALL_TYPE_IMAGE: CallType = "image"
 CALL_TYPE_VIDEO: CallType = "video"

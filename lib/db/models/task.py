@@ -48,6 +48,10 @@ class Task(UserOwnedMixin, Base):
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    # 可自动重试的生成失败次数。每满 2 次把 queued_at 推到现在，排到队尾让其他任务先跑。
+    fail_count: Mapped[int] = mapped_column(Integer, server_default="0", nullable=False)
+    # 最早可再次领取的时刻。Agnes 失败回队会写成 now+30s，避免连续调用触发限流。
+    retry_after: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
     __table_args__ = (
         Index("idx_tasks_status_queued_at", "status", "queued_at"),

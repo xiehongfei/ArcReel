@@ -7,9 +7,10 @@ import logging
 import time
 import uuid
 from collections.abc import Callable
+from datetime import timedelta
 from typing import Any
 
-from sqlalchemy import ColumnElement, func, select, text, update
+from sqlalchemy import ColumnElement, func, or_, select, text, update
 from sqlalchemy import bindparam as sa_bindparam
 from sqlalchemy import delete as sa_delete
 from sqlalchemy.exc import IntegrityError
@@ -19,7 +20,7 @@ from lib.db.base import DEFAULT_USER_ID, dt_to_iso, utc_now
 from lib.db.models.api_call import ApiCall
 from lib.db.models.task import BatchTask, GenerationBatch, Task, WorkerLease
 from lib.db.repositories.base import BaseRepository, rowcount
-from lib.providers import CallStatus
+from lib.providers import AGNES_RETRY_MIN_INTERVAL_SEC, PROVIDER_AGNES, CallStatus
 from lib.task_failure import bound_reason, collapse_cascade_reason, encode_failure, parse_failure
 from lib.task_terminal_events import TERMINAL_TASK_STATUSES
 
@@ -122,6 +123,8 @@ def _task_to_dict(row: Task) -> dict[str, Any]:
         "started_at": dt_to_iso(row.started_at),
         "finished_at": dt_to_iso(row.finished_at),
         "updated_at": dt_to_iso(row.updated_at),
+        "fail_count": int(row.fail_count or 0),
+        "retry_after": dt_to_iso(row.retry_after),
         "user_id": row.user_id,
     }
 
@@ -481,7 +484,7 @@ class TaskRepository(BaseRepository):
         """
         now = utc_now()
 
-        params: dict[str, Any] = {"media_type": media_type}
+        params: dict[str, Any] = {"media_type": media_type, "now": now}
         provider_filter = ""
         if pool_full_providers:
             # SQLite/PG 都支持 expanding bindparam：list 形式 + NOT IN (:providers)
@@ -507,6 +510,7 @@ class TaskRepository(BaseRepository):
               AND tasks.media_type = :media_type
               {provider_filter}
               {task_filter}
+              AND (tasks.retry_after IS NULL OR tasks.retry_after <= :now)
               AND (
                 tasks.dependency_task_id IS NULL
                 OR dependency.status = 'succeeded'
@@ -534,6 +538,7 @@ class TaskRepository(BaseRepository):
                 status="running",
                 started_at=now,
                 updated_at=now,
+                retry_after=None,
             )
         )
         if rowcount(update_result) == 0:
@@ -545,6 +550,20 @@ class TaskRepository(BaseRepository):
         # Reload task
         result = await self.session.execute(select(Task).where(Task.task_id == target_task_id))
         running_task = result.scalar_one()
+        if running_task.provider_id == PROVIDER_AGNES and int(running_task.fail_count or 0) > 0:
+            # Agnes 失败队列：领取一条重试后，其余排队重试至少再隔 30s，避免连续打供应商。
+            cooldown = now + timedelta(seconds=AGNES_RETRY_MIN_INTERVAL_SEC)
+            await self.session.execute(
+                update(Task)
+                .where(
+                    Task.status == "queued",
+                    Task.provider_id == PROVIDER_AGNES,
+                    Task.fail_count > 0,
+                    Task.task_id != target_task_id,
+                    or_(Task.retry_after.is_(None), Task.retry_after < cooldown),
+                )
+                .values(retry_after=cooldown, updated_at=now)
+            )
         task_data = _task_to_dict(running_task)
         await self.session.commit()
         return task_data
@@ -596,6 +615,44 @@ class TaskRepository(BaseRepository):
             return 0
 
         await self._cascade_failed_queued(task_id=task_id, error_message=error_message)
+        await self.session.commit()
+        return affected
+
+    async def requeue_after_failure(
+        self,
+        task_id: str,
+        error_message: str,
+        *,
+        fail_count: int,
+        to_back: bool,
+        retry_after: Any | None = None,
+    ) -> int:
+        """把 running 任务回队继续重试；``to_back`` 时把 ``queued_at`` 推到现在排到队尾。
+
+        ``retry_after`` 未到之前 claim 不会领取。不是终态：不发 terminal event、不级联失败依赖。
+        ``rows=0`` 表示外部已翻走 running。
+        """
+        now = utc_now()
+        values: dict[str, Any] = {
+            "status": "queued",
+            "started_at": None,
+            "finished_at": None,
+            "error_message": bound_reason(error_message, _MAX_ERROR_MESSAGE_LEN),
+            "fail_count": fail_count,
+            "retry_after": retry_after,
+            # 提交前 checkpoint 只允许写一次。回队是新的一次执行，必须清掉，
+            # 否则下次 persist 被守卫拒绝，ValueError 再被当成可重试错误空转。
+            "execution_checkpoint_json": None,
+            "updated_at": now,
+        }
+        if to_back:
+            values["queued_at"] = now
+        update_result = await self.session.execute(
+            update(Task).where(Task.task_id == task_id, Task.status == "running").values(**values)
+        )
+        affected = rowcount(update_result)
+        if affected == 0:
+            return 0
         await self.session.commit()
         return affected
 

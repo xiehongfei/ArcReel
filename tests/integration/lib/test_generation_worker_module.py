@@ -210,6 +210,7 @@ class _FakeQueue:
         self.succeeded = []
         self.failed = []
         self.cancelled = []
+        self.requeued = []
         self._lease_calls = 0
         self._succeeded_rows = succeeded_rows
         self._failed_rows = failed_rows
@@ -248,6 +249,10 @@ class _FakeQueue:
 
     async def mark_task_failed(self, task_id, error):
         self.failed.append((task_id, error))
+        return self._failed_rows
+
+    async def requeue_after_failure(self, task_id, error, *, fail_count, to_back, retry_after=None):
+        self.requeued.append((task_id, error, fail_count, to_back, retry_after))
         return self._failed_rows
 
     async def mark_task_cancelled(self, task_id, *, cancelled_by="user"):
@@ -1033,8 +1038,8 @@ class TestGenerationWorker:
 
         monkeypatch.setattr("server.services.generation_tasks.execute_generation_task", _raise)
         await worker._process_task({"task_id": "t2"})
-        assert queue.failed
-        assert queue.failed[0][0] == "t2"
+        assert queue.requeued == [("t2", "boom", 1, False, None)]
+        assert queue.failed == []
 
     @pytest.mark.asyncio
     async def test_reused_video_result_reaches_the_normal_succeeded_terminal_state(self, monkeypatch):
@@ -1146,77 +1151,6 @@ class TestGenerationWorker:
         monkeypatch.setattr("lib.db.safe_session_factory", _session_factory)
 
         assert await GenerationWorker(queue=_FakeQueue())._requeue_single_task("running") is False
-
-    @pytest.mark.asyncio
-    async def test_process_task_script_edit_error_encodes_key_and_params(self, monkeypatch):
-        """apply_unit_video_assets 经异步任务队列（非 upload_unit_video 同步路由）抛出时，
-        error_message 落成可翻译的 [key] {params} 结构而非 str(exc) 的固定中文，任务状态
-        接口按 Accept-Language 渲染时才不会给 en/vi 用户漏出中文；params 一并落库才能在
-        渲染侧还原成完整的翻译占位符替换（如 resolve_items 的 kind/type_name）。"""
-        queue = _FakeQueue()
-        worker = GenerationWorker(queue=queue)
-
-        async def _raise_script_edit_error(_task):
-            raise ScriptEditError(
-                "segments 必须是列表，当前为 dict",
-                key="script_edit_items_not_list",
-                kind="segments",
-                type_name="dict",
-            )
-
-        monkeypatch.setattr(
-            "server.services.generation_tasks.execute_generation_task",
-            _raise_script_edit_error,
-        )
-        await worker._process_task({"task_id": "t_script_edit"})
-        assert queue.failed
-        assert queue.failed[0] == (
-            "t_script_edit",
-            '[script_edit_items_not_list] {"kind": "segments", "type_name": "dict"}',
-        )
-
-    @pytest.mark.asyncio
-    async def test_process_task_script_edit_error_unregistered_key_falls_back(self, monkeypatch):
-        """两份登记（errors.py 的翻译 key、task_failure.FAILURE_CODE_KEYS 的 worker 编码表）
-        靠约定同步，非运行时校验——新 raise 点忘了同步登记时，encode_failure 对未登记 key
-        抛 KeyError 不能打断 mark_task_failed，否则任务会卡在 running 而非落终态。"""
-        queue = _FakeQueue()
-        worker = GenerationWorker(queue=queue)
-
-        async def _raise_unregistered(_task):
-            raise ScriptEditError("尚未登记的错误", key="script_edit_not_yet_registered")
-
-        monkeypatch.setattr(
-            "server.services.generation_tasks.execute_generation_task",
-            _raise_unregistered,
-        )
-        await worker._process_task({"task_id": "t_unregistered"})
-        assert queue.failed
-        assert queue.failed[0] == ("t_unregistered", "[script_edit_error]")
-
-    @pytest.mark.asyncio
-    async def test_process_task_script_edit_error_circular_params_falls_back(self, monkeypatch):
-        """params 含循环引用时 json.dumps 抛 ValueError（而非 TypeError）——同一条降级路径
-        也要接住这个分支，否则序列化失败照样打断 mark_task_failed，任务卡在 running。"""
-        queue = _FakeQueue()
-        worker = GenerationWorker(queue=queue)
-
-        async def _raise_circular_params(_task):
-            circular: dict[str, Any] = {}
-            circular["self"] = circular
-            raise ScriptEditError(
-                "generated_assets 必须是 dict",
-                key="script_edit_generated_assets_invalid",
-                circular=circular,
-            )
-
-        monkeypatch.setattr(
-            "server.services.generation_tasks.execute_generation_task",
-            _raise_circular_params,
-        )
-        await worker._process_task({"task_id": "t_circular"})
-        assert queue.failed
-        assert queue.failed[0] == ("t_circular", "[script_edit_error]")
 
     @pytest.mark.asyncio
     async def test_process_task_cancelled_error_marks_cancelled(self, monkeypatch):

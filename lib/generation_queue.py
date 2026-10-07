@@ -705,6 +705,36 @@ class GenerationQueue:
             logger.info("mark_failed 0 rows task_id=%s (已被外部翻状态)", task_id)
         return affected
 
+    async def requeue_after_failure(
+        self,
+        task_id: str,
+        error_message: str,
+        *,
+        fail_count: int,
+        to_back: bool,
+        retry_after=None,
+    ) -> int:
+        """Returns rows_affected (0 = 已被外部翻状态，worker 走 0-rows-cancelled 协议)."""
+        async with self._task_repo() as repo:
+            affected = await repo.requeue_after_failure(
+                task_id,
+                error_message,
+                fail_count=fail_count,
+                to_back=to_back,
+                retry_after=retry_after,
+            )
+        if affected > 0:
+            logger.warning(
+                "任务失败后回队 task_id=%s fail_count=%s to_back=%s error=%s",
+                task_id,
+                fail_count,
+                to_back,
+                error_message[:200],
+            )
+        else:
+            logger.info("requeue_after_failure 0 rows task_id=%s (已被外部翻状态)", task_id)
+        return affected
+
     async def mark_task_cancelled(self, task_id: str, *, cancelled_by: str = "user") -> int:
         """Worker finally 0-rows-cancelled 协议兜底入口（SQL 守卫 status IN queued|cancelling|running）。
 
