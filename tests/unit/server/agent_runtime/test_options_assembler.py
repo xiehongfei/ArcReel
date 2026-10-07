@@ -125,6 +125,7 @@ async def test_build_threads_injected_deps_into_options(tmp_path: Path) -> None:
     assert options.extra_args == {"replay-user-messages": None}
     # CLI stdout 单条 NDJSON 行的缓冲上限：默认 1 MiB 会被附图请求的回放副本撞穿
     assert options.max_buffer_size == CLI_STDOUT_MAX_BUFFER_BYTES == 32 * 1024 * 1024
+    assert options.agents is None
 
 
 @pytest.mark.asyncio
@@ -211,6 +212,26 @@ async def test_build_sandbox_disabled_strips_bash(tmp_path: Path) -> None:
         assert tool not in options.allowed_tools
     assert "Read" in options.allowed_tools
     assert options.sandbox == {"enabled": False}
+
+
+@pytest.mark.asyncio
+async def test_build_registers_profile_subagents(tmp_path: Path) -> None:
+    """会话 options.agents 带上 profile 子智能体，Agent 工具才能按名 dispatch。"""
+
+    async def fake_loader():
+        return {}
+
+    profile_agents = tmp_path / "profile" / ".claude" / "agents"
+    profile_agents.mkdir(parents=True)
+    (profile_agents / "normalize-drama-script.md").write_text(
+        "---\nname: normalize-drama-script\ndescription: 剧情演绎规范化剧本\n---\n整理分镜。\n",
+        encoding="utf-8",
+    )
+    options = await _make_assembler(tmp_path, provider_env_loader=fake_loader).build("demo")
+
+    assert options.agents is not None
+    assert "normalize-drama-script" in options.agents
+    assert options.agents["normalize-drama-script"].description == "剧情演绎规范化剧本"
 
 
 @pytest.mark.asyncio

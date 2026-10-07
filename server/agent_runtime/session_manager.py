@@ -319,6 +319,7 @@ class SessionManager:
     DEFAULT_ALLOWED_TOOLS: ClassVar[list[str]] = [
         "Skill",
         "Task",
+        "Agent",
         # —— Bash 系列（sandbox 启用 + autoAllowBashIfSandboxed=True 协同放行）——
         "Bash",
         "BashOutput",

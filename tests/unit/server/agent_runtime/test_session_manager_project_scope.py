@@ -227,6 +227,7 @@ class TestAllowedToolsAndConstants:
         )
         tools = manager.DEFAULT_ALLOWED_TOOLS
         assert "Task" in tools
+        assert "Agent" in tools
         assert "Skill" in tools
         assert "Read" in tools
         assert "AskUserQuestion" in tools

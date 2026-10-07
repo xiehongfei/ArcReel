@@ -31,6 +31,7 @@ from lib.db.engine import async_session_factory as default_async_session_factory
 from lib.i18n import DEFAULT_LOCALE, LOCALE_LANGUAGE_MAP
 from lib.prompt_templates.builtin import builtin_templates
 from server.agent_runtime.agent_access_policy import AgentAccessPolicy
+from server.agent_runtime.profile_agents import load_project_agents
 from server.agent_runtime.sdk_tools import build_arcreel_mcp_server
 from server.auth import create_token, is_auth_enabled
 
@@ -336,6 +337,11 @@ class OptionsAssembler:
             projects_root=self.projects_root,
             user_id=self._user_id_provider(),
         )
+        agents = await asyncio.to_thread(
+            load_project_agents,
+            project_cwd,
+            policy.agent_profile_root,
+        )
 
         return ClaudeAgentOptions(
             cwd=str(project_cwd),
@@ -363,6 +369,7 @@ class OptionsAssembler:
             session_id=session_id,
             can_use_tool=can_use_tool,
             hooks=hooks,  # type: ignore[arg-type]
+            agents=agents,
             mcp_servers={"arcreel": arcreel_server},
             session_store=self.build_session_store(),  # type: ignore[arg-type]
             session_store_flush=session_store_flush_mode(),
