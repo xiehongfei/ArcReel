@@ -8,49 +8,33 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from lib.artifact_activation import (
+from pydantic import BaseModel, ConfigDict, Field
+from pydantic.json_schema import SkipJsonSchema
+
+from lib.artifacts.artifact_activation import (
     active_artifact_currency_resolver,
     resolve_artifact_episode,
 )
-from lib.artifact_manifest import ArtifactKey
-from lib.generation_queue_client import (
-    TaskSpec,
-    batch_enqueue_and_wait,
-)
-from lib.generation_result import (
-    GenerationAction,
-    GenerationCandidate,
-    GenerationProblem,
-    GenerationProblemCode,
+from lib.generation.generation_result import (
     GenerationResultBuilder,
     normalize_requested_ids,
     record_batch_outcomes,
-    select_generation_targets,
 )
-from lib.prompt_builders import render_storyboard_image_prompt
-from lib.reference_admission import admit_storyboard_item
-from lib.reference_catalog import build_reference_catalog
-from lib.resource_paths import resource_relative_path
-from lib.script_models import get_generated_assets, resolve_content_mode
-from lib.script_skeleton import ensure_route_skeleton
-from lib.storyboard_character_identity import project_character_context
-from lib.storyboard_sequence import (
-    build_storyboard_dependency_plan,
-    get_storyboard_items,
-)
+from lib.project.resource_paths import resource_relative_path
+from lib.script.script_models import resolve_content_mode
+from lib.script.script_skeleton import ensure_route_skeleton
 from server.media_tools.context import (
-    ToolContext,
+    GenerationToolValue,
+    RequestedIds,
+    ScriptFilename,
     generation_batch_submission_outcome,
     generation_result_outcome,
     tool_error,
-    tool_services,
-    validate_script_filename,
 )
-from server.media_tools.definition import tool
-from server.services.reference_admission import reference_admission_problems
-from server.tool_runtime import ToolOutcome, submit_media_generation
+from server.services.admission.storyboard_batch import STORYBOARD_BATCH_OPERATION, plan_storyboard_image_batch
+from server.tool_runtime import CallerContext, ProjectScope, Services, ToolOutcome, ToolRequest, submit_media_generation
 
-_OPERATION = "generate_storyboards"
+_OPERATION = STORYBOARD_BATCH_OPERATION
 
 
 class _FailureRecorder:
@@ -88,40 +72,31 @@ class _FailureRecorder:
             self.output_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
-def _build_prompt(
-    segment: dict[str, Any],
-    style: str,
-    style_description: str,
-    id_field: str,
-    *,
-    char_field: str | None = None,
-    characters: object = None,
-) -> str:
-    image_prompt = segment.get("image_prompt", "")
-    if not image_prompt:
-        raise ValueError(f"分镜 {segment[id_field]} 缺少 image_prompt 字段")
-    return render_storyboard_image_prompt(
-        image_prompt,
-        style=style,
-        style_description=style_description,
-        character_context=project_character_context(
-            [segment],
-            char_field=char_field,
-            characters=characters,
-        ),
+class GenerateStoryboardsRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    script: ScriptFilename = Field(description="剧本纯文件名（不含目录），如 episode_1.json")
+    segment_ids: RequestedIds | SkipJsonSchema[None] = Field(
+        default=None,
+        description="要生成或重生的分镜 ID（segment_id / scene_id）列表；省略则只选缺分镜图的分镜",
     )
 
 
-async def handle_generate_storyboards(ctx: ToolContext, args: dict[str, Any]) -> ToolOutcome[Any]:
+async def generate_storyboards(
+    request: ToolRequest[GenerateStoryboardsRequest],
+    scope: ProjectScope,
+    caller: CallerContext,
+    services: Services,
+) -> ToolOutcome[GenerationToolValue]:
     try:
-        script_filename = validate_script_filename(args["script"])
-        segment_ids = normalize_requested_ids(args.get("segment_ids"), field="segment_ids")
+        script_filename = request.value.script
+        segment_ids = normalize_requested_ids(request.value.segment_ids, field="segment_ids")
 
-        script = ctx.pm.load_script(ctx.project_name, script_filename)
-        project_dir = ctx.project_path
+        script = services.projects.load_script(scope.project_name, script_filename)
+        project_dir = services.projects.get_project_path(scope.project_name)
 
         try:
-            project_data = ctx.pm.load_project(ctx.project_name)
+            project_data = services.projects.load_project(scope.project_name)
         except FileNotFoundError:
             # project.json 缺失时允许降级到空 dict（style 走默认值）；
             # JSON 损坏 / 权限错误等其他异常应该让外层 tool_error 暴露出来，
@@ -136,7 +111,6 @@ async def handle_generate_storyboards(ctx: ToolContext, args: dict[str, Any]) ->
                 script, resolve_content_mode(script, project_data), project_data.get("generation_mode")
             )
 
-        items, id_field, char_field, _scene_field, _prop_field = get_storyboard_items(script)
         resolver = active_artifact_currency_resolver(project_dir, project_data)
         episode = (
             resolve_artifact_episode(
@@ -146,101 +120,26 @@ async def handle_generate_storyboards(ctx: ToolContext, args: dict[str, Any]) ->
             )
             or 1
         )
-        items_by_id = {str(item[id_field]): item for item in items if item.get(id_field)}
-        selection = select_generation_targets(
-            candidates=[
-                GenerationCandidate(
-                    unit_id=unit_id,
-                    artifact_key=ArtifactKey.episode_storyboard(episode, unit_id),
-                    artifact_path=get_generated_assets(item).get("storyboard_image"),
-                )
-                for unit_id, item in items_by_id.items()
-            ],
-            requested_ids=segment_ids,
+        plan = plan_storyboard_image_batch(
+            project=project_data,
+            script=script,
+            script_file=script_filename,
+            episode=episode,
             resolver=resolver,
+            requested_ids=segment_ids,
         )
-        builder = GenerationResultBuilder.from_selection(_OPERATION, selection)
-
-        style = project_data.get("style", "")
-        style_description = project_data.get("style_description", "")
-        # 引用准入与 Web 提交入口同源（``lib.reference_admission``）：未登记的引用与没有
-        # 资产图的角色 / 场景 / 道具此前被静默丢弃，agent 会拿到一张少了主体的付费分镜图。
-        catalog = build_reference_catalog(project_data)
-        targets = []
-        for state in selection.targets:
-            item = items_by_id[state.unit_id]
-            # 结果集一个分镜只记一条问题：取首条（未登记排在无资产图之前——名字都没登记时
-            # 「去生成资产图」指不出该对谁做），另一条在这条修完后的下一次调用里报出。
-            reference_problem = next(
-                iter(reference_admission_problems(admit_storyboard_item(catalog, item), unit_id=state.unit_id)),
-                None,
-            )
-            if reference_problem is not None:
-                builder.block(
-                    state.unit_id,
-                    problem=reference_problem,
-                    artifact_key=state.artifact_key,
-                    artifact_path=state.artifact_path,
-                    artifact_status=state.status,
-                )
-                continue
-            try:
-                _build_prompt(
-                    item,
-                    style,
-                    style_description,
-                    id_field,
-                    char_field=char_field,
-                    characters=project_data.get("characters"),
-                )
-            except (KeyError, TypeError, ValueError) as exc:
-                builder.block(
-                    state.unit_id,
-                    problem=GenerationProblem(
-                        code=GenerationProblemCode.UNIT_REQUEST_INVALID,
-                        detail=str(exc),
-                        action=GenerationAction.FIX_INPUT,
-                    ),
-                    artifact_key=state.artifact_key,
-                    artifact_path=state.artifact_path,
-                    artifact_status=state.status,
-                )
-                continue
-            targets.append(state)
-
-        by_id = {state.unit_id: state for state in targets}
-        plans = build_storyboard_dependency_plan(
-            items,
-            id_field,
-            [state.unit_id for state in targets],
-            script_filename,
-        )
-        specs = [
-            TaskSpec.from_request(
-                task_type="storyboard",
-                media_type="image",
-                resource_id=plan.resource_id,
-                prompt=items_by_id[plan.resource_id].get("image_prompt"),
-                script_file=script_filename,
-                dependency_resource_id=plan.dependency_resource_id,
-                dependency_group=plan.dependency_group,
-                dependency_index=plan.dependency_index,
-                unit_id=plan.resource_id,
-                source=ctx.caller.source,
-            )
-            for plan in plans
-        ]
+        by_id = plan.states
+        specs = plan.task_specs(source=caller.source)
 
         submitted = await submit_media_generation(
-            scope=ctx.scope,
-            caller=ctx.caller,
-            services=tool_services(ctx),
+            scope=scope,
+            caller=caller,
+            services=services,
             operation=_OPERATION,
-            preflight=builder.build(),
-            pending_ids=[state.unit_id for state in targets],
+            preflight=plan.preflight,
+            pending_ids=plan.target_ids,
             specs=specs,
             states=by_id,
-            embedded_waiter=batch_enqueue_and_wait,
         )
         if submitted.successes is None or submitted.failures is None:
             return generation_batch_submission_outcome(submitted.batch)
@@ -248,11 +147,12 @@ async def handle_generate_storyboards(ctx: ToolContext, args: dict[str, Any]) ->
             recorder = _FailureRecorder(project_dir / "storyboards")
             # narration → segment_id / drama → scene_id：``id_field`` 是脚本里
             # 的规范字段名，``"segment"`` / ``"scene"`` 是对应的资源类型。
-            resource_type = "segment" if id_field == "segment_id" else "scene"
+            resource_type = "segment" if plan.id_field == "segment_id" else "scene"
             for br in submitted.failures:
                 recorder.record(br.resource_id, resource_type, br.error or "unknown")
             recorder.save()
 
+            builder = GenerationResultBuilder.from_preflight(plan.preflight)
             record_batch_outcomes(
                 builder,
                 successes=submitted.successes,
@@ -262,38 +162,10 @@ async def handle_generate_storyboards(ctx: ToolContext, args: dict[str, Any]) ->
                 fallback_path=lambda rid: resource_relative_path("storyboards", rid),
             )
 
-        return generation_result_outcome(builder.build(), batch_id=submitted.batch.batch_id)
+            return generation_result_outcome(builder.build(), batch_id=submitted.batch.batch_id)
+        return generation_result_outcome(plan.preflight, batch_id=submitted.batch.batch_id)
     except Exception as exc:
         return tool_error(_OPERATION, exc)
 
 
-def generate_storyboards_tool(ctx: ToolContext):
-    @tool(
-        _OPERATION,
-        "为 narration/剧情演绎剧本生成分镜图。"
-        "script 为剧本文件名（如 episode_1.json）；segment_ids 指定要重生的分镜 ID 列表"
-        "（不传则只生成缺分镜图的项；已失效但可用的旧图不会被自动重生）。"
-        "返回 requested / succeeded / failed / blocked 的逐 ID 结果，每个失败项带稳定 code 与下一步动作。",
-        {
-            "type": "object",
-            "properties": {
-                "script": {
-                    "type": "string",
-                    "description": "剧本文件名（如 episode_1.json），必须是纯文件名，禁止任何路径分隔符",
-                },
-                "segment_ids": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "description": "分镜 ID 列表；不传则只选缺分镜图的项",
-                },
-            },
-            "required": ["script"],
-        },
-    )
-    async def _handler(args: dict[str, Any]) -> ToolOutcome[Any]:
-        return await handle_generate_storyboards(ctx, args)
-
-    return _handler
-
-
-__all__ = ["generate_storyboards_tool"]
+__all__ = ["GenerateStoryboardsRequest", "generate_storyboards"]

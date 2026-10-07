@@ -22,6 +22,8 @@ export interface SystemConfigSettings {
   claude_code_subagent_model: string;
   agent_session_cleanup_delay_seconds: number;
   agent_max_concurrent_sessions: number;
+  /** 市场源 GitHub raw 代理前缀；空串即直连。 */
+  market_github_proxy_prefix?: string;
 }
 
 export interface SystemConfigOptions {
@@ -32,6 +34,17 @@ export interface SystemConfigOptions {
   provider_names?: Record<string, string>;
   /** "provider_id/model_id" → 按 Accept-Language 成文的模型名；缺键即退回 model id。 */
   model_names?: Record<string, string>;
+}
+
+/** 新建 TTS 项目的预填值；未配置任何音频供应商时 audio_backend 为 null。 */
+export interface NarrationDefaultsResponse {
+  audio_backend: string | null;
+  narration_voice: string;
+  narration_speed: number | null;
+}
+
+export interface TtsModelCapabilitiesResponse {
+  supports_speed: boolean;
 }
 
 export interface GetSystemConfigResponse {
@@ -103,4 +116,5 @@ export interface SystemConfigPatch {
   claude_code_subagent_model?: string;
   agent_session_cleanup_delay_seconds?: number;
   agent_max_concurrent_sessions?: number;
+  market_github_proxy_prefix?: string;
 }

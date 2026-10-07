@@ -12,9 +12,9 @@ ArcReel 把"做什么内容"和"怎么生成视频"拆成两条独立维度。`c
 | `storyboard` | `drama` | `scenes[]` | normalize-drama-script | `script_plan_normalized_script.json` | DramaNormalizedScript（script_plan）→ DramaVisualScript（prompt_authoring）→ DramaEpisodeScript（合并） | 每个分镜一张分镜图作起始帧（`grid_storyboard=true` 时为宫格图切块） |
 | `reference_video` | `narration` / `drama` | `video_units[]` | split-reference-video-units | `script_plan_reference_units.json` | ReferenceVideoScript | 角色 / 场景 / 道具 sheet 图直接作为 `reference_images` |
 
-> drama 走两段式（见 ADR 0041）：script_plan（normalize-drama-script）产出**结构化内容** `script_plan_normalized_script.json`（分镜边界 / 出场资产 / 逐字口播 utterances / 原文锚 source_text / 视觉改编描述）；prompt_authoring（create-episode-script）LLM 只出视觉层 `DramaVisualScript`（scene_id + image_prompt + video_prompt），后端按 scene_id 合并回 script_plan 内容得 `DramaEpisodeScript`、透传非视觉字段。
+> drama 走两段式（见 ADR 0041）：script_plan（normalize-drama-script）产出**结构化内容** `script_plan_normalized_script.json`（分镜边界 / 出场资产 / 逐字口播 utterances / 原文锚 source_text / 视觉改编描述）；prompt_authoring（create-episode-script）LLM 只出视觉层 `DramaVisualScript`（scene_id + image_prompt + video_prompt），后端按 scene_id 写回正式脚本 `DramaEpisodeScript`。内容确认时脚本规划整集转为正式脚本，之后内容修改在正式脚本上经 `patch_episode_script` 进行。
 >
-> script_plan 中间文件统一位于 `drafts/episode_{N}/`。状态检测与剧本生成**只认当前项目 generation_mode 对应的那一个文件**：目录中出现其他模式的 `script_plan_*` 文件属历史残留，既不作为脚本规划已完成的依据，也不能当作剧本生成的代替输入。drama 旧项目残留的 `script_plan_normalized_script.md`（结构化前自由文本稿）不算有效 script_plan，须重跑 normalize 产出 `.json`。
+> script_plan 中间文件统一位于 `drafts/episode_{N}/`。状态检测与内容确认**只认当前项目 generation_mode 对应的那一个文件**：目录中出现其他模式的 `script_plan_*` 文件属历史残留，既不作为脚本规划已完成的依据，也不能当作内容确认的代替输入。drama 旧项目残留的 `script_plan_normalized_script.md`（结构化前自由文本稿）不算有效 script_plan，须重跑 normalize 产出 `.json`。
 
 ## 步骤适用性由计划表达
 
@@ -28,19 +28,19 @@ ArcReel 把"做什么内容"和"怎么生成视频"拆成两条独立维度。`c
 
 几条不由计划表达、需要在这里说清的事实：
 
-- `reference_video` **只跳过分镜图**这一步。它不跳过 audio：旁白交付选择在两种生成模式下都要逐次做，
+- `reference_video` **只跳过分镜图**这一步。TTS 配音项目在两种生成模式下都能生成旁白配音，
   只是参考生视频没有按段批量 TTS 的入口（无 `segments[]`）。
 - 视频入队按项目 `generation_mode` 定生成模式，剧本骨架只作校验；失配（如 storyboard 项目里残留
   `video_units[]` 旧剧本）直接拒绝入队，正解是按项目当前生成模式重跑脚本规划与剧本生成，而非指望旧剧本被执行。
-- 脚本规划中间文件被修改 / 重拆后必须重新生成剧本 JSON——剧本不会自动跟随中间文件更新。
+- 正式脚本不跟随脚本规划变化：内容修改在正式脚本上经 `patch_episode_script` 进行；只有整集重做才重跑脚本规划，重跑后须重新确认，确认会整份覆盖现有正式脚本（先经覆盖确认）。
 
 ## 视频规格
 
 - **分辨率**：图片 1K，视频 1080p
 - **单分镜时长**（storyboard，含 grid_storyboard）：取值必须在模型 `supported_durations` 内；项目 `default_duration` 非 null 时作默认值（项目创建时按 content_mode 写入 project.json），为 null 时由脚本规划按内容节奏自行取值
 - **单集目标时长**（非 ad 项目）：项目 `episode_target_duration` 非 null 时，脚本规划据它决定本集拆多少个分镜 / 视频单元；未显式设 `episode_target_units` 时，分集规划也按它经口播语速折算出每集塞多少原文。两处均为软目标，内容不足宁少拆、内容确实需要可超出，超出只提示不阻断
-- **单个视频单元时长**（参考生视频）：视频单元是一次生成调用的单元，一个视频单元一个时长——取值必须在该视频单元**引用状态对应**的生效档位内（`get_video_capabilities` 返回的 `reference_unit_durations.with_references` / `.without_references`；部分型号对带参考图的生成另有时长限制）；内容装不下所选档位时重拆视频单元，不违约时长。具体数值由子智能体在执行时通过 `mcp__arcreel__get_video_capabilities` 工具查得，**不在本文档固化**
-- **拼接**：全部模式用 ffmpeg concat；Veo extend 仅用于**单片段延长**，不串联不同镜头
+- **单个视频单元时长**（参考生视频）：视频单元是一次生成调用的单元，一个视频单元一个时长——取值必须在该视频单元**引用状态对应**的生效档位内（`get_video_capabilities` 返回的 `reference_unit_durations.with_references` / `.without_references`；部分型号对带参考图的生成另有时长限制）；内容装不下所选档位时重拆视频单元，不违约时长。具体数值由子智能体在执行时通过 `mcp__arcreel__get_video_capabilities` 工具查得，**不在本文档固化**。已有正式视频单元实际落的桶与档位以同一返回里 `reference_unit_durations.units[unit_id]` 的服务端判定为准：它按此刻可用的参考图定桶，登记了资产却没有资产图的引用不算带图，并在 `problems` / `unavailable_references` 里点名
+- **剪辑与出片**：全部模式按 `edit-video` skill 在剪辑时间线上衔接并出成片；Veo extend 仅用于**单片段延长**，不串联不同镜头
 - **BGM**：生成端已在视频 prompt 末尾自动追加 `Avoid: BGM、文字字幕、水印`，无需手动追加，prompt 里也不要描述 BGM / 配乐
 
 ## Prompt 语言

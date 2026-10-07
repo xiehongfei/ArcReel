@@ -123,14 +123,14 @@ class TestUnexpectedErrorsDoNotLeak:
             assert resp.status_code == 500
             assert sentinel not in self._body(resp)
 
-    def test_reorder_shots_unexpected_error_maps_to_500(self, tmp_path, monkeypatch):
-        sentinel = "LEAKED_SECRET_reorder_shots"
+    def test_move_script_item_unexpected_error_maps_to_500(self, tmp_path, monkeypatch):
+        sentinel = "LEAKED_SECRET_move_script_item"
         client = build_projects_client(monkeypatch, _FakePM(tmp_path))
         monkeypatch.setattr(projects, "get_project_manager", _raise(sentinel))
         with client:
             resp = client.post(
-                "/api/v1/projects/ready/script-shots/reorder",
-                json={"script_file": "scripts/episode_1.json", "shot_ids": ["a", "b"]},
+                "/api/v1/projects/ready/script-items/a/move",
+                json={"script_file": "scripts/episode_1.json", "after_id": "b"},
             )
             assert resp.status_code == 500
             assert sentinel not in self._body(resp)
@@ -217,6 +217,18 @@ class TestUnexpectedErrorsDoNotLeak:
             resp = client.post("/api/v1/projects/bad-schema/generate-overview")
             assert resp.status_code == 400
             assert resp.json()["detail"] == zh_errors.MESSAGES["overview_ai_response_invalid"]
+
+    def test_generate_overview_truncated_maps_to_truncation_problem(self, tmp_path, monkeypatch):
+        # 输出被截断是可操作的终局错误（缩小范围或换模型），不能落进兜底的通用 500；
+        # diagnostic 复用 text_output_truncated 问题票的形状，前端据此给出登记输出长度或换模型的出路
+        client = build_projects_client(monkeypatch, _FakePM(tmp_path))
+        with client:
+            resp = client.post("/api/v1/projects/truncated/generate-overview")
+            assert resp.status_code == 422
+            body = resp.json()
+            assert body["detail"] == zh_errors.MESSAGES["text_output_truncated"].format(model="my-llm")
+            assert body["diagnostic"]["code"] == "text_output_truncated"
+            assert body["diagnostic"]["params"] == {"provider_id": "custom-3", "model": "my-llm", "custom_model": True}
 
     def test_generate_overview_invalid_project_name_maps_to_400_not_provider_error(self, tmp_path, monkeypatch):
         # get_project_path 抛出的非法项目名 ValueError（路径穿越等）不能被 generate_overview()

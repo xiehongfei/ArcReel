@@ -1,4 +1,4 @@
-"""Tests for enqueue_videos batch admission."""
+"""generate_videos 的整批准入：全有或全无、逐单元结论与按调用方隔离的在途任务。"""
 
 from __future__ import annotations
 
@@ -8,89 +8,41 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from lib.artifact_manifest import ArtifactStatus
 from lib.db.models.user import User
-from lib.narration_delivery import TtsSynthesisSettings
-from server.media_tools.context import ToolContext
-from server.services.narration_delivery_tasks import ResolvedTtsSettingsResolver, active_tts_resource_ids
-from server.tool_runtime import CallerContext
-from tests.integration.server.agent_runtime.sdk_tools.sdk_tools_support import (
-    call,
+from server.tool_runtime import CallerContext, ToolOutcome
+from tests.factories import make_video_request_facts
+from tests.integration.server.agent_tool_support import (
+    ToolHarness,
+    fake_reference_projection,
     read_generation_result,
     reference_video_script,
+    run_generate_videos,
     use_reference_route,
-    videos_tool_for_scope,
 )
 
 
-def _episode_scope(ctx: ToolContext):
-    return videos_tool_for_scope(ctx, "episode")
+@pytest.fixture(autouse=True)
+def storyboard_request_facts(set_admission_video_request_facts) -> None:
+    facts = make_video_request_facts(provider_id="fake", model_id="fake-video", audio_switch_controllable=True)
+    set_admission_video_request_facts(facts)
 
 
-def _all_scope(ctx: ToolContext):
-    return videos_tool_for_scope(ctx, "all")
+_EPISODE_1 = {"scope": "episode", "episode_id": 1}
+_ALL = {"scope": "all"}
+# 越出项目根的成片路径：清单无从检查这份产物，它的状态既不是「缺失」也不是「可用」。
+_UNREADABLE_CLIP = "../outside/E1S02.mp4"
 
 
-def _selected_scope(ctx: ToolContext):
-    return videos_tool_for_scope(ctx, "selected")
-
-
-async def test_generate_videos_episode_scope_reports_an_interrupted_batch_enqueue_per_id(
-    fake_ctx: ToolContext, monkeypatch
-) -> None:
-    """入队中断逐 ID 报告：建成的算 succeeded，没轮到的带「入队中断」问题码且未计费。"""
-    from lib.generation_queue_client import BatchTaskResult
-    from server.media_tools import videos as mod
-
-    fake_ctx.pm.script_payload["segments"] = [
-        {"segment_id": "E1S01", "novel_text": "第一段旁白。", "video_prompt": "第一镜"},
-        {"segment_id": "E1S02", "novel_text": "第二段旁白。", "video_prompt": "第二镜"},
-    ]
-    project_dir = fake_ctx.pm.get_project_path("demo")
-    for segment_id in ("E1S01", "E1S02"):
-        image = project_dir / "storyboards" / f"scene_{segment_id}.png"
-        image.write_bytes(b"png")
-        for item in fake_ctx.pm.script_payload["segments"]:
-            if item["segment_id"] == segment_id:
-                item["generated_assets"] = {"storyboard_image": f"storyboards/scene_{segment_id}.png"}
-
-    async def _interrupted(*, project_name, specs, on_success=None, on_failure=None, **_batch_kwargs):
-        success = BatchTaskResult(
-            resource_id="E1S01",
-            task_id="t1",
-            status="succeeded",
-            result={"file_path": "videos/E1S01.mp4"},
-        )
-        if on_success is not None:
-            on_success(success)
-        return (
-            [success],
-            [
-                BatchTaskResult(
-                    resource_id="E1S02",
-                    task_id="",
-                    status="failed",
-                    error="queue unavailable",
-                    enqueue_interrupted=True,
-                )
-            ],
-        )
-
-    monkeypatch.setattr(mod, "batch_enqueue_and_wait", _interrupted)
-
-    out = await call(_episode_scope(fake_ctx), {"script": "episode_1.json"})
-
-    payload = out["generation_result"]
-    assert payload["succeeded"] == ["E1S01"]
-    assert payload["failed"] == ["E1S02"]
-    failed_item = next(item for item in payload["items"] if item["unit_id"] == "E1S02")
-    assert failed_item["problem"]["code"] == "generation_enqueue_interrupted"
-    assert failed_item["task_state"] == "not_queued"
-    assert failed_item["task_id"] is None
+def _admission_codes(out: ToolOutcome[Any]) -> dict[str, list[str]]:
+    assert isinstance(out.value, dict)
+    return {
+        unit["unit_id"]: [problem["code"] for problem in unit["problems"]]
+        for unit in out.value["batch_admission"]["units"]
+    }
 
 
 async def test_generate_videos_episode_scope_batch_is_all_or_nothing_when_a_unit_is_occupied(
-    idle_fake_ctx: ToolContext, concurrent_session_factory
+    idle_fake_ctx: ToolHarness, concurrent_session_factory
 ) -> None:
     """在途任务冲突拦下整批：一个都不入队，其余 unit 报告自己是被谁扣下的。"""
     fake_ctx = idle_fake_ctx
@@ -135,9 +87,8 @@ async def test_generate_videos_episode_scope_batch_is_all_or_nothing_when_a_unit
     assert (await fake_ctx.queue.get_task(other_user["task_id"])) is not None
     assert [task["task_id"] for task in caller_active] == [occupied["task_id"]]
 
-    out = await call(_episode_scope(fake_ctx), {"script": "episode_1.json"})
+    out = await run_generate_videos(fake_ctx, _EPISODE_1)
 
-    assert out["is_error"] is True
     other_task = await fake_ctx.queue.get_task(other_user["task_id"])
     occupied_task = await fake_ctx.queue.get_task(occupied["task_id"])
     assert other_task is not None
@@ -151,15 +102,97 @@ async def test_generate_videos_episode_scope_batch_is_all_or_nothing_when_a_unit
     assert codes["E1S01"] == "generation_batch_admission_withheld"
 
 
-async def test_generate_reference_videos_reads_active_tts_from_the_callers_queue_only(
-    idle_fake_ctx: ToolContext, concurrent_session_factory
+_WEB_SCRIPT_FILE = "scripts/episode_1.json"  # Web 路由传账本原值；Agent 工具传纯文件名
+
+
+def _enqueue_reference_video_as_web(fake_ctx: ToolHarness) -> Any:
+    return fake_ctx.queue.enqueue_task(
+        project_name="demo",
+        task_type="reference_video",
+        media_type="video",
+        resource_id="E1U1",
+        payload={},
+        script_file=_WEB_SCRIPT_FILE,
+        provider_id="fake",
+    )
+
+
+async def test_generate_reference_videos_refuses_a_unit_the_web_route_already_queued(
+    idle_fake_ctx: ToolHarness, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """参考视频预检只认同队列同租户 TTS；其他租户的任务不能占住当前请求。"""
+    """Web 先入队同一单元：Agent 整集生成在准入处被「已在队列中」拦下，不再入队计费。"""
     fake_ctx = idle_fake_ctx
-    fake_ctx.tts_settings_resolver = ResolvedTtsSettingsResolver(
-        TtsSynthesisSettings(provider_id="dashscope", model_id="qwen3-tts-flash", voice="Cherry", speed=None)
+    monkeypatch.setattr(
+        "server.services.admission.video_batch_admission.project_reference_unit_request",
+        fake_reference_projection(),
     )
     use_reference_route(fake_ctx)
+    fake_ctx.pm.script_payload = reference_video_script()
+    queued = await _enqueue_reference_video_as_web(fake_ctx)
+    enqueue = AsyncMock(return_value=([], []))
+
+    out = await run_generate_videos(fake_ctx, _EPISODE_1, batch_waiter=enqueue)
+
+    enqueue.assert_not_awaited()
+    result = read_generation_result(out)
+    assert result.blocked == ["E1U1"]
+    codes = {item.unit_id: item.problem.code for item in result.items if item.problem is not None}
+    assert codes["E1U1"] == "generation_active_task_conflict"
+    active = await fake_ctx.queue.get_active_tasks_for_resources(
+        project_name="demo", task_type="reference_video", resource_ids=["E1U1"], script_file="episode_1.json"
+    )
+    assert [task["task_id"] for task in active] == [queued["task_id"]]
+
+
+async def test_web_route_enqueue_dedupes_to_the_task_the_agent_tool_already_queued(
+    idle_fake_ctx: ToolHarness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Agent 先入队同一单元：Web 路由随后的入队落在同一个任务上，只产生一个任务。"""
+    fake_ctx = idle_fake_ctx
+    monkeypatch.setattr(
+        "server.services.admission.video_batch_admission.project_reference_unit_request",
+        fake_reference_projection(),
+    )
+    use_reference_route(fake_ctx)
+    fake_ctx.pm.script_payload = reference_video_script()
+    agent_task_ids: list[str] = []
+
+    async def enqueue_as_agent(*, specs, **_batch_kwargs):
+        for spec in specs:
+            queued = await fake_ctx.queue.enqueue_task(
+                project_name="demo",
+                task_type=spec.task_type,
+                media_type=spec.media_type,
+                resource_id=spec.resource_id,
+                payload=spec.payload,
+                script_file=spec.script_file,
+                provider_id="fake",
+            )
+            agent_task_ids.append(queued["task_id"])
+        return [], []
+
+    out = await run_generate_videos(fake_ctx, _EPISODE_1, batch_waiter=enqueue_as_agent)
+
+    assert out.problem is None, out
+    assert len(agent_task_ids) == 1
+    web = await _enqueue_reference_video_as_web(fake_ctx)
+    assert web["deduped"] is True
+    assert web["task_id"] == agent_task_ids[0]
+
+
+async def test_generate_reference_videos_ignores_narration_audio_state(
+    idle_fake_ctx: ToolHarness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """TTS 配音项目里旁白配音缺失或正在生成，都不影响参考生视频的准入与入队。"""
+    fake_ctx = idle_fake_ctx
+    monkeypatch.setattr(
+        "server.services.admission.video_batch_admission.project_reference_unit_request",
+        fake_reference_projection(),
+    )
+    use_reference_route(fake_ctx)
+    fake_ctx.pm.project_payload.update(
+        {"narration_delivery": "use_tts", "audio_backend": "dashscope/qwen3-tts-flash", "narration_voice": "Cherry"}
+    )
     (fake_ctx.project_path / "project.json").write_text(
         json.dumps(fake_ctx.pm.project_payload, ensure_ascii=False),
         encoding="utf-8",
@@ -174,77 +207,31 @@ async def test_generate_reference_videos_reads_active_tts_from_the_callers_queue
         }
     )
     fake_ctx.pm.script_payload = script
-    async with concurrent_session_factory() as session:
-        session.add(User(id="tenant-user", username="tenant-user"))
-        await session.commit()
-    fake_ctx.caller = CallerContext(user_id="tenant-user", source="embedded")
-    other_user = await fake_ctx.queue.enqueue_task(
-        project_name="demo",
-        task_type="tts",
-        media_type="audio",
-        resource_id="E1U1",
-        script_file="episode_1.json",
-        payload={"text": "别人的发声任务"},
-    )
-    caller_tts = await fake_ctx.queue.enqueue_task(
+    await fake_ctx.queue.enqueue_task(
         project_name="demo",
         task_type="tts",
         media_type="audio",
         resource_id="E1U2",
         script_file="episode_1.json",
-        payload={"text": "当前调用方的发声任务"},
-        user_id="tenant-user",
+        payload={"text": "回声渐渐远去。"},
     )
-    assert await active_tts_resource_ids(
-        project_name="demo",
-        resource_ids=("E1U1", "E1U2"),
-        script_file="episode_1.json",
-        user_id="tenant-user",
-        queue=fake_ctx.queue,
-    ) == frozenset({"E1U2"})
-    assert await active_tts_resource_ids(
-        project_name="demo",
-        resource_ids=("E1U1", "E1U2"),
-        script_file="episode_1.json",
-        queue=fake_ctx.queue,
-    ) == frozenset({"E1U1"})
+    enqueued: list[Any] = []
 
-    out = await call(
-        _episode_scope(fake_ctx),
-        {"script": "episode_1.json", "narration_delivery": "use_tts"},
-    )
+    async def _batch(*, specs, **_batch_kwargs):
+        enqueued.extend(specs)
+        return [], []
 
-    assert out["is_error"] is True
-    other_task = await fake_ctx.queue.get_task(other_user["task_id"])
-    caller_task = await fake_ctx.queue.get_task(caller_tts["task_id"])
-    assert other_task is not None
-    assert other_task["user_id"] == "default"
-    assert caller_task is not None
-    assert caller_task["user_id"] == "tenant-user"
-    result = read_generation_result(out)
-    assert sorted(result.blocked) == ["E1U1", "E1U2"]
-    problems = {item.unit_id: item.problem for item in result.items if item.problem is not None}
-    assert problems["E1U1"].code == "tts_missing"
-    assert problems["E1U2"].code == "tts_generating"
-    assert not await fake_ctx.queue.get_active_tasks_for_resources(
-        project_name="demo",
-        task_type="reference_video",
-        resource_ids=["E1U1", "E1U2"],
-        script_file="episode_1.json",
-        user_id="tenant-user",
-    )
+    out = await run_generate_videos(fake_ctx, _EPISODE_1, batch_waiter=_batch)
+
+    assert out.problem is None, out
+    assert read_generation_result(out).blocked == []
+    assert sorted(spec.resource_id for spec in enqueued) == ["E1U1", "E1U2"]
 
 
 async def test_generate_videos_all_scope_creates_zero_tasks_when_one_artifact_state_is_unreadable(
-    fake_ctx: ToolContext, monkeypatch: pytest.MonkeyPatch
+    fake_ctx: ToolHarness,
 ) -> None:
     """产物状态读不出的场景属于这次请求：它带着自己的问题进准入，整批停下，健康的场景不入队计费。"""
-    from dataclasses import replace as dc_replace
-
-    from lib.artifact_manifest import ArtifactBlocker
-    from lib.generation_result import GenerationCandidate, GenerationTargetState
-    from server.media_tools import videos as mod
-
     fake_ctx.pm.script_payload["segments"].append(
         {
             "segment_id": "E1S02",
@@ -252,48 +239,26 @@ async def test_generate_videos_all_scope_creates_zero_tasks_when_one_artifact_st
             "novel_text": "清晨的山道上落着薄雾。",
             "video_prompt": {"action": "镜头推近", "camera_motion": "Push", "ambiance_audio": "鸟鸣"},
             "duration_seconds": 4,
-            "generated_assets": {"storyboard_image": "storyboards/scene_E1S02.png"},
+            "generated_assets": {"storyboard_image": "storyboards/scene_E1S02.png", "video_clip": _UNREADABLE_CLIP},
         }
     )
     (fake_ctx.project_path / "storyboards").mkdir(parents=True, exist_ok=True)
     (fake_ctx.project_path / "storyboards" / "scene_E1S02.png").write_bytes(b"\x89PNG")
-
-    select_targets = mod.select_generation_targets
-
-    def _one_unavailable(**kwargs: Any):
-        selection = select_targets(**kwargs)
-        blocked = GenerationTargetState(
-            candidate=GenerationCandidate(unit_id="E1S02"),
-            status=ArtifactStatus.BLOCKED,
-            blocker=ArtifactBlocker(code="artifact_manifest_unreadable", path="", detail="侧车读不出"),
-        )
-        return dc_replace(
-            selection,
-            targets=tuple(state for state in selection.targets if state.unit_id != "E1S02"),
-            unavailable=(blocked,),
-        )
-
     enqueue = AsyncMock(return_value=([], []))
-    monkeypatch.setattr(mod, "select_generation_targets", _one_unavailable)
-    monkeypatch.setattr(mod, "batch_enqueue_and_wait", enqueue)
 
-    out = await call(_all_scope(fake_ctx), {"script": "episode_1.json"})
+    out = await run_generate_videos(fake_ctx, _ALL, batch_waiter=enqueue)
 
-    assert out.get("batch_admission") is not None, out
-    assert out["batch_admission"]["decision"] == "blocked"
+    assert out.value["batch_admission"]["decision"] == "blocked"
     enqueue.assert_not_awaited()
-    codes = {
-        unit["unit_id"]: [problem["code"] for problem in unit["problems"]] for unit in out["batch_admission"]["units"]
-    }
+    codes = _admission_codes(out)
     assert codes["E1S02"] == ["generation_artifact_state_unavailable"]
     assert codes["E1S01"] == ["generation_batch_admission_withheld"]
 
 
 async def test_generate_videos_all_scope_blocks_a_reference_gap_and_withholds_the_batch(
-    fake_ctx: ToolContext, monkeypatch: pytest.MonkeyPatch
+    fake_ctx: ToolHarness,
 ) -> None:
     """图生视频的整批准入与单条提交同判：引用有缺口的场景阻断，整批一个都不入队。"""
-    from server.media_tools import videos as mod
 
     fake_ctx.pm.script_payload["segments"].append(
         {
@@ -310,14 +275,12 @@ async def test_generate_videos_all_scope_blocks_a_reference_gap_and_withholds_th
     (fake_ctx.project_path / "storyboards" / "scene_E1S02.png").write_bytes(b"\x89PNG")
 
     enqueue = AsyncMock(return_value=([], []))
-    monkeypatch.setattr(mod, "batch_enqueue_and_wait", enqueue)
 
-    out = await call(_all_scope(fake_ctx), {"script": "episode_1.json"})
+    out = await run_generate_videos(fake_ctx, _ALL, batch_waiter=enqueue)
 
-    assert out.get("batch_admission") is not None, out
-    assert out["batch_admission"]["decision"] == "blocked"
+    assert out.value["batch_admission"]["decision"] == "blocked"
     enqueue.assert_not_awaited()
-    units = {unit["unit_id"]: unit for unit in out["batch_admission"]["units"]}
+    units = {unit["unit_id"]: unit for unit in out.value["batch_admission"]["units"]}
     assert [problem["code"] for problem in units["E1S02"]["problems"]] == ["reference_asset_unregistered"]
     assert units["E1S02"]["problems"][0]["action"] == "generate_dependency"
     assert units["E1S02"]["problems"][0]["params"]["missing_text"] == "无名氏"
@@ -325,10 +288,9 @@ async def test_generate_videos_all_scope_blocks_a_reference_gap_and_withholds_th
 
 
 async def test_generate_videos_all_scope_admits_legacy_narration_stored_under_scenes(
-    fake_ctx: ToolContext, monkeypatch: pytest.MonkeyPatch
+    fake_ctx: ToolHarness,
 ) -> None:
     """narration 数据落在 scenes 键的历史剧本按实际骨架做发声准入，不被整批判成解析失败。"""
-    from server.media_tools import videos as mod
 
     fake_ctx.pm.script_payload = {
         "content_mode": "narration",
@@ -351,7 +313,7 @@ async def test_generate_videos_all_scope_admits_legacy_narration_stored_under_sc
     (fake_ctx.project_path / "storyboards" / "scene_E1S01.png").write_bytes(b"\x89PNG")
 
     async def fake_batch(*, project_name, specs, on_success=None, on_failure=None, **_batch_kwargs):
-        from lib.generation_queue_client import BatchTaskResult
+        from lib.generation.generation_queue_client import BatchTaskResult
 
         return [
             BatchTaskResult(
@@ -363,56 +325,31 @@ async def test_generate_videos_all_scope_admits_legacy_narration_stored_under_sc
             for spec in specs
         ], []
 
-    monkeypatch.setattr(mod, "batch_enqueue_and_wait", fake_batch)
+    out = await run_generate_videos(fake_ctx, _ALL, batch_waiter=fake_batch)
 
-    out = await call(_all_scope(fake_ctx), {"script": "episode_1.json"})
-
-    assert out.get("is_error") is not True, out
+    assert out.problem is None, out.problem
     result = read_generation_result(out)
     assert list(result.succeeded) == ["E1S01"]
 
 
 async def test_generate_videos_all_scope_reports_an_all_unreadable_selection_as_blocked(
-    fake_ctx: ToolContext, monkeypatch: pytest.MonkeyPatch
+    fake_ctx: ToolHarness,
 ) -> None:
     """全部目标的产物状态都读不出时不能报成空的成功：那会把每一条状态问题都藏起来。"""
-    from dataclasses import replace as dc_replace
-
-    from lib.artifact_manifest import ArtifactBlocker
-    from lib.generation_result import GenerationCandidate, GenerationTargetState
-    from server.media_tools import videos as mod
-
-    select_targets = mod.select_generation_targets
-
-    def _all_unavailable(**kwargs: Any):
-        selection = select_targets(**kwargs)
-        blocked = GenerationTargetState(
-            candidate=GenerationCandidate(unit_id="E1S01"),
-            status=ArtifactStatus.BLOCKED,
-            blocker=ArtifactBlocker(code="artifact_manifest_unreadable", path="", detail="侧车读不出"),
-        )
-        return dc_replace(selection, targets=(), unavailable=(blocked,))
-
+    fake_ctx.pm.script_payload["segments"][0]["generated_assets"]["video_clip"] = _UNREADABLE_CLIP
     enqueue = AsyncMock(return_value=([], []))
-    monkeypatch.setattr(mod, "select_generation_targets", _all_unavailable)
-    monkeypatch.setattr(mod, "batch_enqueue_and_wait", enqueue)
 
-    out = await call(_all_scope(fake_ctx), {"script": "episode_1.json"})
+    out = await run_generate_videos(fake_ctx, _ALL, batch_waiter=enqueue)
 
-    assert out.get("batch_admission") is not None, out
-    assert out["batch_admission"]["decision"] == "blocked"
+    assert out.value["batch_admission"]["decision"] == "blocked"
     enqueue.assert_not_awaited()
-    codes = {
-        unit["unit_id"]: [problem["code"] for problem in unit["problems"]] for unit in out["batch_admission"]["units"]
-    }
-    assert codes == {"E1S01": ["generation_artifact_state_unavailable"]}
+    assert _admission_codes(out) == {"E1S01": ["generation_artifact_state_unavailable"]}
 
 
 async def test_generate_reference_episode_refuses_a_non_scalar_unit_id(
-    fake_ctx: ToolContext, monkeypatch: pytest.MonkeyPatch
+    fake_ctx: ToolHarness,
 ) -> None:
     """整集参考生成遇到非标量 unit_id：它按位置记名拒收，健康的兄弟条目不会独自入队计费。"""
-    from server.media_tools import videos as mod
 
     use_reference_route(fake_ctx)
     script = reference_video_script()
@@ -420,23 +357,19 @@ async def test_generate_reference_episode_refuses_a_non_scalar_unit_id(
     script["video_units"] = [{**healthy, "unit_id": ["U9"]}, healthy]
     fake_ctx.pm.script_payload = script
     enqueue = AsyncMock(return_value=([], []))
-    monkeypatch.setattr(mod, "batch_enqueue_and_wait", enqueue)
 
-    out = await call(_episode_scope(fake_ctx), {"script": "episode_1.json"})
+    out = await run_generate_videos(fake_ctx, _EPISODE_1, batch_waiter=enqueue)
 
     enqueue.assert_not_awaited()
-    codes = {
-        unit["unit_id"]: [problem["code"] for problem in unit["problems"]] for unit in out["batch_admission"]["units"]
-    }
+    codes = _admission_codes(out)
     assert codes["video_units[0]"] == ["generation_unit_request_invalid"]
     assert healthy["unit_id"] in codes
 
 
 async def test_generate_reference_units_refuses_a_duplicated_named_unit(
-    fake_ctx: ToolContext, monkeypatch: pytest.MonkeyPatch
+    fake_ctx: ToolHarness,
 ) -> None:
     """点名的 unit 在剧本里有两份：无从判定要做哪一条，整批停在建任务之前。"""
-    from server.media_tools import videos as mod
 
     use_reference_route(fake_ctx)
     script = reference_video_script()
@@ -444,15 +377,10 @@ async def test_generate_reference_units_refuses_a_duplicated_named_unit(
     fake_ctx.pm.script_payload = script
     duplicated_id = script["video_units"][0]["unit_id"]
     enqueue = AsyncMock(return_value=([], []))
-    monkeypatch.setattr(mod, "batch_enqueue_and_wait", enqueue)
 
-    out = await call(
-        _selected_scope(fake_ctx),
-        {"script": "episode_1.json", "scene_ids": [duplicated_id]},
+    out = await run_generate_videos(
+        fake_ctx, {"scope": "selected", "ids": [duplicated_id]}, batch_waiter=enqueue, force=True
     )
 
     enqueue.assert_not_awaited()
-    codes = {
-        unit["unit_id"]: [problem["code"] for problem in unit["problems"]] for unit in out["batch_admission"]["units"]
-    }
-    assert codes == {duplicated_id: ["generation_unit_request_invalid"]}
+    assert _admission_codes(out) == {duplicated_id: ["generation_unit_request_invalid"]}

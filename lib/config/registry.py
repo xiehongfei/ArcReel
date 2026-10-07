@@ -4,11 +4,11 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Literal
 
-from lib.agnes_shared import AGNES_BASE_URL
-from lib.ark_shared import ARK_BASE_URL
-from lib.dashscope_shared import DASHSCOPE_BASE_URL
-from lib.minimax_shared import MINIMAX_BASE_URL
-from lib.pricing.types import (
+from lib.backends.agnes_shared import AGNES_BASE_URL
+from lib.backends.ark_shared import ARK_BASE_URL
+from lib.backends.dashscope_shared import DASHSCOPE_BASE_URL
+from lib.backends.minimax_shared import MINIMAX_BASE_URL
+from lib.billing.pricing.types import (
     PerCharacter,
     PerImageByResolution,
     PerImageFlat,
@@ -29,7 +29,7 @@ ModelCapability = Literal[
     "text_generation",
     "structured_output",  # 消费点：文本 backend 结构化输出探测
     "vision",  # 消费点：文本解析的 vision 闸（lib/config/resolver.py）
-    "text_to_image",  # 消费点：图片任务类型桶判定（lib/generation_type_buckets.py）
+    "text_to_image",  # 消费点：图片任务类型桶判定（lib/backends/generation_type_buckets.py）
     "image_to_image",  # 消费点：同上
     "text_to_speech",
 ]
@@ -44,7 +44,7 @@ class ModelInfo:
     # 此声明——它们的真相源是各 backend 的 VideoCapabilities 与请求期 gate，与请求构造同源，
     # 也只有那里表达得了「同一 model 内按执行子路径分叉」（可灵 v3-omni 走多图主体子路径时
     # 请求体没有音轨开关）。补一份视频能力位声明即引入第二份手写来源，由
-    # tests/unit/lib/video_backends/test_video_backend_capabilities.py::TestVideoCapabilitySingleSourceOfTruth 拦下。
+    # tests/unit/lib/backends/video_backends/test_video_backend_capabilities.py::TestVideoCapabilitySingleSourceOfTruth 拦下。
     capabilities: list[ModelCapability]
     default: bool = False
     supported_durations: list[int] = field(default_factory=list)
@@ -62,6 +62,9 @@ class ModelInfo:
     # 图像 / 视频两个 registry 条目）用此字段让两条目共用一个 API 模型名，而 registry 键名各自
     # 唯一——键名兼作 UI 标识与计费查表键，不能重复，故 API 模型名需与键名解耦。
     api_model_name: str | None = None
+    # 最大输出长度（单位 token），对照供应商文档手工填写；带 text_generation 能力的模型必须登记。
+    # 文本请求的实际上限取 min(本值, 64000)，见 lib.backends.text_generator.effective_max_output_tokens。
+    max_output_tokens: int | None = None
 
 
 # 合法并发 lane 名，与 CapacityTable 的 image/video/audio 三条容量通道对齐。
@@ -153,13 +156,15 @@ def _gemini_image_pricing(model_id: str, rates: dict[str, float]) -> PerImageByR
     return PerImageByResolution(rates={model_id: rates}, default_model=model_id, currency="USD")
 
 
-# Veo 视频费率（美元/秒），按 (分辨率, 是否生成有声视频)。
+# Veo 视频费率（美元/秒），按 (分辨率, 是否生成有声视频)。backend 在分辨率未指定时不下发
+# resolution，由供应商按默认档出片：AI Studio 与 Vertex 的 Veo 文档均写明省略时默认 720p。
 def _veo_video_pricing(model_id: str, rates: dict[tuple[str, bool | None], float]) -> PerSecondMatrix:
     return PerSecondMatrix(
         rates={model_id: rates},
         default_model=model_id,
         dimensions="resolution_audio",
         currency="USD",
+        default_resolution="720p",
     )
 
 
@@ -222,6 +227,18 @@ def _grok_text_pricing(model_id: str, input_rate: float, output_rate: float) -> 
 # Grok 图片费率（美元/张）。
 def _grok_image_pricing(model_id: str, per_image: float) -> PerImageFlat:
     return PerImageFlat(rates={model_id: per_image}, default_model=model_id, currency="USD")
+
+
+# Grok 视频费率（美元/秒），按分辨率分档、不随音轨变化。未指定分辨率时 xAI 按 480p 出片
+# （https://docs.x.ai/developers/model-capabilities/video/generation 的 Resolution 表），结算跟随同一默认档。
+def _grok_video_pricing(model_id: str, rates: dict[str, float]) -> PerSecondMatrix:
+    return PerSecondMatrix(
+        rates={model_id: {(res, None): rate for res, rate in rates.items()}},
+        default_model=model_id,
+        dimensions="resolution_only",
+        currency="USD",
+        default_resolution="480p",
+    )
 
 
 # OpenAI 文本费率（美元/百万 token）。
@@ -348,30 +365,23 @@ def _kling_image_by_resolution_pricing(model_id: str, rates: dict[str, float]) -
 
 
 # Agnes 图片费率（美元/张）按官方标准价建模，不纳入促销价。
-def _agnes_image_pricing(model_id: str, per_image: float) -> PerImageFlat:
-    return PerImageFlat(rates={model_id: per_image}, default_model=model_id, currency="USD")
-
-
-# Agnes Image 2.5 Flash 按输出分辨率档位计费（刊例价）；不纳入限时 $0。
-def _agnes_image_25_pricing(model_id: str) -> PerImageByResolution:
-    return PerImageByResolution(
-        rates={
-            model_id: {
-                "1K": 0.010,
-                "2K": 0.018,
-                "3K": 0.021,
-                "4K": 0.024,
-            }
-        },
-        default_model=model_id,
-        currency="USD",
-    )
+def _agnes_image_pricing(model_id: str, rates: dict[str, float]) -> PerImageByResolution:
+    return PerImageByResolution(rates={model_id: rates}, default_model=model_id, currency="USD")
 
 
 # Agnes 文本费率（美元/百万 token），官方原价。
-def _agnes_text_pricing(model_id: str, input_rate: float, output_rate: float) -> PerToken:
+def _agnes_text_pricing(
+    model_id: str,
+    input_rate: float,
+    output_rate: float,
+    *,
+    cached_input_rate: float | None = None,
+) -> PerToken:
+    rates = {"input": input_rate, "output": output_rate}
+    if cached_input_rate is not None:
+        rates["cached_input"] = cached_input_rate
     return PerToken(
-        rates={model_id: {"input": input_rate, "output": output_rate}},
+        rates={model_id: rates},
         default_model=model_id,
         currency="USD",
     )
@@ -387,28 +397,10 @@ def _agnes_video_pricing(model_id: str, per_second: float) -> PerSecondMatrix:
     )
 
 
-# Agnes Video 2.5 按分辨率档位计费（刊例价）；1K 与 1080P 同价。Auto 未指定分辨率时按官方默认 720P。
-def _agnes_video_25_pricing(model_id: str) -> PerSecondMatrix:
+def _agnes_video_pricing_by_resolution(model_id: str, rates: dict[str, float]) -> PerSecondMatrix:
+    # 分辨率未指定（Auto）时按官方默认 720P 出片，结算跟随同一档位。
     return PerSecondMatrix(
-        rates={
-            model_id: {
-                ("720p", None): 0.025,
-                ("1080p", None): 0.040,
-                ("1k", None): 0.040,
-                ("2k", None): 0.055,
-            }
-        },
-        default_model=model_id,
-        dimensions="resolution_only",
-        currency="USD",
-        default_resolution="720p",
-    )
-
-
-# Agnes Video 2.5 Flash 仅 720P；刊例价 $0.025/s，不纳入限时 $0 促销。
-def _agnes_video_25_flash_pricing(model_id: str) -> PerSecondMatrix:
-    return PerSecondMatrix(
-        rates={model_id: {("720p", None): 0.025}},
+        rates={model_id: {(resolution, None): rate for resolution, rate in rates.items()}},
         default_model=model_id,
         dimensions="resolution_only",
         currency="USD",
@@ -430,6 +422,7 @@ PROVIDER_REGISTRY: dict[str, ProviderMeta] = {
                 media_type="text",
                 capabilities=["text_generation", "structured_output", "vision"],
                 pricing=_gemini_text_pricing("gemini-3.1-pro-preview", 2.00, 12.00),
+                max_output_tokens=65536,
             ),
             "gemini-3-flash-preview": ModelInfo(
                 display_name="Gemini 3 Flash",
@@ -437,12 +430,14 @@ PROVIDER_REGISTRY: dict[str, ProviderMeta] = {
                 capabilities=["text_generation", "structured_output", "vision"],
                 default=True,
                 pricing=_gemini_text_pricing("gemini-3-flash-preview", 0.50, 3.00),
+                max_output_tokens=65536,
             ),
-            "gemini-3.1-flash-lite-preview": ModelInfo(
+            "gemini-3.1-flash-lite": ModelInfo(
                 display_name="Gemini 3.1 Flash Lite",
                 media_type="text",
-                capabilities=["text_generation", "structured_output"],
-                pricing=_gemini_text_pricing("gemini-3.1-flash-lite-preview", 0.25, 1.50),
+                capabilities=["text_generation", "structured_output", "vision"],
+                pricing=_gemini_text_pricing("gemini-3.1-flash-lite", 0.25, 1.50),
+                max_output_tokens=65536,
             ),
             # --- image ---
             "gemini-3-pro-image-preview": ModelInfo(
@@ -514,6 +509,7 @@ PROVIDER_REGISTRY: dict[str, ProviderMeta] = {
                 media_type="text",
                 capabilities=["text_generation", "structured_output", "vision"],
                 pricing=_gemini_text_pricing("gemini-3.1-pro-preview", 2.00, 12.00),
+                max_output_tokens=65536,
             ),
             "gemini-3-flash-preview": ModelInfo(
                 display_name="Gemini 3 Flash",
@@ -521,12 +517,14 @@ PROVIDER_REGISTRY: dict[str, ProviderMeta] = {
                 capabilities=["text_generation", "structured_output", "vision"],
                 default=True,
                 pricing=_gemini_text_pricing("gemini-3-flash-preview", 0.50, 3.00),
+                max_output_tokens=65536,
             ),
-            "gemini-3.1-flash-lite-preview": ModelInfo(
+            "gemini-3.1-flash-lite": ModelInfo(
                 display_name="Gemini 3.1 Flash Lite",
                 media_type="text",
-                capabilities=["text_generation", "structured_output"],
-                pricing=_gemini_text_pricing("gemini-3.1-flash-lite-preview", 0.25, 1.50),
+                capabilities=["text_generation", "structured_output", "vision"],
+                pricing=_gemini_text_pricing("gemini-3.1-flash-lite", 0.25, 1.50),
+                max_output_tokens=65536,
             ),
             # --- image ---
             "gemini-3-pro-image-preview": ModelInfo(
@@ -590,6 +588,7 @@ PROVIDER_REGISTRY: dict[str, ProviderMeta] = {
                 media_type="text",
                 capabilities=["text_generation", "vision"],
                 pricing=_ark_text_pricing("doubao-seed-2-0-pro-260215", 3.20, 16.00),
+                max_output_tokens=131072,
             ),
             "doubao-seed-2-0-lite-260215": ModelInfo(
                 display_name="豆包 Seed 2.0 Lite",
@@ -597,18 +596,21 @@ PROVIDER_REGISTRY: dict[str, ProviderMeta] = {
                 capabilities=["text_generation", "vision"],
                 default=True,
                 pricing=_ark_text_pricing("doubao-seed-2-0-lite-260215", 0.60, 3.60),
+                max_output_tokens=131072,
             ),
             "doubao-seed-2-0-mini-260215": ModelInfo(
                 display_name="豆包 Seed 2.0 Mini",
                 media_type="text",
                 capabilities=["text_generation", "vision"],
                 pricing=_ark_text_pricing("doubao-seed-2-0-mini-260215", 0.20, 2.00),
+                max_output_tokens=131072,
             ),
             "doubao-seed-1-8-251228": ModelInfo(
                 display_name="豆包 Seed 1.8",
                 media_type="text",
                 capabilities=["text_generation", "structured_output", "vision"],
                 pricing=_ark_text_pricing("doubao-seed-1-8-251228", 0.80, 2.00),
+                max_output_tokens=32768,
             ),
             # --- image ---
             "doubao-seedream-5-0-lite-260128": ModelInfo(
@@ -718,47 +720,56 @@ PROVIDER_REGISTRY: dict[str, ProviderMeta] = {
                 display_name="豆包 Seed 2.0 Mini",
                 media_type="text",
                 capabilities=["text_generation", "vision"],
+                max_output_tokens=131072,
             ),
             "doubao-seed-2.0-lite": ModelInfo(
                 display_name="豆包 Seed 2.0 Lite",
                 media_type="text",
                 capabilities=["text_generation", "vision"],
                 default=True,
+                max_output_tokens=131072,
             ),
             "doubao-seed-2.0-pro": ModelInfo(
                 display_name="豆包 Seed 2.0 Pro",
                 media_type="text",
                 capabilities=["text_generation", "vision"],
+                max_output_tokens=131072,
             ),
             "doubao-seed-2.0-code": ModelInfo(
                 display_name="豆包 Seed 2.0 Code",
                 media_type="text",
                 capabilities=["text_generation"],
+                max_output_tokens=131072,
             ),
             "deepseek-v4-flash": ModelInfo(
                 display_name="DeepSeek V4 Flash",
                 media_type="text",
                 capabilities=["text_generation"],
+                max_output_tokens=393216,
             ),
             "deepseek-v4-pro": ModelInfo(
                 display_name="DeepSeek V4 Pro",
                 media_type="text",
                 capabilities=["text_generation"],
+                max_output_tokens=393216,
             ),
             "glm-5.1": ModelInfo(
                 display_name="GLM 5.1",
                 media_type="text",
                 capabilities=["text_generation"],
+                max_output_tokens=131072,
             ),
             "kimi-k2.6": ModelInfo(
                 display_name="Kimi K2.6",
                 media_type="text",
                 capabilities=["text_generation"],
+                max_output_tokens=32768,
             ),
             "minimax-m2.7": ModelInfo(
                 display_name="MiniMax M2.7",
                 media_type="text",
                 capabilities=["text_generation"],
+                max_output_tokens=131072,
             ),
             # --- image ---
             "doubao-seedream-5.0-lite": ModelInfo(
@@ -813,12 +824,14 @@ PROVIDER_REGISTRY: dict[str, ProviderMeta] = {
                 media_type="text",
                 capabilities=["text_generation", "structured_output", "vision"],
                 pricing=_grok_text_pricing("grok-4.20-0309-reasoning", 2.00, 6.00),
+                max_output_tokens=131072,
             ),
             "grok-4.20-0309-non-reasoning": ModelInfo(
                 display_name="Grok 4.20 Non-Reasoning",
                 media_type="text",
                 capabilities=["text_generation", "structured_output", "vision"],
                 pricing=_grok_text_pricing("grok-4.20-0309-non-reasoning", 2.00, 6.00),
+                max_output_tokens=131072,
             ),
             "grok-4-1-fast-reasoning": ModelInfo(
                 display_name="Grok 4.1 Fast Reasoning",
@@ -826,12 +839,14 @@ PROVIDER_REGISTRY: dict[str, ProviderMeta] = {
                 capabilities=["text_generation", "structured_output", "vision"],
                 default=True,
                 pricing=_grok_text_pricing("grok-4-1-fast-reasoning", 0.20, 0.50),
+                max_output_tokens=131072,
             ),
             "grok-4-1-fast-non-reasoning": ModelInfo(
                 display_name="Grok 4.1 Fast (Non-Reasoning)",
                 media_type="text",
                 capabilities=["text_generation", "structured_output", "vision"],
                 pricing=_grok_text_pricing("grok-4-1-fast-non-reasoning", 0.20, 0.50),
+                max_output_tokens=131072,
             ),
             # --- image ---
             "grok-imagine-image-pro": ModelInfo(
@@ -850,19 +865,44 @@ PROVIDER_REGISTRY: dict[str, ProviderMeta] = {
                 pricing=_grok_image_pricing("grok-imagine-image", 0.02),
             ),
             # --- video ---
+            # 时长 1–15 秒对全系成立（视频生成页 Duration 段）。参考图生视频以
+            # https://docs.x.ai/developers/model-capabilities/video/reference-to-video.md 为准：reference_images
+            # 全系可用，last_frame 仅 1.5；输入模式、尾帧与参考图上限的真相源在
+            # GrokVideoBackend.video_capabilities_for_model。
             "grok-imagine-video": ModelInfo(
                 display_name="Grok Imagine Video",
                 media_type="video",
                 capabilities=[],
                 default=True,
                 supported_durations=list(range(1, 16)),
+                # 1080p 官方仅对 grok-imagine-video-1.5 系列开放，本模型只有 480p/720p 两档。
                 resolutions=["480p", "720p"],
-                # 不区分分辨率/音频的单一秒费率。
-                pricing=PerSecondMatrix(
-                    rates={"grok-imagine-video": {("", None): 0.050}},
-                    default_model="grok-imagine-video",
-                    dimensions="flat",
-                    currency="USD",
+                # https://docs.x.ai/developers/models/grok-imagine-video
+                pricing=_grok_video_pricing("grok-imagine-video", {"480p": 0.050, "720p": 0.070}),
+            ),
+            "grok-imagine-video-1.5": ModelInfo(
+                display_name="Grok Imagine Video 1.5",
+                media_type="video",
+                capabilities=[],
+                supported_durations=list(range(1, 16)),
+                # 视频生成页：「1080p is supported on grok-imagine-video-1.5 for text-to-video and
+                # image-to-video. Reference-to-video is capped at 720p.」参考生视频的 720p 上限在
+                # GrokVideoBackend 请求期校验。
+                resolutions=["480p", "720p", "1080p"],
+                # https://docs.x.ai/developers/models/grok-imagine-video-1.5
+                pricing=_grok_video_pricing("grok-imagine-video-1.5", {"480p": 0.080, "720p": 0.140, "1080p": 0.250}),
+            ),
+            "grok-imagine-video-1.5-lite": ModelInfo(
+                display_name="Grok Imagine Video 1.5 Lite",
+                media_type="video",
+                capabilities=[],
+                supported_durations=list(range(1, 16)),
+                # 两处官方来源有分歧：视频生成页只写 1.5 支持 1080p、未提及 lite；lite 模型页
+                # （https://docs.x.ai/developers/models/grok-imagine-video-1.5-lite）列出 480p/720p/1080p
+                # 三档价格。以模型专属页为准开放 1080p。
+                resolutions=["480p", "720p", "1080p"],
+                pricing=_grok_video_pricing(
+                    "grok-imagine-video-1.5-lite", {"480p": 0.020, "720p": 0.030, "1080p": 0.140}
                 ),
             ),
         },
@@ -880,12 +920,14 @@ PROVIDER_REGISTRY: dict[str, ProviderMeta] = {
                 media_type="text",
                 capabilities=["text_generation", "structured_output", "vision"],
                 pricing=_openai_text_pricing("gpt-5.5", 5.00, 30.00),
+                max_output_tokens=128000,
             ),
             "gpt-5.4": ModelInfo(
                 display_name="GPT-5.4",
                 media_type="text",
                 capabilities=["text_generation", "structured_output", "vision"],
                 pricing=_openai_text_pricing("gpt-5.4", 2.50, 15.00),
+                max_output_tokens=128000,
             ),
             "gpt-5.4-mini": ModelInfo(
                 display_name="GPT-5.4 Mini",
@@ -893,12 +935,14 @@ PROVIDER_REGISTRY: dict[str, ProviderMeta] = {
                 capabilities=["text_generation", "structured_output", "vision"],
                 default=True,
                 pricing=_openai_text_pricing("gpt-5.4-mini", 0.75, 4.50),
+                max_output_tokens=128000,
             ),
             "gpt-5.4-nano": ModelInfo(
                 display_name="GPT-5.4 Nano",
                 media_type="text",
                 capabilities=["text_generation", "structured_output", "vision"],
                 pricing=_openai_text_pricing("gpt-5.4-nano", 0.20, 1.25),
+                max_output_tokens=128000,
             ),
             # --- image ---
             "gpt-image-2": ModelInfo(
@@ -958,7 +1002,7 @@ PROVIDER_REGISTRY: dict[str, ProviderMeta] = {
         secret_keys=["api_key"],
         models={
             # --- image ---
-            # Vidu 计费以响应 credits 为准，费率逻辑在 lib.vidu_shared；此处统一委托标记。
+            # Vidu 计费以响应 credits 为准，费率逻辑在 lib.backends.vidu_shared；此处统一委托标记。
             "viduq2": ModelInfo(
                 display_name="Vidu Q2 Image",
                 media_type="image",
@@ -1025,7 +1069,7 @@ PROVIDER_REGISTRY: dict[str, ProviderMeta] = {
         required_keys=["api_key"],
         # wan3_base_url：万相 3.0 走独立 maas 域名，且域名里含地域与 workspace，
         # 无法由通用 base_url 派生，故单列一键。仅 wan3.0-video 的请求消费它（见
-        # lib/video_backends/dashscope.py），留空则该模型回落通用 base_url。
+        # lib/backends/video_backends/dashscope.py），留空则该模型回落通用 base_url。
         optional_keys=["base_url", "wan3_base_url", "image_max_workers", "video_max_workers", "audio_max_workers"],
         secret_keys=["api_key"],
         models={
@@ -1036,36 +1080,42 @@ PROVIDER_REGISTRY: dict[str, ProviderMeta] = {
                 capabilities=["text_generation", "structured_output"],
                 default=True,
                 pricing=_dashscope_text_pricing("qwen-plus", 0.8, 2.0),
+                max_output_tokens=32768,
             ),
             "qwen3.6-plus": ModelInfo(
                 display_name="Qwen3.6 Plus",
                 media_type="text",
-                capabilities=["text_generation", "structured_output"],
+                capabilities=["text_generation", "structured_output", "vision"],
                 pricing=_dashscope_text_pricing("qwen3.6-plus", 2.0, 12.0),
+                max_output_tokens=65536,
             ),
             "qwen3-max": ModelInfo(
                 display_name="Qwen3 Max",
                 media_type="text",
                 capabilities=["text_generation", "structured_output"],
                 pricing=_dashscope_text_pricing("qwen3-max", 2.5, 10.0),
+                max_output_tokens=32768,
             ),
             "qwen3.7-max": ModelInfo(
                 display_name="Qwen3.7 Max",
                 media_type="text",
                 capabilities=["text_generation", "structured_output"],
                 pricing=_dashscope_text_pricing("qwen3.7-max", 12.0, 36.0),
+                max_output_tokens=131072,
             ),
             "qwen3.6-flash": ModelInfo(
                 display_name="Qwen3.6 Flash",
                 media_type="text",
-                capabilities=["text_generation", "structured_output"],
+                capabilities=["text_generation", "structured_output", "vision"],
                 pricing=_dashscope_text_pricing("qwen3.6-flash", 1.2, 7.2),
+                max_output_tokens=65536,
             ),
             "qwen-long": ModelInfo(
                 display_name="Qwen Long",
                 media_type="text",
-                capabilities=["text_generation", "structured_output"],
+                capabilities=["text_generation"],
                 pricing=_dashscope_text_pricing("qwen-long", 0.5, 2.0),
+                max_output_tokens=8192,
             ),
             # --- image ---
             # qwen-image-2.0 融合系列：T2I + I2I 同模型，size 用像素值 宽*高。
@@ -1229,12 +1279,14 @@ PROVIDER_REGISTRY: dict[str, ProviderMeta] = {
                 capabilities=["text_generation", "structured_output", "vision"],
                 default=True,
                 pricing=_minimax_text_pricing("MiniMax-M3", 2.1, 8.4),
+                max_output_tokens=524288,
             ),
             "MiniMax-M2.7": ModelInfo(
                 display_name="MiniMax M2.7",
                 media_type="text",
                 capabilities=["text_generation", "structured_output"],
                 pricing=_minimax_text_pricing("MiniMax-M2.7", 2.1, 8.4),
+                max_output_tokens=204800,
             ),
             # --- image ---
             # image-01：单步同步取 URL，T2I + I2I（subject_reference 单脸参考）；
@@ -1398,76 +1450,92 @@ PROVIDER_REGISTRY: dict[str, ProviderMeta] = {
         secret_keys=["api_key"],
         models={
             # --- text ---
-            # agnes-2.5-flash：官方当前文本型号，OpenAI 兼容 /v1/chat/completions，原生
-            # response_format json_schema + image_url 图像理解。2.0 已废弃但仍可选手选。
+            # OpenAI 兼容 /v1/chat/completions，原生 response_format json_schema 结构化输出，
+            # 失败再降级 Instructor（见 AgnesTextBackend）。
+            "agnes-3.0-flash": ModelInfo(
+                display_name="Agnes 3.0 Flash",
+                media_type="text",
+                capabilities=["text_generation", "structured_output", "vision"],
+                default=True,
+                pricing=_agnes_text_pricing("agnes-3.0-flash", 0.05, 0.15, cached_input_rate=0.005),
+                max_output_tokens=65536,
+            ),
             "agnes-2.5-flash": ModelInfo(
                 display_name="Agnes 2.5 Flash",
                 media_type="text",
                 capabilities=["text_generation", "structured_output", "vision"],
-                default=True,
-                pricing=_agnes_text_pricing("agnes-2.5-flash", 0.05, 0.15),
+                pricing=_agnes_text_pricing("agnes-2.5-flash", 0.05, 0.15, cached_input_rate=0.005),
+                max_output_tokens=65536,
             ),
-            # agnes-2.0-flash：兼容保留。OpenAI 兼容 chat/completions，结构化输出；
-            # vision 未实测，不纳入能力集。
+            "agnes-2.5-pro": ModelInfo(
+                display_name="Agnes 2.5 Pro",
+                media_type="text",
+                capabilities=["text_generation", "structured_output"],
+                pricing=_agnes_text_pricing("agnes-2.5-pro", 0.45, 0.90, cached_input_rate=0.045),
+                max_output_tokens=65536,
+            ),
             "agnes-2.0-flash": ModelInfo(
                 display_name="Agnes 2.0 Flash",
                 media_type="text",
                 capabilities=["text_generation", "structured_output"],
+                hidden=True,
                 pricing=_agnes_text_pricing("agnes-2.0-flash", 0.03, 0.15),
+                max_output_tokens=65536,
             ),
             # --- image ---
-            # agnes-image-2.5-flash：与 2.1 同一 /images/generations 契约（T2I + I2I + 多图合成）。
-            # 官方已公开该型号；apihub LiteLLM 若未登记会 400 LLM Provider NOT provided。
-            # resolutions 仍是保守 UI 档位（backend 长边收口 2048）；刊例价按输出分辨率。
+            # OpenAI 兼容 /images/generations 单步同步，T2I + I2I。
             "agnes-image-2.5-flash": ModelInfo(
                 display_name="Agnes Image 2.5 Flash",
                 media_type="image",
                 capabilities=["text_to_image", "image_to_image"],
-                resolutions=["1K", "2K"],
-                pricing=_agnes_image_25_pricing("agnes-image-2.5-flash"),
+                default=True,
+                resolutions=["1K", "2K", "3K", "4K"],
+                pricing=_agnes_image_pricing(
+                    "agnes-image-2.5-flash",
+                    {"1K": 0.010, "2K": 0.018, "3K": 0.021, "4K": 0.024},
+                ),
             ),
-            # agnes-image-2.1-flash：OpenAI 兼容 /images/generations 单步同步，T2I + I2I。
-            # 当前默认：网关已登记。2.0 未单独登记（与 2.1 同契约）。resolutions 是保守 UI
-            # 档位；实际尺寸由 backend aspect_size 计算、与此无耦合。
             "agnes-image-2.1-flash": ModelInfo(
                 display_name="Agnes Image 2.1 Flash",
                 media_type="image",
                 capabilities=["text_to_image", "image_to_image"],
-                default=True,
+                hidden=True,
                 resolutions=["1K", "2K"],
-                pricing=_agnes_image_pricing("agnes-image-2.1-flash", 0.003),
+                pricing=_agnes_image_pricing(
+                    "agnes-image-2.1-flash",
+                    {"1K": 0.010, "2K": 0.018, "3K": 0.021, "4K": 0.024},
+                ),
             ),
             # --- video ---
-            # agnes-video-v2.0：apihub 异步 /v1/videos，图生 / 首尾帧 / 多图主体参考；fps 固定 24、
-            # 时长 1–18s。resolutions 为保守 UI 档位；实际尺寸由 backend aspect_size 计算、与此无耦合。
-            "agnes-video-v2.0": ModelInfo(
-                display_name="Agnes Video 2.0",
+            # 2.5：apihub 异步 /v1/videos，文生 / 首尾关键帧 / 多图主体参考；按分辨率与秒数计费。
+            "agnes-video-2.5-flash": ModelInfo(
+                display_name="Agnes Video 2.5 Flash",
                 media_type="video",
                 capabilities=[],
                 default=True,
-                supported_durations=list(range(1, 19)),
-                resolutions=["480p", "720p", "1080p"],
-                pricing=_agnes_video_pricing("agnes-video-v2.0", 0.005),
+                supported_durations=list(range(4, 13)),
+                resolutions=["720p"],
+                pricing=_agnes_video_pricing_by_resolution("agnes-video-2.5-flash", {"720p": 0.025}),
             ),
-            # agnes-video-2.5：官方 OpenAI Videos 兼容异步 /v1/videos。mode=text/keyframe/reference；
-            # 首帧、尾帧可单独或成对使用；时长 4–12s；分辨率 720P/1080P/1K/2K；参考音频最多 3 段。
             "agnes-video-2.5": ModelInfo(
                 display_name="Agnes Video 2.5",
                 media_type="video",
                 capabilities=[],
                 supported_durations=list(range(4, 13)),
                 resolutions=["720p", "1080p", "1K", "2K"],
-                pricing=_agnes_video_25_pricing("agnes-video-2.5"),
+                pricing=_agnes_video_pricing_by_resolution(
+                    "agnes-video-2.5", {"720p": 0.025, "1080p": 0.040, "1k": 0.040, "2k": 0.055}
+                ),
             ),
-            # agnes-video-2.5-flash：与 2.5 同一 Videos 契约（text/keyframe/reference、可单独尾帧），
-            # 但 size 仅 720P、参考图最多 5 张、参考音频最多 3 段、不支持参考视频。
-            "agnes-video-2.5-flash": ModelInfo(
-                display_name="Agnes Video 2.5 Flash",
+            # 旧 v2.0 契约保留，仅从 UI 下拉隐藏。
+            "agnes-video-v2.0": ModelInfo(
+                display_name="Agnes Video 2.0",
                 media_type="video",
                 capabilities=[],
-                supported_durations=list(range(4, 13)),
-                resolutions=["720p"],
-                pricing=_agnes_video_25_flash_pricing("agnes-video-2.5-flash"),
+                hidden=True,
+                supported_durations=list(range(1, 19)),
+                resolutions=["480p", "720p", "1080p"],
+                pricing=_agnes_video_pricing("agnes-video-v2.0", 0.005),
             ),
         },
         default_base_url=AGNES_BASE_URL,

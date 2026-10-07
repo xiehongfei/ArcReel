@@ -6,21 +6,43 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
 
-from lib.generation_queue import GenerationQueue
-from lib.generation_queue_client import wait_for_task
-from lib.generation_worker import CapacityTable, GenerationWorker
-from lib.project_change_hints import register_project_change_batch_listener
-from server.media_tools.context import ToolContext
-from tests.integration.server.agent_runtime.sdk_tools.sdk_tools_support import FakePM, fake_caps_resolver
+from lib.generation.generation_queue import GenerationQueue
+from lib.generation.generation_queue_client import wait_for_task
+from lib.generation.generation_worker import CapacityTable, GenerationWorker
+from lib.project.project_change_hints import register_project_change_batch_listener
+from lib.project.project_manager import ProjectManager
+from server.auth import CurrentUserInfo, get_current_user
+from server.error_handlers import register_error_handlers
+from server.routers import assets
+from server.services.tasks.generation_tasks import execute_generation_task
+from server.services.tasks.resume_executor import execute_resume_video_task
+from tests.auth_deps import AUTH_DEPENDENCIES
+from tests.integration.server.agent_tool_support import FakePM, ToolHarness, fake_caps_resolver
 
 
-def _build_fake_ctx(tmp_path: Path, session_factory, monkeypatch: pytest.MonkeyPatch) -> ToolContext:
+@pytest.fixture
+def assets_env(db_factory, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
+    """全局资产库路由的测试客户端（``client``）与指向 ``tmp_path/projects`` 的 ``ProjectManager``（``pm``）。"""
+
+    pm = ProjectManager(tmp_path / "projects")
+    monkeypatch.setattr(assets, "async_session_factory", db_factory)
+    monkeypatch.setattr(assets, "get_project_manager", lambda: pm)
+    app = FastAPI()
+    register_error_handlers(app)
+    app.dependency_overrides[get_current_user] = lambda: CurrentUserInfo(id="default", sub="testuser", role="admin")
+    app.include_router(assets.router, prefix="/api/v1", dependencies=AUTH_DEPENDENCIES)
+    return {"client": TestClient(app), "pm": pm}
+
+
+def _build_fake_ctx(tmp_path: Path, session_factory, monkeypatch: pytest.MonkeyPatch) -> ToolHarness:
     monkeypatch.setattr("lib.db.async_session_factory", session_factory)
-    monkeypatch.setattr("server.services.video_batch_admission.async_session_factory", session_factory)
-    monkeypatch.setattr("server.services.video_caps.async_session_factory", session_factory)
-    project_dir = tmp_path / "demo"
-    project_dir.mkdir()
+    monkeypatch.setattr("server.services.admission.video_batch_admission.async_session_factory", session_factory)
+    monkeypatch.setattr("server.services.tasks.video_caps.async_session_factory", session_factory)
+    project_dir = tmp_path / "projects" / "demo"
+    project_dir.mkdir(parents=True)
     (project_dir / "storyboards").mkdir()
     (project_dir / "storyboards" / "scene_E1S01.png").write_bytes(b"")
     (project_dir / "audio").mkdir()
@@ -28,9 +50,9 @@ def _build_fake_ctx(tmp_path: Path, session_factory, monkeypatch: pytest.MonkeyP
     (project_dir / "audio" / "segment_E1S02.wav").write_bytes(b"")
 
     queue = GenerationQueue(session_factory=session_factory)
-    return ToolContext(
+    return ToolHarness(
         project_name="demo",
-        projects_root=tmp_path,
+        data_root=tmp_path,
         pm=FakePM("demo", project_dir),
         queue=queue,
         config_resolver=fake_caps_resolver(),
@@ -38,7 +60,7 @@ def _build_fake_ctx(tmp_path: Path, session_factory, monkeypatch: pytest.MonkeyP
 
 
 @pytest.fixture
-def idle_fake_ctx(tmp_path: Path, concurrent_session_factory, monkeypatch: pytest.MonkeyPatch) -> ToolContext:
+def idle_fake_ctx(tmp_path: Path, concurrent_session_factory, monkeypatch: pytest.MonkeyPatch) -> ToolHarness:
     return _build_fake_ctx(tmp_path, concurrent_session_factory, monkeypatch)
 
 
@@ -47,7 +69,7 @@ async def fake_ctx(
     tmp_path: Path,
     concurrent_session_factory,
     monkeypatch: pytest.MonkeyPatch,
-) -> AsyncIterator[ToolContext]:
+) -> AsyncIterator[ToolHarness]:
     ctx = _build_fake_ctx(tmp_path, concurrent_session_factory, monkeypatch)
     queue = ctx.queue
 
@@ -59,6 +81,8 @@ async def fake_ctx(
         capacity=CapacityTable(_limits={}, _defaults={"text": 1}),
         provider_projection=text_provider,
         lanes=("text",),
+        executor=execute_generation_task,
+        resume_executor=execute_resume_video_task,
     )
     worker.poll_interval = 60
     worker.heartbeat_interval = 60
@@ -82,11 +106,25 @@ async def fake_ctx(
         owner_id=worker.owner_id,
         ttl_seconds=worker.lease_ttl,
     )
-    queue.set_worker_cancel_callback(worker.request_cancel)
     await worker.start()
     try:
         yield ctx
     finally:
         await worker.stop()
-        queue.set_worker_cancel_callback(None)
         unregister()
+
+
+@pytest.fixture
+def active_episode_tasks(monkeypatch: pytest.MonkeyPatch) -> dict[str, list[dict[str, Any]]]:
+    """在途任务检查读到的生成队列：按状态（``queued`` / ``running``）回放写进返回字典的任务。"""
+    from server.routers import episode_management
+
+    tasks: dict[str, list[dict[str, Any]]] = {}
+
+    class _Queue:
+        async def list_tasks(self, *, project_name: str, status: str, page: int, page_size: int) -> dict[str, Any]:
+            del project_name, page, page_size
+            return {"items": tasks.get(status, [])}
+
+    monkeypatch.setattr(episode_management, "get_generation_queue", lambda: _Queue())
+    return tasks

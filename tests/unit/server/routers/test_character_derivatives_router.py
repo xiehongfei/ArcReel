@@ -6,8 +6,8 @@ from pathlib import Path
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from lib.data_validator import DataValidator
-from lib.project_manager import ProjectManager
+from lib.project.data_validator import DataValidator
+from lib.project.project_manager import ProjectManager
 from server.auth import CurrentUserInfo, get_current_user
 from server.error_handlers import register_error_handlers
 from server.routers import characters, scenes
@@ -34,7 +34,7 @@ class _FakePM(FakeProjectAssetMutationMixin):
         }
 
     def _add_asset(self, asset_type, project_name, name, entry):
-        from lib.asset_types import ASSET_SPECS
+        from lib.project.asset_types import ASSET_SPECS
 
         if project_name not in self.projects:
             raise FileNotFoundError(project_name)
@@ -262,7 +262,7 @@ class TestCharacterDerivativesPersistence:
             assert persisted["characters"]["阿岚"]["derivatives"] == {
                 "战斗装": {"description": "换上黑色重甲", "character_sheet": ""}
             }
-            assert DataValidator(str(pm.projects_root)).validate_project("demo").errors == []
+            assert DataValidator(str(pm.projects_dir)).validate_project("demo").errors == []
 
             rejected = client.post(
                 "/api/v1/projects/demo/characters/阿岚/derivatives",

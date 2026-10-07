@@ -12,6 +12,7 @@ import asyncio
 import logging
 import random
 import re
+from collections.abc import Collection
 from pathlib import Path
 from typing import Any, Protocol
 from uuid import uuid4
@@ -41,6 +42,8 @@ ENTRY_SUBTYPE_INTERRUPT = "interrupt"
 ENTRY_SUBTYPE_TASK_NOTIFICATION = "task_notification"
 ENTRY_SUBTYPE_QUESTION_ANSWER = "question_answer"
 ENTRY_SUBTYPE_AGENT_TURN_FAILURE = "agent_turn_failure"
+ENTRY_SUBTYPE_COMPACT_SUMMARY = "compact_summary"
+ENTRY_SUBTYPE_SUBAGENT_OUTCOME = "subagent_outcome"
 
 SYSTEM_SUBTYPE_SKILL_INVOCATION = "skill_invocation"
 
@@ -57,6 +60,14 @@ _PARENT_KEY_VARIANTS = ("parent_tool_use_id", "parentToolUseID", "parentToolUseI
 # CLI 注入的中断回显前缀。具体措辞是 CLI 内部实现细节（非稳定 API），
 # 只在写入点做一次前缀识别，定型后读取端不再嗅探。
 _INTERRUPT_ECHO_PREFIX = "[Request interrupted"
+
+# 上下文压缩后 CLI 注入的续接摘要。transcript 载荷带结构化标记 isCompactSummary
+# （适配器回填为 is_compact_summary）；live 消息的解析结果不携带该标记，只能按
+# 摘要开头的固定措辞识别。措辞是 CLI 内部实现细节，只在写入点识别一次。
+_COMPACT_SUMMARY_PREFIX = "This session is being continued from a previous conversation"
+
+# 推断出的子代理描述合并为一行后截到这个长度。
+_SUBAGENT_DESCRIPTION_MAX_CHARS = 200
 
 # SDK 以用户消息形态注入的后台任务通知 XML。
 _TASK_NOTIFICATION_RE = re.compile(r"<task-notification>\s*.*?</task-notification>", re.DOTALL)
@@ -143,6 +154,12 @@ def _is_interrupt_echo(blocks: list[dict[str, Any]]) -> bool:
     if len(blocks) != 1 or blocks[0].get("type") != "text":
         return False
     return str(blocks[0].get("text") or "").strip().startswith(_INTERRUPT_ECHO_PREFIX)
+
+
+def _is_compact_summary(message: dict[str, Any], blocks: list[dict[str, Any]]) -> bool:
+    if message.get("is_compact_summary") is True:
+        return True
+    return _blocks_text(blocks).lstrip().startswith(_COMPACT_SUMMARY_PREFIX)
 
 
 def _extract_task_notifications(blocks: list[dict[str, Any]]) -> list[dict[str, str]]:
@@ -350,6 +367,16 @@ class SdkMessageNormalizer:
         parent = _extract_parent(message)
 
         if not tool_results:
+            if _is_compact_summary(message, blocks):
+                summary_entry: dict[str, Any] = {
+                    "type": ENTRY_TYPE_USER,
+                    "subtype": ENTRY_SUBTYPE_COMPACT_SUMMARY,
+                    "content": blocks,
+                    "uuid": base_uuid or f"entry-{uuid4().hex}",
+                    "timestamp": timestamp,
+                }
+                _copy_parent(message, summary_entry)
+                return [summary_entry]
             if _is_interrupt_echo(blocks):
                 return [
                     build_interrupt_entry(
@@ -507,6 +534,58 @@ def _assistant_tool_use_ids(message: Any) -> list[str]:
             if isinstance(block_id, str) and block_id:
                 ids.append(block_id)
     return ids
+
+
+def infer_subagent_outcome(
+    tool_use_id: str,
+    messages: list[dict[str, Any]],
+    description: str | None = None,
+) -> dict[str, Any] | None:
+    """为主线缺锚点 tool_use 的子代理，按子时间线推断描述与终态。
+
+    压缩续接后，主线从续接摘要开始，摘要之前发起的子代理没有锚点，也就没有
+    调用参数里的描述与 tool_result。描述优先用原始载荷里调用参数的
+    ``description``（由调用方传入），没有时取子时间线的首条指令；多行合并为
+    一行再截断。最后一条是不再调用工具的回答时视为已完成，结论即回答正文；
+    最后一条带 SDK 错误标记时视为失败；其余（停在工具调用中途）视为已停止。
+    """
+    conversation = [m for m in messages if m.get("type") in (ENTRY_TYPE_USER, ENTRY_TYPE_ASSISTANT)]
+    if not conversation:
+        return None
+    text = (description or "").strip()
+    if not text:
+        for message in conversation:
+            if message.get("type") != ENTRY_TYPE_USER:
+                continue
+            text = _blocks_text(normalize_content(message.get("content", ""))).strip()
+            if text:
+                break
+    description = " ".join(text.split())[:_SUBAGENT_DESCRIPTION_MAX_CHARS]
+
+    last = conversation[-1]
+    last_blocks = normalize_content(last.get("content", ""))
+    summary: str | None = None
+    if last.get("type") == ENTRY_TYPE_ASSISTANT and last.get("error") is not None:
+        status = "failed"
+    elif (
+        last.get("type") == ENTRY_TYPE_ASSISTANT
+        and not any(block.get("type") == "tool_use" for block in last_blocks)
+        and _blocks_text(last_blocks).strip()
+    ):
+        status = "completed"
+        summary = _blocks_text(last_blocks).strip()
+    else:
+        status = "stopped"
+    return {
+        "type": ENTRY_TYPE_SYSTEM,
+        "subtype": ENTRY_SUBTYPE_SUBAGENT_OUTCOME,
+        "tool_use_id": tool_use_id,
+        "description": description,
+        "task_status": status,
+        "summary": summary,
+        "uuid": f"subagent-outcome-{tool_use_id}",
+        "timestamp": last.get("timestamp") or utc_now_iso(),
+    }
 
 
 def _first_driver_attr(exc: IntegrityError, *attr_names: str) -> Any:
@@ -817,6 +896,13 @@ class TranscriptReader(Protocol):
         project_cwd: Path | str | None = None,
     ) -> dict[str, list[dict[str, Any]]]: ...
 
+    async def read_subagent_descriptions(
+        self,
+        sdk_session_id: str | None,
+        project_cwd: Path | str | None,
+        tool_use_ids: Collection[str],
+    ) -> dict[str, str]: ...
+
 
 class EventLogService:
     """事件日志读取入口：懒生成 + 游标列举。"""
@@ -880,11 +966,23 @@ class EventLogService:
                 for tool_use_id in _assistant_tool_use_ids(message):
                     for sub_message in subagent_groups.pop(tool_use_id, []):
                         _consume(sub_message, tool_use_id)
-            # 主线缺失锚点 tool_use 的残余组仍全量入日志：前端按 parent
-            # 归组，无锚时呈现为独立卡片，不丢子时间线数据。
+            # 主线缺失锚点 tool_use 的残余组（多见于压缩续接）仍全量入日志：
+            # 前端按 parent 归组，无锚时呈现为独立卡片，不丢子时间线数据。
+            # 组末附一条推断出的描述与终态，卡片据此显示，而不是一律「已停止」。
+            descriptions: dict[str, str] = {}
+            if subagent_groups:
+                try:
+                    descriptions = await self._adapter.read_subagent_descriptions(
+                        session_id, project_cwd, list(subagent_groups)
+                    )
+                except Exception:
+                    logger.exception("子代理调用描述读取失败，改用子时间线推断 session_id=%s", session_id)
             for tool_use_id, group in subagent_groups.items():
                 for sub_message in group:
                     _consume(sub_message, tool_use_id)
+                outcome = infer_subagent_outcome(tool_use_id, group, descriptions.get(tool_use_id))
+                if outcome is not None:
+                    entries.append(outcome)
             if entries:
                 await self._store.append(session_id, entries)
                 # 仅在写入成功后清锁引用：此后 has_entries 恒真，旧锁等待者与

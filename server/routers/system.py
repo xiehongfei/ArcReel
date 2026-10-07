@@ -10,9 +10,9 @@ from datetime import UTC, datetime
 from fastapi import APIRouter
 from fastapi.responses import StreamingResponse
 
-from lib.i18n import Translator
-from lib.logging_config import resolve_log_dir
-from server.services.diagnostics import collect_diagnostics
+from lib.infra.data_root_layout import DataRootLayout
+from server.i18n import Translator
+from server.services.system.diagnostics import collect_diagnostics
 
 router = APIRouter()
 
@@ -24,7 +24,7 @@ _LOG_GLOB = "arcreel.log*"
 @router.get("/system/logs/download")
 async def download_logs(_t: Translator) -> StreamingResponse:
     """打包返回 logs/ 目录所有文件 + diagnostics.txt。"""
-    log_dir = resolve_log_dir()
+    log_dir = DataRootLayout.current().log_dir
     diagnostics_lines: list[str] = []
 
     spooled = tempfile.SpooledTemporaryFile(max_size=_SPOOL_MAX)  # noqa: SIM115 -- 句柄要活过本函数、随 StreamingResponse 流式读完才关，不能收进 with

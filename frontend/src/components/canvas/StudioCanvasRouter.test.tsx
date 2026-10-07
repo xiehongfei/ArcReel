@@ -1,13 +1,15 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { Route, Router } from "wouter";
 import { memoryLocation } from "wouter/memory-location";
-import { API, NarratedVideoDurationError } from "@/api";
+import { API } from "@/api";
 import { useAppStore } from "@/stores/app-store";
 import { useConfigStatusStore } from "@/stores/config-status-store";
 import { useProjectsStore } from "@/stores/projects-store";
 import { selectActiveResourceIds, selectHasActiveTaskForScriptFile, useTasksStore } from "@/stores/tasks-store";
 import { StudioCanvasRouter } from "@/components/canvas/StudioCanvasRouter";
+import { episodeEditViewPath } from "@/app-routes";
 import { DEMO_PROJECT_NAME } from "@/onboarding/demo-project";
 import type { AdEpisodeScript, EpisodeScript, ProjectData } from "@/types";
 
@@ -25,13 +27,20 @@ vi.mock("@/components/workflow/WorkflowPanel", () => ({
   ),
 }));
 
-vi.mock("./OverviewCanvas", () => ({
+// 剪辑视图自己读取剪辑时间线，行为在 EditTimelineView.test.tsx 覆盖；这里只关心集页何时挂载它。
+vi.mock("./edit/EditTimelineView", () => ({
+  EditTimelineView: ({ episode }: { episode: number }) => (
+    <div data-testid="edit-timeline-view">episode {episode}</div>
+  ),
+}));
+
+vi.mock("./overview/OverviewCanvas", () => ({
   OverviewCanvas: () => <div data-testid="overview-canvas">Overview</div>,
 }));
 
-vi.mock("./SourceFileViewer", () => ({
-  SourceFileViewer: ({ filename }: { filename: string }) => (
-    <div data-testid="source-file-viewer">{filename}</div>
+vi.mock("./episodes/EpisodesView", () => ({
+  EpisodesView: ({ projectName }: { projectName: string }) => (
+    <div data-testid="episodes-view">{projectName}</div>
   ),
 }));
 
@@ -42,34 +51,39 @@ vi.mock("./timeline/TimelineCanvas", () => ({
     durationOptions,
     onUpdatePrompt,
     onMoveShot,
+    onInsertShot,
+    onRemoveShot,
     onGenerateStoryboard,
     onGenerateVideo,
     onGenerateNarration,
     onGenerateEpisodeNarration,
-    onSaveTitle,
-    canEditTitle,
+    view,
   }: {
+    view: string;
     episodeScript: unknown;
     scriptFile?: string;
     durationOptions?: number[];
-    onUpdatePrompt?: (segmentId: string, field: string, value: unknown, scriptFile?: string) => void;
-    onMoveShot?: (
-      shotId: string,
-      direction: "earlier" | "later",
-      scriptFile?: string,
-    ) => Promise<boolean> | void;
+    onUpdatePrompt?: (segmentId: string, patch: Record<string, unknown>, scriptFile?: string) => Promise<boolean>;
+    onMoveShot?: (shotId: string, afterId: string | null, scriptFile?: string) => Promise<boolean> | void;
+    onInsertShot?: (afterId: string, novelText: string | undefined, scriptFile?: string) => Promise<boolean>;
+    onRemoveShot?: (itemId: string, scriptFile?: string) => Promise<boolean>;
     onGenerateStoryboard?: (segmentId: string) => void;
     onGenerateVideo?: (segmentId: string) => void;
     onGenerateNarration?: (segmentId: string) => void;
     onGenerateEpisodeNarration?: (scriptFile?: string) => void;
-    onSaveTitle?: (title: string) => Promise<void>;
-    canEditTitle?: boolean;
   }) => (
-    <div data-testid="timeline-canvas">
+    <div data-testid="timeline-canvas" data-view={view}>
       <div data-testid="timeline-has-script">{episodeScript ? "yes" : "no"}</div>
-      <div data-testid="timeline-can-edit-title">{canEditTitle ? "yes" : "no"}</div>
       <div data-testid="timeline-duration-options">{(durationOptions ?? []).join(",")}</div>
-      <button onClick={() => onUpdatePrompt?.("SEG-1", "image_prompt", "new prompt", scriptFile)}>
+      <button
+        onClick={(e) => {
+          const el = e.currentTarget;
+          onUpdatePrompt?.("SEG-1", { image_prompt: "new prompt" }, scriptFile).then(
+            (refreshed) => el.setAttribute("data-result", String(refreshed)),
+            (err: Error) => el.setAttribute("data-error", err.message),
+          );
+        }}
+      >
         update-prompt
       </button>
       <button
@@ -77,7 +91,7 @@ vi.mock("./timeline/TimelineCanvas", () => ({
           const el = e.currentTarget;
           el.setAttribute("data-update-pending", "true");
           void Promise.resolve(
-            onUpdatePrompt?.("SEG-1", "image_prompt", "new prompt", scriptFile),
+            onUpdatePrompt?.("SEG-1", { image_prompt: "new prompt" }, scriptFile),
           ).then(() => {
             el.setAttribute("data-update-pending", "false");
           });
@@ -88,18 +102,35 @@ vi.mock("./timeline/TimelineCanvas", () => ({
       <button
         onClick={(e) => {
           const el = e.currentTarget;
-          void Promise.resolve(onMoveShot?.("SEG-1", "later", scriptFile)).then((moved) => {
+          void Promise.resolve(onMoveShot?.("SEG-1", "SEG-2", scriptFile)).then((moved) => {
             el.setAttribute("data-move-result", String(moved));
           });
         }}
       >
         move-shot-later
       </button>
+      <button
+        onClick={(e) => {
+          const el = e.currentTarget;
+          void onInsertShot?.("SEG-1", undefined, scriptFile).then((ok) => el.setAttribute("data-result", String(ok)));
+        }}
+      >
+        insert-shot
+      </button>
+      <button
+        onClick={(e) => {
+          const el = e.currentTarget;
+          void onRemoveShot?.("SEG-1", scriptFile).then((ok) => el.setAttribute("data-result", String(ok)));
+        }}
+      >
+        remove-shot
+      </button>
       <button onClick={() => onGenerateStoryboard?.("SEG-1")}>generate-storyboard</button>
       <button onClick={() => onGenerateVideo?.("SEG-1")}>generate-video</button>
-      <button onClick={() => onGenerateNarration?.("SEG-1")}>generate-narration</button>
-      <button onClick={() => onGenerateEpisodeNarration?.()}>generate-episode-narration</button>
-      <button onClick={() => void onSaveTitle?.("新标题")?.catch(() => {})}>save-title</button>
+      {onGenerateNarration && <button onClick={() => onGenerateNarration("SEG-1")}>generate-narration</button>}
+      {onGenerateEpisodeNarration && (
+        <button onClick={() => onGenerateEpisodeNarration()}>generate-episode-narration</button>
+      )}
     </div>
   ),
 }));
@@ -115,28 +146,22 @@ vi.mock("./EpisodeSourceReview", () => ({
 vi.mock("./reference/ReferenceVideoCanvas", () => ({
   ReferenceVideoCanvas: ({
     hasScript,
-    canEditTitle,
-    onSaveTitle,
     showPreprocess,
     freeDuration,
+    view,
   }: {
     hasScript: boolean;
-    canEditTitle?: boolean;
-    onSaveTitle?: (title: string) => Promise<void>;
     showPreprocess?: boolean;
     freeDuration?: boolean;
+    view: string;
   }) => (
     <div
       data-testid="reference-video-canvas"
+      data-view={view}
       data-has-script={hasScript ? "yes" : "no"}
       data-preprocess={showPreprocess === false ? "no" : "yes"}
       data-free-duration={freeDuration ? "yes" : "no"}
-    >
-      <div data-testid="reference-can-edit-title">{canEditTitle ? "yes" : "no"}</div>
-      <button onClick={() => void onSaveTitle?.("新标题")?.catch(() => {})}>
-        reference-save-title
-      </button>
-    </div>
+    />
   ),
 }));
 
@@ -144,26 +169,24 @@ vi.mock("./grid/GridImageToVideoCanvas", () => ({
   GridImageToVideoCanvas: ({
     onGenerateGrid,
     onGenerateVideo,
+    view,
   }: {
+    view: string;
     onGenerateGrid?: (
       episode: number,
       scriptFile: string,
       sceneIds?: string[],
     ) => void | Promise<void>;
-    onGenerateVideo?: (
-      segmentId: string,
-      scriptFile?: string,
-      requestOptions?: { narration_delivery: "use_tts" },
-    ) => void | Promise<void>;
+    onGenerateVideo?: (segmentId: string, scriptFile?: string) => void | Promise<void>;
   }) => (
-    <div data-testid="grid-canvas">
+    <div data-testid="grid-canvas" data-view={view}>
       <button onClick={() => void onGenerateGrid?.(1, "episode_1.json")}>generate-grid</button>
       <button
         onClick={(event) => {
           const button = event.currentTarget;
           button.dataset.videoResult = "pending";
           void Promise.resolve(
-            onGenerateVideo?.("SEG-1", "episode_1.json", { narration_delivery: "use_tts" }),
+            onGenerateVideo?.("SEG-1", "episode_1.json"),
           ).then(
             () => {
               button.dataset.videoResult = "resolved";
@@ -180,111 +203,49 @@ vi.mock("./grid/GridImageToVideoCanvas", () => ({
   ),
 }));
 
-vi.mock("./lorebook/CharacterCard", () => ({
-  CharacterCard: ({
-    name,
-    onSave,
+// 画廊替身为每个资产渲染一个生成按钮，路由测试经它触发资产图生成回调；
+// 版本恢复与重新加载按钮把回调的结算值写到 data-result 上。
+vi.mock("./lorebook/AssetGallery", () => ({
+  AssetGallery: ({
+    assetType,
+    assets,
     onGenerate,
+    onRestoreVersion,
+    onReload,
   }: {
-    name: string;
-    onSave: (
-      name: string,
-      payload: { description: string; voiceStyle: string; referenceFile?: File | null; audioFile?: File | null },
-    ) => Promise<void>;
+    assetType: string;
+    assets: Record<string, unknown>;
     onGenerate: (name: string) => void;
+    onRestoreVersion?: () => Promise<unknown> | void;
+    onReload?: () => Promise<unknown> | void;
   }) => (
-    <div data-testid="character-card" data-name={name}>
+    <div data-testid={`${assetType}-gallery`} data-names={Object.keys(assets).join(",")}>
+      {Object.keys(assets).map((name) => (
+        <button key={name} onClick={() => onGenerate(name)}>
+          generate-{assetType}
+        </button>
+      ))}
       <button
-        onClick={() =>
-          void onSave(name, {
-            description: "new desc",
-            voiceStyle: "new voice",
-            referenceFile: new File(["ref"], "hero.png", { type: "image/png" }),
-          })
-        }
+        onClick={(e) => {
+          const el = e.currentTarget;
+          void Promise.resolve(onRestoreVersion?.()).then((result) => el.setAttribute("data-result", String(result)));
+        }}
       >
-        update-character
+        restore-{assetType}
       </button>
       <button
-        onClick={() =>
-          void onSave(name, {
-            description: "new desc",
-            voiceStyle: "new voice",
-            audioFile: new File(["audio"], "hero.wav", { type: "audio/wav" }),
-          })
-        }
+        onClick={(e) => {
+          const el = e.currentTarget;
+          void Promise.resolve(onReload?.()).then((result) => el.setAttribute("data-result", String(result)));
+        }}
       >
-        update-character-with-audio
+        reload-{assetType}
       </button>
-      <button onClick={() => onGenerate(name)}>generate-character</button>
     </div>
   ),
 }));
 
-vi.mock("./lorebook/SceneCard", () => ({
-  SceneCard: ({
-    name,
-    onUpdate,
-    onGenerate,
-  }: {
-    name: string;
-    onUpdate: (name: string, updates: Record<string, unknown>) => void;
-    onGenerate: (name: string) => void;
-  }) => (
-    <div data-testid="scene-card" data-name={name}>
-      <button onClick={() => onUpdate(name, { description: "new scene desc" })}>
-        update-scene
-      </button>
-      <button onClick={() => onGenerate(name)}>generate-scene</button>
-    </div>
-  ),
-}));
-
-vi.mock("./lorebook/PropCard", () => ({
-  PropCard: ({
-    name,
-    onUpdate,
-    onGenerate,
-  }: {
-    name: string;
-    onUpdate: (name: string, updates: Record<string, unknown>) => void;
-    onGenerate: (name: string) => void;
-  }) => (
-    <div data-testid="prop-card" data-name={name}>
-      <button onClick={() => onUpdate(name, { description: "new prop desc" })}>
-        update-prop
-      </button>
-      <button onClick={() => onGenerate(name)}>generate-prop</button>
-    </div>
-  ),
-}));
-
-vi.mock("./lorebook/ProductsPage", () => ({
-  ProductsPage: ({
-    products,
-    onUpdateProduct,
-    onGenerateProduct,
-    onAddProduct,
-  }: {
-    products: Record<string, { description: string }>;
-    onUpdateProduct: (name: string, updates: Record<string, unknown>) => void;
-    onGenerateProduct: (name: string) => void;
-    onAddProduct: (name: string, description: string, brand: string) => Promise<void>;
-  }) => (
-    <div data-testid="products-page" data-names={Object.keys(products).join(",")}>
-      <button onClick={() => onUpdateProduct("Phone", { description: "new product desc" })}>
-        update-product
-      </button>
-      <button onClick={() => onGenerateProduct("Phone")}>generate-product</button>
-      <button onClick={() => void onAddProduct("NewPhone", "desc", "Acme").catch(() => {})}>
-        add-product
-      </button>
-      <button onClick={() => void onAddProduct("NewPhone", "desc", "").catch(() => {})}>
-        add-product-no-brand
-      </button>
-    </div>
-  ),
-}));
+const REFRESH_FAILED = "操作已完成，但页面数据刷新失败，请手动刷新查看最新状态";
 
 /** 服务端 video-capabilities 应答：时长收窄结果由服务端按项目分辨率与生成模式算好回传。 */
 function fakeVideoCapabilities(allowed: number[], raw: number[] = allowed) {
@@ -302,7 +263,6 @@ function fakeVideoCapabilities(allowed: number[], raw: number[] = allowed) {
       resolution: null,
       uses_reference_images: false,
       allowed,
-      allowed_without_reference_images: allowed,
       excluded: {},
     },
   } as Awaited<ReturnType<typeof API.getVideoCapabilities>>;
@@ -341,7 +301,6 @@ function makeScript(): EpisodeScript {
         props: ["Sword"],
         image_prompt: "image prompt",
         video_prompt: "video prompt",
-        transition_to_next: "cut",
       },
     ],
   };
@@ -361,7 +320,6 @@ function makeAdScript(): EpisodeScript {
         voiceover_text: "口播文案",
         image_prompt: "ad image prompt",
         video_prompt: "ad video prompt",
-        transition_to_next: "cut",
       },
     ],
   };
@@ -381,10 +339,17 @@ function makeDramaScript(): EpisodeScript {
         characters_in_scene: ["Hero"],
         image_prompt: "drama image prompt",
         video_prompt: "drama video prompt",
-        transition_to_next: "cut",
       },
     ],
   };
+}
+
+/** 在集页页头改集标题：点铅笔、输入、回车保存。 */
+async function renameEpisode(title: string) {
+  fireEvent.click(await screen.findByRole("button", { name: "编辑分集标题" }));
+  const input = screen.getByRole("textbox", { name: "编辑分集标题" });
+  fireEvent.change(input, { target: { value: title } });
+  fireEvent.keyDown(input, { key: "Enter" });
 }
 
 function renderAt(path: string) {
@@ -439,10 +404,10 @@ describe("StudioCanvasRouter", () => {
     renderAt("/characters");
 
     expect(screen.getByText("加载中...")).toBeInTheDocument();
-    expect(screen.queryByTestId("character-card")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("character-gallery")).not.toBeInTheDocument();
   });
 
-  it("routes characters/scenes/props/source/episodes views correctly", async () => {
+  it("routes characters/scenes/props/episodes views correctly", async () => {
     useProjectsStore.setState({
       currentProjectName: "demo",
       currentProjectData: makeProjectData(),
@@ -452,20 +417,20 @@ describe("StudioCanvasRouter", () => {
     });
 
     const viewCharacters = renderAt("/characters");
-    expect(screen.getByTestId("character-card")).toHaveAttribute("data-name", "Hero");
+    expect(screen.getByTestId("character-gallery")).toHaveAttribute("data-names", "Hero");
     viewCharacters.unmount();
 
     const viewScenes = renderAt("/scenes");
-    expect(screen.getByTestId("scene-card")).toHaveAttribute("data-name", "Temple");
+    expect(screen.getByTestId("scene-gallery")).toHaveAttribute("data-names", "Temple");
     viewScenes.unmount();
 
     const viewProps = renderAt("/props");
-    expect(screen.getByTestId("prop-card")).toHaveAttribute("data-name", "Sword");
+    expect(screen.getByTestId("prop-gallery")).toHaveAttribute("data-names", "Sword");
     viewProps.unmount();
 
-    const viewSource = renderAt("/source/source%20file.txt");
-    expect(screen.getByTestId("source-file-viewer")).toHaveTextContent("source file.txt");
-    viewSource.unmount();
+    const viewEpisodeList = renderAt("/episodes");
+    expect(screen.getByTestId("episodes-view")).toHaveTextContent("demo");
+    viewEpisodeList.unmount();
 
     const viewEpisodes = renderAt("/episodes/1");
     expect(screen.getByTestId("timeline-canvas")).toBeInTheDocument();
@@ -475,6 +440,28 @@ describe("StudioCanvasRouter", () => {
     await waitFor(() => {
       expect(screen.queryByText("加载中...")).not.toBeInTheDocument();
     });
+  });
+
+  it("sends ad projects away from the episodes view to the overview", () => {
+    useProjectsStore.setState({
+      currentProjectName: "demo",
+      currentProjectData: makeProjectData({ content_mode: "ad" }),
+    });
+
+    renderAt("/episodes");
+
+    expect(screen.queryByTestId("episodes-view")).not.toBeInTheDocument();
+    expect(screen.getByTestId("overview-canvas")).toBeInTheDocument();
+  });
+
+  it("shows an empty state for an unknown workspace path and leads back to the overview", async () => {
+    useProjectsStore.setState({ currentProjectName: "demo", currentProjectData: makeProjectData() });
+
+    renderAt("/lorebook");
+
+    expect(screen.getByRole("heading", { name: "这个页面不存在" })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("link", { name: "回到概览" }));
+    expect(await screen.findByTestId("overview-canvas")).toBeInTheDocument();
   });
 
   // 同一 StudioCanvasRouter 实例从真实项目切到演示项目（路由 nest 下 projectName 参数
@@ -621,46 +608,209 @@ describe("StudioCanvasRouter", () => {
     expect(screen.queryByTestId("episode-source-review")).not.toBeInTheDocument();
   });
 
-  it("runs character callbacks and reports API failures with toast", async () => {
+  it("switches an episode with a script between the storyboard and edit views", async () => {
+    useProjectsStore.setState({
+      currentProjectName: "demo",
+      currentProjectData: makeProjectData({
+        episodes: [
+          { episode: 1, title: "EP1", script_file: "scripts/episode_1.json", script_status: "generated" },
+        ],
+      }),
+      currentScripts: { "episode_1.json": makeScript() },
+    });
+    const { hook, searchHook } = memoryLocation({ path: "/episodes/1" });
+    render(
+      <Router hook={hook} searchHook={searchHook}>
+        <StudioCanvasRouter />
+      </Router>,
+    );
+
+    expect(screen.getByRole("tab", { name: "分镜" })).toHaveAttribute("aria-selected", "true");
+    fireEvent.click(screen.getByRole("tab", { name: "剪辑" }));
+
+    expect(screen.getByTestId("edit-timeline-view")).toHaveTextContent("episode 1");
+    expect(screen.queryByTestId("timeline-canvas")).not.toBeInTheDocument();
+    expect(screen.getByTestId("workflow-panel")).toBeInTheDocument();
+    expect(screen.getByRole("tabpanel", { name: "剪辑" })).toContainElement(screen.getByTestId("edit-timeline-view"));
+
+    fireEvent.click(screen.getByRole("tab", { name: "分镜" }));
+    expect(screen.getByTestId("timeline-canvas")).toHaveAttribute("data-view", "board");
+    expect(screen.getByRole("tabpanel", { name: "分镜" })).toContainElement(screen.getByTestId("timeline-canvas"));
+
+    // 方向键只移动焦点，切换视图要按下：剪辑视图会卸载画布，不随焦点经过就切走；Tab 只停在选中的那个
+    const storyboard = screen.getByRole("tab", { name: "分镜" });
+    expect(storyboard).toHaveAttribute("tabindex", "0");
+    expect(screen.getByRole("tab", { name: "剪辑" })).toHaveAttribute("tabindex", "-1");
+    const user = userEvent.setup();
+    act(() => storyboard.focus());
+    await user.keyboard("{ArrowRight}");
+    const edit = screen.getByRole("tab", { name: "剪辑" });
+    expect(edit).toHaveFocus();
+    expect(storyboard).toHaveAttribute("aria-selected", "true");
+    await user.keyboard("{Enter}");
+    expect(screen.getByRole("tabpanel", { name: "剪辑" })).toContainElement(screen.getByTestId("edit-timeline-view"));
+  });
+
+  it("deep-links each canvas view through ?view= and writes no view for the default one", () => {
+    useProjectsStore.setState({
+      currentProjectName: "demo",
+      currentProjectData: makeProjectData({
+        grid_storyboard: true,
+        episodes: [
+          { episode: 1, title: "EP1", script_file: "scripts/episode_1.json", script_status: "generated" },
+        ],
+      }),
+      currentScripts: { "episode_1.json": makeScript() },
+    });
+    const { hook, searchHook, history } = memoryLocation({ path: "/episodes/1?view=plan", record: true });
+    render(
+      <Router hook={hook} searchHook={searchHook}>
+        <StudioCanvasRouter />
+      </Router>,
+    );
+
+    expect(screen.getByRole("tab", { name: "脚本规划" })).toHaveAttribute("aria-selected", "true");
+    expect(screen.getByTestId("grid-canvas")).toHaveAttribute("data-view", "plan");
+    expect(screen.getByRole("tabpanel", { name: "脚本规划" })).toContainElement(screen.getByTestId("grid-canvas"));
+
+    fireEvent.click(screen.getByRole("tab", { name: "多宫格分镜图" }));
+    expect(screen.getByTestId("grid-canvas")).toHaveAttribute("data-view", "grid");
+    expect(history.at(-1)).toBe("/episodes/1?view=grid");
+
+    // 分镜是有剧本时的缺省视图：地址不带 view，剧本生成后停在缺省视图的页面才会自动落到分镜
+    fireEvent.click(screen.getByRole("tab", { name: "分镜" }));
+    expect(screen.getByTestId("grid-canvas")).toHaveAttribute("data-view", "board");
+    expect(history.at(-1)).toBe("/episodes/1");
+  });
+
+  it("falls back to the default view when the linked one is unknown or not available yet", () => {
+    useProjectsStore.setState({
+      currentProjectName: "demo",
+      currentProjectData: makeProjectData({
+        episodes: [
+          { episode: 1, title: "EP1", script_file: "scripts/episode_1.json", script_status: "segmented" },
+        ],
+      }),
+      currentScripts: {},
+    });
+
+    renderAt("/episodes/1?view=board");
+    // 只有脚本规划中间稿时分镜还不可选，停在脚本规划
+    expect(screen.getByRole("tab", { name: "分镜" })).toHaveAttribute("aria-disabled", "true");
+    expect(screen.getByRole("tab", { name: "脚本规划" })).toHaveAttribute("aria-selected", "true");
+    expect(screen.getByTestId("timeline-canvas")).toHaveAttribute("data-view", "plan");
+    cleanup();
+
+    renderAt("/episodes/1?view=nonsense");
+    expect(screen.getByTestId("timeline-canvas")).toHaveAttribute("data-view", "plan");
+  });
+
+  it("names the board view after video units on the reference route and opens its plan view from the link", () => {
+    useProjectsStore.setState({
+      currentProjectName: "demo",
+      currentProjectData: makeProjectData({
+        generation_mode: "reference_video",
+        episodes: [
+          { episode: 1, title: "EP1", script_file: "scripts/episode_1.json", script_status: "generated" },
+        ],
+      }),
+      currentScripts: { "episode_1.json": makeScript() },
+    });
+
+    renderAt("/episodes/1?view=plan");
+
+    expect(screen.getByRole("tab", { name: "视频单元" })).toHaveAttribute("aria-selected", "false");
+    expect(screen.queryByRole("tab", { name: "分镜" })).not.toBeInTheDocument();
+    expect(screen.getByTestId("reference-video-canvas")).toHaveAttribute("data-view", "plan");
+  });
+
+  it("deletes the episode from the page header menu", async () => {
+    useProjectsStore.setState({
+      currentProjectName: "demo",
+      currentProjectData: makeProjectData({
+        episodes: [
+          { episode: 1, title: "EP1", script_file: "scripts/episode_1.json", script_status: "generated" },
+        ],
+      }),
+      currentScripts: { "episode_1.json": makeScript() },
+    });
+    const impact = { episode: 1, recoverable: true, revision: "rev-1", text: "删除「EP1」后可以从集原文重新生成。" };
+    const remove = vi
+      .spyOn(API, "deleteEpisode")
+      .mockResolvedValueOnce({ status: "confirmation_required", impact } as never)
+      .mockResolvedValueOnce({ status: "deleted", impact } as never);
+    useProjectsStore.setState({ refreshProject: vi.fn().mockResolvedValue("success") });
+    const user = userEvent.setup();
+    const { hook, searchHook, history } = memoryLocation({ path: "/episodes/1", record: true });
+    render(
+      <Router hook={hook} searchHook={searchHook}>
+        <StudioCanvasRouter />
+      </Router>,
+    );
+
+    await user.click(screen.getByRole("button", { name: "这一集的更多操作" }));
+    await user.click(await screen.findByRole("menuitem", { name: "删除这一集" }));
+    const dialog = await screen.findByRole("alertdialog", { name: "删除「EP1」" });
+    await user.click(within(dialog).getByRole("button", { name: "删除" }));
+
+    // 删掉的是正在看的这一集，回到分集列表
+    await waitFor(() => expect(history.at(-1)).toBe("/episodes"));
+    expect(remove).toHaveBeenLastCalledWith("demo", 1, "rev-1");
+  });
+
+  it("opens the edit view directly from its link", () => {
+    useProjectsStore.setState({
+      currentProjectName: "demo",
+      currentProjectData: makeProjectData({
+        episodes: [
+          { episode: 1, title: "EP1", script_file: "scripts/episode_1.json", script_status: "generated" },
+        ],
+      }),
+      currentScripts: { "episode_1.json": makeScript() },
+    });
+    const { hook, searchHook } = memoryLocation({ path: episodeEditViewPath(1) });
+    render(
+      <Router hook={hook} searchHook={searchHook}>
+        <StudioCanvasRouter />
+      </Router>,
+    );
+
+    expect(screen.getByRole("tab", { name: "剪辑" })).toHaveAttribute("aria-selected", "true");
+    expect(screen.getByTestId("edit-timeline-view")).toBeInTheDocument();
+  });
+
+  it("keeps the edit view closed for an episode that has no script yet", () => {
+    useProjectsStore.setState({
+      currentProjectName: "demo",
+      currentProjectData: makeProjectData({
+        episodes: [{ episode: 1, title: "EP1", script_file: "scripts/episode_1.json" }],
+      }),
+      currentScripts: {},
+    });
+    const { hook, searchHook } = memoryLocation({ path: episodeEditViewPath(1) });
+    render(
+      <Router hook={hook} searchHook={searchHook}>
+        <StudioCanvasRouter />
+      </Router>,
+    );
+
+    expect(screen.queryByRole("tab", { name: "剪辑" })).not.toBeInTheDocument();
+    expect(screen.queryByTestId("edit-timeline-view")).not.toBeInTheDocument();
+  });
+
+  it("submits character generation, marks the character active and confirms with a toast", async () => {
     useProjectsStore.setState({
       currentProjectName: "demo",
       currentProjectData: makeProjectData(),
       currentScripts: { "episode_1.json": makeScript() },
     });
-
-    vi.spyOn(API, "getProject").mockResolvedValue({
-      project: makeProjectData(),
-      scripts: { "episode_1.json": makeScript() },
-    });
-    vi.spyOn(API, "updateCharacter").mockResolvedValue({ success: true });
-    vi.spyOn(API, "uploadFile").mockResolvedValue({ success: true, path: "x", url: "y" });
     vi.spyOn(API, "generateCharacter").mockResolvedValue({ success: true, task_id: "t-1", deduped: false, message: "已提交" });
 
     renderAt("/characters");
 
-    fireEvent.click(screen.getByText("update-character"));
-    await waitFor(() => {
-      expect(API.updateCharacter).toHaveBeenCalledWith("demo", "Hero", {
-        description: "new desc",
-        voice_style: "new voice",
-      });
-      expect(API.uploadFile).toHaveBeenNthCalledWith(
-        1,
-        "demo",
-        "character_ref",
-        expect.any(File),
-        "Hero",
-      );
-      expect(API.getProject).toHaveBeenCalled();
-    });
-
     fireEvent.click(screen.getByText("generate-character"));
     await waitFor(() => {
-      expect(API.generateCharacter).toHaveBeenCalledWith(
-        "demo",
-        "Hero",
-        "hero description",
-      );
+      expect(API.generateCharacter).toHaveBeenCalledWith("demo", "Hero");
       expect(useAppStore.getState().toast?.text).toContain("生成任务已提交");
       expect(useAppStore.getState().toast?.tone).toBe("success");
       // 入队成功后应立即乐观占用该角色，避免 SSE 轮询落地前的空窗被误判为空闲
@@ -670,98 +820,28 @@ describe("StudioCanvasRouter", () => {
     });
   });
 
-  it("refreshes the project even when the audio upload step fails partway through save", async () => {
+  it("reports scene and prop generation failures with toast", async () => {
     useProjectsStore.setState({
       currentProjectName: "demo",
       currentProjectData: makeProjectData(),
       currentScripts: { "episode_1.json": makeScript() },
     });
-
-    vi.spyOn(API, "getProject").mockResolvedValue({
-      project: makeProjectData(),
-      scripts: { "episode_1.json": makeScript() },
-    });
-    vi.spyOn(API, "updateCharacter").mockResolvedValue({ success: true });
-    vi.spyOn(API, "uploadFile").mockRejectedValue(new Error("audio_duration_out_of_range"));
-
-    renderAt("/characters");
-
-    fireEvent.click(screen.getByText("update-character-with-audio"));
-    await waitFor(() => {
-      expect(API.uploadFile).toHaveBeenCalledWith(
-        "demo",
-        "character_audio_ref",
-        expect.any(File),
-        expect.any(String),
-      );
-      // description/voice_style 已持久化成功，仅音频上传失败：即便整体 catch 到错误，
-      // 也要刷新 store 让已保存的部分反映到 UI，而不是让用户误以为整个保存都没生效
-      expect(API.getProject).toHaveBeenCalled();
-      expect(useAppStore.getState().toast?.text).toContain("更新角色失败");
-      expect(useAppStore.getState().toast?.tone).toBe("error");
-    });
-  });
-
-  it("runs scene callbacks and reports API failures with toast", async () => {
-    useProjectsStore.setState({
-      currentProjectName: "demo",
-      currentProjectData: makeProjectData(),
-      currentScripts: { "episode_1.json": makeScript() },
-    });
-
-    vi.spyOn(API, "getProject").mockResolvedValue({
-      project: makeProjectData(),
-      scripts: { "episode_1.json": makeScript() },
-    });
-    vi.spyOn(API, "updateProjectScene").mockRejectedValue(new Error("scene update failed"));
     vi.spyOn(API, "generateProjectScene").mockRejectedValue(new Error("scene generate failed"));
-
-    renderAt("/scenes");
-
-    fireEvent.click(screen.getByText("update-scene"));
-    await waitFor(() => {
-      expect(API.updateProjectScene).toHaveBeenCalledWith("demo", "Temple", {
-        description: "new scene desc",
-      });
-      expect(useAppStore.getState().toast?.text).toContain("更新场景失败");
-      expect(useAppStore.getState().toast?.tone).toBe("error");
-    });
-
-    fireEvent.click(screen.getByText("generate-scene"));
-    await waitFor(() => {
-      expect(API.generateProjectScene).toHaveBeenCalledWith("demo", "Temple", "ancient temple");
-      expect(useAppStore.getState().toast?.text).toContain("提交失败");
-    });
-  });
-
-  it("runs prop callbacks and reports API failures with toast", async () => {
-    useProjectsStore.setState({
-      currentProjectName: "demo",
-      currentProjectData: makeProjectData(),
-      currentScripts: { "episode_1.json": makeScript() },
-    });
-
-    vi.spyOn(API, "getProject").mockResolvedValue({
-      project: makeProjectData(),
-      scripts: { "episode_1.json": makeScript() },
-    });
-    vi.spyOn(API, "updateProjectProp").mockRejectedValue(new Error("prop update failed"));
     vi.spyOn(API, "generateProjectProp").mockRejectedValue(new Error("prop generate failed"));
 
-    renderAt("/props");
-
-    fireEvent.click(screen.getByText("update-prop"));
+    const scenes = renderAt("/scenes");
+    fireEvent.click(screen.getByText("generate-scene"));
     await waitFor(() => {
-      expect(API.updateProjectProp).toHaveBeenCalledWith("demo", "Sword", {
-        description: "new prop desc",
-      });
-      expect(useAppStore.getState().toast?.text).toContain("更新道具失败");
-      expect(useAppStore.getState().toast?.tone).toBe("error");
+      expect(API.generateProjectScene).toHaveBeenCalledWith("demo", "Temple");
+      expect(useAppStore.getState().toast?.text).toContain("提交失败");
     });
+    scenes.unmount();
+    useAppStore.setState({ toast: null });
 
+    renderAt("/props");
     fireEvent.click(screen.getByText("generate-prop"));
     await waitFor(() => {
-      expect(API.generateProjectProp).toHaveBeenCalledWith("demo", "Sword", "rusty sword");
+      expect(API.generateProjectProp).toHaveBeenCalledWith("demo", "Sword");
       expect(useAppStore.getState().toast?.text).toContain("提交失败");
     });
   });
@@ -782,7 +862,7 @@ describe("StudioCanvasRouter", () => {
     renderAt("/scenes");
     fireEvent.click(screen.getByText("generate-scene"));
     await waitFor(() => {
-      expect(API.generateProjectScene).toHaveBeenCalledWith("demo", "Temple", "ancient temple");
+      expect(API.generateProjectScene).toHaveBeenCalledWith("demo", "Temple");
       const { tasks, optimisticActive } = useTasksStore.getState();
       expect(selectActiveResourceIds(tasks, "scene", "demo", optimisticActive).has("Temple")).toBe(true);
     });
@@ -804,13 +884,13 @@ describe("StudioCanvasRouter", () => {
     renderAt("/props");
     fireEvent.click(screen.getByText("generate-prop"));
     await waitFor(() => {
-      expect(API.generateProjectProp).toHaveBeenCalledWith("demo", "Sword", "rusty sword");
+      expect(API.generateProjectProp).toHaveBeenCalledWith("demo", "Sword");
       const { tasks, optimisticActive } = useTasksStore.getState();
       expect(selectActiveResourceIds(tasks, "prop", "demo", optimisticActive).has("Sword")).toBe(true);
     });
   });
 
-  it("runs product callbacks and reports API failures with toast", async () => {
+  it("submits product generation and reports its failure with toast", async () => {
     const projectData = makeProjectData({
       products: { Phone: { description: "sleek phone" } },
     });
@@ -819,83 +899,27 @@ describe("StudioCanvasRouter", () => {
       currentProjectData: projectData,
       currentScripts: { "episode_1.json": makeScript() },
     });
-
-    vi.spyOn(API, "getProject").mockResolvedValue({
-      project: projectData,
-      scripts: { "episode_1.json": makeScript() },
-    });
-    const updateSpy = vi.spyOn(API, "updateProjectProduct").mockResolvedValue({ success: true });
     const generateSpy = vi
       .spyOn(API, "generateProjectProduct")
-      .mockResolvedValue({ success: true, task_id: "t-1", deduped: false, message: "已提交" });
-    const addSpy = vi.spyOn(API, "addProjectProduct").mockResolvedValue({ success: true });
+      .mockResolvedValueOnce({ success: true, task_id: "t-1", deduped: false, message: "已提交" })
+      .mockRejectedValueOnce(new Error("product generate failed"));
 
     renderAt("/products");
-    expect(screen.getByTestId("products-page")).toHaveAttribute("data-names", "Phone");
-
-    fireEvent.click(screen.getByText("update-product"));
-    await waitFor(() => {
-      expect(updateSpy).toHaveBeenCalledWith("demo", "Phone", {
-        description: "new product desc",
-      });
-      expect(API.getProject).toHaveBeenCalled();
-    });
+    expect(screen.getByTestId("product-gallery")).toHaveAttribute("data-names", "Phone");
 
     fireEvent.click(screen.getByText("generate-product"));
     await waitFor(() => {
-      expect(generateSpy).toHaveBeenCalledWith("demo", "Phone", "sleek phone");
+      expect(generateSpy).toHaveBeenCalledWith("demo", "Phone");
       expect(useAppStore.getState().toast?.text).toContain("资产图生成任务已提交");
       expect(useAppStore.getState().toast?.tone).toBe("success");
       const { tasks, optimisticActive } = useTasksStore.getState();
       expect(selectActiveResourceIds(tasks, "product", "demo", optimisticActive).has("Phone")).toBe(true);
     });
 
-    fireEvent.click(screen.getByText("add-product"));
-    await waitFor(() => {
-      expect(addSpy).toHaveBeenCalledWith("demo", "NewPhone", "desc", "Acme");
-      expect(useAppStore.getState().toast?.text).toContain("已添加");
-    });
-
-    fireEvent.click(screen.getByText("add-product-no-brand"));
-    await waitFor(() => {
-      expect(addSpy).toHaveBeenCalledWith("demo", "NewPhone", "desc", undefined);
-    });
-  });
-
-  it("reports product callback failures with error toasts", async () => {
-    const projectData = makeProjectData({
-      products: { Phone: { description: "sleek phone" } },
-    });
-    useProjectsStore.setState({
-      currentProjectName: "demo",
-      currentProjectData: projectData,
-      currentScripts: { "episode_1.json": makeScript() },
-    });
-
-    vi.spyOn(API, "getProject").mockResolvedValue({
-      project: projectData,
-      scripts: { "episode_1.json": makeScript() },
-    });
-    vi.spyOn(API, "updateProjectProduct").mockRejectedValue(new Error("product update failed"));
-    vi.spyOn(API, "generateProjectProduct").mockRejectedValue(new Error("product generate failed"));
-    vi.spyOn(API, "addProjectProduct").mockRejectedValue(new Error("product add failed"));
-
-    renderAt("/products");
-
-    fireEvent.click(screen.getByText("update-product"));
-    await waitFor(() => {
-      expect(useAppStore.getState().toast?.text).toContain("更新商品失败");
-      expect(useAppStore.getState().toast?.tone).toBe("error");
-    });
-
+    useTasksStore.setState({ tasks: [], optimisticActive: new Set() });
     fireEvent.click(screen.getByText("generate-product"));
     await waitFor(() => {
       expect(useAppStore.getState().toast?.text).toContain("提交失败");
-    });
-
-    fireEvent.click(screen.getByText("add-product"));
-    await waitFor(() => {
-      expect(useAppStore.getState().toast?.text).toContain("添加失败");
     });
   });
 
@@ -922,8 +946,10 @@ describe("StudioCanvasRouter", () => {
         script_file: "episode_1.json",
         image_prompt: "new prompt",
       });
-      expect(useAppStore.getState().toast?.text).toContain("更新 Prompt 失败");
+      // 保存失败如实抛给分镜详情，由提示条显示，不另弹全局提示
+      expect(screen.getByText("update-prompt")).toHaveAttribute("data-error", "update failed");
     });
+    expect(useAppStore.getState().toast).toBeNull();
 
     fireEvent.click(screen.getByText("generate-storyboard"));
     await waitFor(() => {
@@ -1067,7 +1093,7 @@ describe("StudioCanvasRouter", () => {
     expect(updateSegmentSpy).not.toHaveBeenCalled();
   });
 
-  it("moves an ad shot by submitting the full reordered id list", async () => {
+  it("moves a shot after its anchor", async () => {
     const script = makeAdScript() as AdEpisodeScript;
     script.shots.push({
       shot_id: "SEG-2",
@@ -1076,7 +1102,6 @@ describe("StudioCanvasRouter", () => {
       voiceover_text: "立即下单",
       image_prompt: "p2",
       video_prompt: "v2",
-      transition_to_next: "cut",
     });
     useProjectsStore.setState({
       currentProjectName: "demo",
@@ -1088,13 +1113,13 @@ describe("StudioCanvasRouter", () => {
       project: makeProjectData({ content_mode: "ad" }),
       scripts: { "episode_1.json": script },
     });
-    const reorderSpy = vi.spyOn(API, "reorderShots").mockResolvedValue({ success: true });
+    const moveSpy = vi.spyOn(API, "moveScriptItem").mockResolvedValue({ success: true });
 
     renderAt("/episodes/1");
 
     fireEvent.click(screen.getByText("move-shot-later"));
     await waitFor(() => {
-      expect(reorderSpy).toHaveBeenCalledWith("demo", "episode_1.json", ["SEG-2", "SEG-1"]);
+      expect(moveSpy).toHaveBeenCalledWith("demo", "episode_1.json", "SEG-1", "SEG-2");
     });
     // 重排 + 本地刷新都成功 → 报告移动成功
     await waitFor(() => {
@@ -1102,7 +1127,7 @@ describe("StudioCanvasRouter", () => {
     });
   });
 
-  it("reports move failure and toasts when the reorder request fails", async () => {
+  it("reports move failure and toasts when the move request fails", async () => {
     const script = makeAdScript() as AdEpisodeScript;
     script.shots.push({
       shot_id: "SEG-2",
@@ -1111,7 +1136,6 @@ describe("StudioCanvasRouter", () => {
       voiceover_text: "立即下单",
       image_prompt: "p2",
       video_prompt: "v2",
-      transition_to_next: "cut",
     });
     useProjectsStore.setState({
       currentProjectName: "demo",
@@ -1123,7 +1147,7 @@ describe("StudioCanvasRouter", () => {
       project: makeProjectData({ content_mode: "ad" }),
       scripts: { "episode_1.json": script },
     });
-    vi.spyOn(API, "reorderShots").mockRejectedValue(new Error("server boom"));
+    vi.spyOn(API, "moveScriptItem").mockRejectedValue(new Error("server boom"));
 
     renderAt("/episodes/1");
 
@@ -1135,7 +1159,7 @@ describe("StudioCanvasRouter", () => {
     expect(useAppStore.getState().toast?.tone).toBe("error");
   });
 
-  it("reports move failure when local refresh fails after a successful reorder", async () => {
+  it("reports move failure when local refresh fails after a successful move", async () => {
     const script = makeAdScript() as AdEpisodeScript;
     script.shots.push({
       shot_id: "SEG-2",
@@ -1144,7 +1168,6 @@ describe("StudioCanvasRouter", () => {
       voiceover_text: "立即下单",
       image_prompt: "p2",
       video_prompt: "v2",
-      transition_to_next: "cut",
     });
     useProjectsStore.setState({
       currentProjectName: "demo",
@@ -1152,10 +1175,10 @@ describe("StudioCanvasRouter", () => {
       currentScripts: { "episode_1.json": script },
     });
 
-    // 重排接口成功，但项目刷新失败：本地 segments 仍是旧顺序，
+    // 移动接口成功，但项目刷新失败：本地 segments 仍是旧顺序，
     // 必须报告失败，否则调用方会推进 selectedIndex 切到错误分镜
     vi.spyOn(API, "getProject").mockRejectedValue(new Error("network down"));
-    vi.spyOn(API, "reorderShots").mockResolvedValue({ success: true });
+    vi.spyOn(API, "moveScriptItem").mockResolvedValue({ success: true });
 
     renderAt("/episodes/1");
 
@@ -1164,6 +1187,47 @@ describe("StudioCanvasRouter", () => {
       expect(screen.getByText("move-shot-later")).toHaveAttribute("data-move-result", "false");
     });
   });
+
+  it("warns when the local refresh fails after a successful move", async () => {
+    const script = makeAdScript() as AdEpisodeScript;
+    useProjectsStore.setState({
+      currentProjectName: "demo",
+      currentProjectData: makeProjectData({ content_mode: "ad" }),
+      currentScripts: { "episode_1.json": script },
+    });
+    vi.spyOn(API, "getProject").mockRejectedValue(new Error("network down"));
+    vi.spyOn(API, "moveScriptItem").mockResolvedValue({ success: true });
+
+    renderAt("/episodes/1");
+
+    fireEvent.click(screen.getByText("move-shot-later"));
+    await waitFor(() => expect(screen.getByText("move-shot-later")).toHaveAttribute("data-move-result", "false"));
+    expect(useAppStore.getState().toast).toMatchObject({ text: REFRESH_FAILED, tone: "warning" });
+  });
+
+  it.each([
+    ["insert-shot", "insertScriptItem"],
+    ["remove-shot", "removeScriptItem"],
+  ] as const)(
+    "%s reports success once the edit is committed even if the local refresh then fails",
+    async (button, apiMethod) => {
+      const script = makeAdScript() as AdEpisodeScript;
+      useProjectsStore.setState({
+        currentProjectName: "demo",
+        currentProjectData: makeProjectData({ content_mode: "ad" }),
+        currentScripts: { "episode_1.json": script },
+      });
+      vi.spyOn(API, "getProject").mockRejectedValue(new Error("network down"));
+      const editSpy = vi.spyOn(API, apiMethod).mockResolvedValue({ success: true } as never);
+
+      renderAt("/episodes/1");
+
+      fireEvent.click(screen.getByText(button));
+      await waitFor(() => expect(screen.getByText(button)).toHaveAttribute("data-result", "true"));
+      expect(editSpy).toHaveBeenCalledTimes(1);
+      expect(useAppStore.getState().toast?.tone).toBe("warning");
+    },
+  );
 
   it("routes ad + reference_video projects to the unified unit canvas without preprocessing", async () => {
     useProjectsStore.setState({
@@ -1188,10 +1252,12 @@ describe("StudioCanvasRouter", () => {
     expect(canvas).toHaveAttribute("data-free-duration", "yes");
     // 分镜编辑画布在该路径下不再渲染
     expect(screen.queryByTestId("timeline-canvas")).not.toBeInTheDocument();
-    // script_file 存在 → 标题可编辑入口透传为 true
-    expect(screen.getByTestId("reference-can-edit-title")).toHaveTextContent("yes");
+    // 广告/短片没有脚本规划，「分镜」称作「视频单元」；恒单集，不给删除
+    expect(screen.queryByRole("tab", { name: "脚本规划" })).not.toBeInTheDocument();
+    expect(screen.getByRole("tab", { name: "视频单元" })).toHaveAttribute("aria-selected", "true");
+    expect(screen.queryByRole("button", { name: "这一集的更多操作" })).not.toBeInTheDocument();
 
-    fireEvent.click(screen.getByText("reference-save-title"));
+    await renameEpisode("新标题");
     await waitFor(() => {
       expect(API.updateEpisode).toHaveBeenCalledWith("demo", 1, { title: "新标题" });
     });
@@ -1236,11 +1302,7 @@ describe("StudioCanvasRouter", () => {
     });
   });
 
-  it("routes the panel's video regenerate to the duration-confirmation flow instead of a dead-end raw toast", async () => {
-    // 视频重生撞上时长档位需要确认时，enqueueVideo 内部对 NarratedVideoDurationError
-    // 选择 rethrow（而不是像其它入队回调那样自己吞掉转成 toast）。面板没有自己的确认
-    // 弹窗——把用户带到承接这套确认流程的单元卡上，并给一句翻译过的提示，而不是把
-    // 供应商侧的裸 message 直接扔出来。
+  it("routes the panel's video regenerate through the storyboard video entry", async () => {
     const projectData = makeProjectData();
     useProjectsStore.setState({
       currentProjectName: "demo",
@@ -1251,44 +1313,16 @@ describe("StudioCanvasRouter", () => {
       project: projectData,
       scripts: { "episode_1.json": makeScript() },
     });
-    vi.spyOn(API, "generateVideo").mockRejectedValue(
-      new NarratedVideoDurationError({
-        allowed: false,
-        kind: "narrated_video_duration",
-        unit_id: "SEG-1",
-        narration_delivery: {},
-        planned_duration: 4,
-        duration_input: 6.2,
-        request_duration: 8,
-        adjustment: "up",
-        problems: [
-          {
-            code: "reference_duration_confirmation_required",
-            blocking: true,
-            unit_id: "SEG-1",
-            locations: [{ path: ["duration_seconds"], line: null }],
-            params: { duration_input: 6.2, request_duration: 8 },
-            reason: "request_duration_uses_different_tier",
-            action: "confirm_duration",
-            message: "本次时长基准 6.2s 将按 8s 档位生成，请确认后重试",
-          },
-        ],
-      }),
-    );
+    vi.spyOn(API, "generateVideo").mockRejectedValue(new Error("provider down"));
 
     renderAt("/episodes/1");
 
     fireEvent.click(screen.getByText("workflow-regenerate-video"));
     await waitFor(() => {
       expect(useAppStore.getState().toast?.tone).toBe("error");
-      // 断言的是翻译过的引导文案本身，不是"不包含供应商原始 message"这个弱条件——
-      // 空文本、错译 key 或无关错误文本都得挡在这条断言之外。
-      expect(useAppStore.getState().toast?.text).toBe(
-        "本次申请时长需要先确认档位，已为你定位到对应分镜",
-      );
+      expect(useAppStore.getState().toast?.text).toBe("生成视频失败：provider down");
     });
-    expect(useAppStore.getState().scrollTarget?.id).toBe("SEG-1");
-    expect(useAppStore.getState().scrollTarget?.type).toBe("segment");
+    expect(API.generateVideo).toHaveBeenCalledWith("demo", "SEG-1", "video prompt", "episode_1.json", 4);
   });
 
   it("withholds the panel's regenerate entry on the reference route instead of wiring a dead button", async () => {
@@ -1398,13 +1432,13 @@ describe("StudioCanvasRouter", () => {
 
     fireEvent.click(screen.getByText("generate-character"));
     await waitFor(() => {
-      expect(API.generateCharacter).toHaveBeenCalledWith("demo", "Hero", "hero description");
+      expect(API.generateCharacter).toHaveBeenCalledWith("demo", "Hero");
       expect(useAppStore.getState().toast?.text).toContain("提交失败");
       expect(useAppStore.getState().toast?.tone).toBe("error");
     });
   });
 
-  it("saves the episode title and shows a success toast", async () => {
+  it("saves the episode title from the page header without a success toast", async () => {
     useProjectsStore.setState({
       currentProjectName: "demo",
       currentProjectData: makeProjectData(),
@@ -1419,16 +1453,77 @@ describe("StudioCanvasRouter", () => {
 
     renderAt("/episodes/1");
 
-    // script_file 存在 → 标题可编辑入口透传为 true
-    expect(screen.getByTestId("timeline-can-edit-title")).toHaveTextContent("yes");
-
-    fireEvent.click(screen.getByText("save-title"));
+    await renameEpisode("新标题");
     await waitFor(() => {
       expect(API.updateEpisode).toHaveBeenCalledWith("demo", 1, { title: "新标题" });
       expect(API.getProject).toHaveBeenCalled();
-      expect(useAppStore.getState().toast?.text).toContain("分集标题已更新");
-      expect(useAppStore.getState().toast?.tone).toBe("success");
     });
+    // 即时生效的修改成功不提示，标题回到展示态
+    await waitFor(() => expect(screen.queryByRole("textbox", { name: "编辑分集标题" })).not.toBeInTheDocument());
+    expect(useAppStore.getState().toast).toBeNull();
+  });
+
+  it("leaves the edit state and warns when the refresh after saving the title fails", async () => {
+    useProjectsStore.setState({
+      currentProjectName: "demo",
+      currentProjectData: makeProjectData(),
+      currentScripts: { "episode_1.json": makeScript() },
+    });
+    vi.spyOn(API, "getProject").mockRejectedValue(new Error("network down"));
+    vi.spyOn(API, "updateEpisode").mockResolvedValue({ success: true });
+
+    renderAt("/episodes/1");
+
+    await renameEpisode("新标题");
+    await waitFor(() =>
+      expect(useAppStore.getState().toast).toMatchObject({ text: REFRESH_FAILED, tone: "warning" }),
+    );
+    // 标题已保存，不停在编辑态引人重复提交
+    await waitFor(() => expect(screen.queryByRole("textbox", { name: "编辑分集标题" })).not.toBeInTheDocument());
+  });
+
+  it.each(["restore-character", "reload-character"])(
+    "%s warns and reports not-synced when the refresh after the write fails",
+    async (button) => {
+      useProjectsStore.setState({
+        currentProjectName: "demo",
+        currentProjectData: makeProjectData(),
+        currentScripts: { "episode_1.json": makeScript() },
+      });
+      vi.spyOn(API, "getProject").mockRejectedValue(new Error("network down"));
+
+      renderAt("/characters");
+
+      fireEvent.click(screen.getByText(button));
+      await waitFor(() => expect(screen.getByText(button)).toHaveAttribute("data-result", "false"));
+      expect(useAppStore.getState().toast).toMatchObject({ text: REFRESH_FAILED, tone: "warning" });
+    },
+  );
+
+  it("drops an unsaved title draft when switching to another episode", async () => {
+    useProjectsStore.setState({
+      currentProjectName: "demo",
+      currentProjectData: makeProjectData({
+        episodes: [
+          { episode: 1, title: "EP1", script_file: "scripts/episode_1.json", script_status: "generated" },
+          { episode: 2, title: "EP2", script_file: "scripts/episode_2.json", script_status: "generated" },
+        ],
+      }),
+      currentScripts: { "episode_1.json": makeScript(), "episode_2.json": makeScript() },
+    });
+    const { hook, searchHook, navigate } = memoryLocation({ path: "/episodes/1" });
+    render(
+      <Router hook={hook} searchHook={searchHook}>
+        <StudioCanvasRouter />
+      </Router>,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "编辑分集标题" }));
+    fireEvent.change(screen.getByRole("textbox", { name: "编辑分集标题" }), { target: { value: "写给第一集的标题" } });
+    act(() => navigate("/episodes/2"));
+
+    expect(screen.queryByRole("textbox", { name: "编辑分集标题" })).not.toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "EP2" })).toBeInTheDocument();
   });
 
   it("reports episode title update failure with an error toast", async () => {
@@ -1446,23 +1541,42 @@ describe("StudioCanvasRouter", () => {
 
     renderAt("/episodes/1");
 
-    fireEvent.click(screen.getByText("save-title"));
+    await renameEpisode("新标题");
     await waitFor(() => {
       expect(API.updateEpisode).toHaveBeenCalledWith("demo", 1, { title: "新标题" });
       expect(useAppStore.getState().toast?.text).toContain("更新分集标题失败");
       expect(useAppStore.getState().toast?.tone).toBe("error");
     });
+    // 失败时保持编辑态，输入不丢
+    expect(screen.getByRole("textbox", { name: "编辑分集标题" })).toHaveValue("新标题");
+  });
+
+  it("hides narration generation entries for post-production projects", () => {
+    useProjectsStore.setState({
+      currentProjectName: "demo",
+      currentProjectData: makeProjectData({ narration_delivery: "post_production" }),
+      currentScripts: { "episode_1.json": makeScript() },
+    });
+    vi.spyOn(API, "getProject").mockResolvedValue({
+      project: makeProjectData({ narration_delivery: "post_production" }),
+      scripts: { "episode_1.json": makeScript() },
+    });
+
+    renderAt("/episodes/1");
+
+    expect(screen.queryByText("generate-narration")).not.toBeInTheDocument();
+    expect(screen.queryByText("generate-episode-narration")).not.toBeInTheDocument();
   });
 
   it("submits narration generation and shows a success toast", async () => {
     useProjectsStore.setState({
       currentProjectName: "demo",
-      currentProjectData: makeProjectData(),
+      currentProjectData: makeProjectData({ narration_delivery: "use_tts" }),
       currentScripts: { "episode_1.json": makeScript() },
     });
 
     vi.spyOn(API, "getProject").mockResolvedValue({
-      project: makeProjectData(),
+      project: makeProjectData({ narration_delivery: "use_tts" }),
       scripts: { "episode_1.json": makeScript() },
     });
     vi.spyOn(API, "generateNarrationAudio").mockResolvedValue({
@@ -1485,12 +1599,12 @@ describe("StudioCanvasRouter", () => {
   it("reports narration generation failure with an error toast", async () => {
     useProjectsStore.setState({
       currentProjectName: "demo",
-      currentProjectData: makeProjectData(),
+      currentProjectData: makeProjectData({ narration_delivery: "use_tts" }),
       currentScripts: { "episode_1.json": makeScript() },
     });
 
     vi.spyOn(API, "getProject").mockResolvedValue({
-      project: makeProjectData(),
+      project: makeProjectData({ narration_delivery: "use_tts" }),
       scripts: { "episode_1.json": makeScript() },
     });
     vi.spyOn(API, "generateNarrationAudio").mockRejectedValue(new Error("tts failed"));
@@ -1507,12 +1621,12 @@ describe("StudioCanvasRouter", () => {
   it("submits episode narration batch and reports the submitted count", async () => {
     useProjectsStore.setState({
       currentProjectName: "demo",
-      currentProjectData: makeProjectData(),
+      currentProjectData: makeProjectData({ narration_delivery: "use_tts" }),
       currentScripts: { "episode_1.json": makeScript() },
     });
 
     vi.spyOn(API, "getProject").mockResolvedValue({
-      project: makeProjectData(),
+      project: makeProjectData({ narration_delivery: "use_tts" }),
       scripts: { "episode_1.json": makeScript() },
     });
     vi.spyOn(API, "generateEpisodeNarrationAudio").mockResolvedValue({
@@ -1536,12 +1650,12 @@ describe("StudioCanvasRouter", () => {
   it("tells the user when episode narration has nothing missing", async () => {
     useProjectsStore.setState({
       currentProjectName: "demo",
-      currentProjectData: makeProjectData(),
+      currentProjectData: makeProjectData({ narration_delivery: "use_tts" }),
       currentScripts: { "episode_1.json": makeScript() },
     });
 
     vi.spyOn(API, "getProject").mockResolvedValue({
-      project: makeProjectData(),
+      project: makeProjectData({ narration_delivery: "use_tts" }),
       scripts: { "episode_1.json": makeScript() },
     });
     vi.spyOn(API, "generateEpisodeNarrationAudio").mockResolvedValue({
@@ -1564,7 +1678,7 @@ describe("StudioCanvasRouter", () => {
   it("blocks narration generation when no audio provider is configured", async () => {
     useProjectsStore.setState({
       currentProjectName: "demo",
-      currentProjectData: makeProjectData(),
+      currentProjectData: makeProjectData({ narration_delivery: "use_tts" }),
       currentScripts: { "episode_1.json": makeScript() },
     });
     useConfigStatusStore.setState({
@@ -1573,7 +1687,7 @@ describe("StudioCanvasRouter", () => {
     });
 
     vi.spyOn(API, "getProject").mockResolvedValue({
-      project: makeProjectData(),
+      project: makeProjectData({ narration_delivery: "use_tts" }),
       scripts: { "episode_1.json": makeScript() },
     });
     const generateSpy = vi.spyOn(API, "generateNarrationAudio");
@@ -1611,7 +1725,7 @@ describe("StudioCanvasRouter", () => {
     });
   });
 
-  it("preserves the grid video promise for duration confirmation", async () => {
+  it("submits the grid video without any narration delivery choice", async () => {
     const projectData = makeProjectData({ generation_mode: "storyboard", grid_storyboard: true });
     useProjectsStore.setState({
       currentProjectName: "demo",
@@ -1622,31 +1736,12 @@ describe("StudioCanvasRouter", () => {
       project: projectData,
       scripts: { "episode_1.json": makeScript() },
     });
-    vi.spyOn(API, "generateVideo").mockRejectedValue(
-      new NarratedVideoDurationError({
-        allowed: false,
-        kind: "narrated_video_duration",
-        unit_id: "SEG-1",
-        narration_delivery: {},
-        planned_duration: 4,
-        duration_input: 6.2,
-        request_duration: 8,
-        adjustment: "up",
-        problems: [
-          {
-            code: "reference_duration_confirmation_required",
-            blocking: true,
-            unit_id: "SEG-1",
-            locations: [{ path: ["duration_seconds"], line: null }],
-            params: { duration_input: 6.2, request_duration: 8 },
-            reason: "request_duration_uses_different_tier",
-            action: "confirm_duration",
-            message: "本次时长基准 6.2s 将按 8s 档位生成，请确认后重试",
-          },
-        ],
-      }),
-    );
-    vi.spyOn(console, "error").mockImplementation(() => {});
+    vi.spyOn(API, "generateVideo").mockResolvedValue({
+      success: true,
+      task_id: "t-v",
+      deduped: false,
+      message: "已提交",
+    });
 
     renderAt("/episodes/1");
 
@@ -1654,7 +1749,7 @@ describe("StudioCanvasRouter", () => {
     fireEvent.click(button);
 
     await waitFor(() => {
-      expect(button).toHaveAttribute("data-video-result", "NarratedVideoDurationError");
+      expect(button).toHaveAttribute("data-video-result", "resolved");
     });
     expect(API.generateVideo).toHaveBeenCalledWith(
       "demo",
@@ -1662,7 +1757,6 @@ describe("StudioCanvasRouter", () => {
       "video prompt",
       "episode_1.json",
       4,
-      { narration_delivery: "use_tts" },
     );
   });
 
@@ -1682,6 +1776,7 @@ describe("StudioCanvasRouter", () => {
       grid_ids: ["grid-1"],
       task_ids: ["t-1"],
       task_ids_by_grid: { "grid-1": "t-1" },
+      unsplit_grid_ids: [],
       deduped: false,
       message: "已提交",
     });
@@ -1714,6 +1809,7 @@ describe("StudioCanvasRouter", () => {
       grid_ids: [],
       task_ids: [],
       task_ids_by_grid: {},
+      unsplit_grid_ids: [],
       deduped: false,
       message: "已提交 0 个多宫格分镜生成任务",
     });

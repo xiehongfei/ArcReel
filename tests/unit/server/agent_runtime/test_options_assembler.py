@@ -9,19 +9,22 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 from pathlib import Path
 from unittest.mock import patch
 
 import pytest
 
-from lib.agent_memory_paths import project_memory_dir, user_memory_dir
+from lib.agent.agent_memory_paths import project_memory_dir
 from lib.db.base import DEFAULT_USER_ID
+from lib.infra.data_root_layout import DataRootLayout
 from server.agent_runtime.agent_access_policy import AgentAccessPolicy
 from server.agent_runtime.options_assembler import (
     CLI_STDOUT_MAX_BUFFER_BYTES,
     OptionsAssembler,
     load_provider_env_overrides,
 )
+from server.agent_toolset.toolset import ARCREEL_MCP_TOOL_IDS
 from server.auth import verify_token
 from tests.fakes import blocking_file_read_gate
 
@@ -32,9 +35,8 @@ _SETTING_SOURCES = ["project"]
 def _make_policy(tmp_path: Path, *, sandbox_enabled: bool = True) -> AgentAccessPolicy:
     return AgentAccessPolicy(
         project_root=(tmp_path / "repo").resolve(),
-        projects_root=(tmp_path / "projects").resolve(),
+        data_root=(tmp_path / "projects").resolve(),
         agent_profile_root=(tmp_path / "profile").resolve(),
-        log_dir=(tmp_path / "logs").resolve(),
         sandbox_enabled=sandbox_enabled,
         in_docker=False,
     )
@@ -53,7 +55,7 @@ def _make_assembler(
     (projects_root / "demo").mkdir(exist_ok=True)
     resolved_policy = policy or _make_policy(tmp_path)
     return OptionsAssembler(
-        projects_root=projects_root,
+        data_root=projects_root,
         allowed_tools=_ALLOWED_TOOLS,
         setting_sources=_SETTING_SOURCES,
         access_policy_provider=lambda: resolved_policy,
@@ -166,8 +168,8 @@ async def test_build_adds_keep_alive_hook_with_can_use_tool(tmp_path: Path) -> N
 
     pre_without = without.hooks["PreToolUse"][0].hooks
     pre_with = with_cut.hooks["PreToolUse"][0].hooks
-    assert len(pre_without) == 1
-    assert len(pre_with) == 2
+    assert len(pre_without) == 2
+    assert len(pre_with) == 3
     assert pre_with[0] is assembler._keep_stream_open_hook
 
 
@@ -305,7 +307,7 @@ async def test_build_settings_redirects_auto_memory_to_project_memory_dir(tmp_pa
 async def test_append_prompt_carries_user_memory_dir_and_index(tmp_path: Path) -> None:
     """用户记忆段给出目录绝对路径、两级分流规则与索引全文。"""
     assembler = _make_assembler(tmp_path)
-    memory_dir = user_memory_dir((tmp_path / "projects").resolve(), DEFAULT_USER_ID)
+    memory_dir = DataRootLayout((tmp_path / "projects").resolve()).user_memory_dir(DEFAULT_USER_ID)
     memory_dir.mkdir(parents=True)
     (memory_dir / "MEMORY.md").write_text("- [配音偏好](voice.md) — 固定用女声\n", encoding="utf-8")
 
@@ -323,7 +325,7 @@ async def test_append_prompt_carries_user_memory_dir_and_index(tmp_path: Path) -
 async def test_append_prompt_omits_index_when_user_memory_absent(tmp_path: Path) -> None:
     """目录不存在：段落照给（Agent 要知道该往哪写），索引要点省略，且不建目录。"""
     assembler = _make_assembler(tmp_path)
-    memory_dir = user_memory_dir((tmp_path / "projects").resolve(), DEFAULT_USER_ID)
+    memory_dir = DataRootLayout((tmp_path / "projects").resolve()).user_memory_dir(DEFAULT_USER_ID)
 
     prompt = await assembler._build_append_prompt("demo")
 
@@ -336,7 +338,7 @@ async def test_append_prompt_omits_index_when_user_memory_absent(tmp_path: Path)
 async def test_append_prompt_omits_index_when_user_memory_index_blank(tmp_path: Path) -> None:
     """索引存在但只有空白：省略索引要点，不注入一段空索引。"""
     assembler = _make_assembler(tmp_path)
-    memory_dir = user_memory_dir((tmp_path / "projects").resolve(), DEFAULT_USER_ID)
+    memory_dir = DataRootLayout((tmp_path / "projects").resolve()).user_memory_dir(DEFAULT_USER_ID)
     memory_dir.mkdir(parents=True)
     (memory_dir / "MEMORY.md").write_text("\n   \n", encoding="utf-8")
 
@@ -350,7 +352,7 @@ async def test_append_prompt_omits_index_when_user_memory_index_blank(tmp_path: 
 async def test_append_prompt_truncates_user_memory_index_over_line_limit(tmp_path: Path) -> None:
     """索引超 200 行：只注入前 200 行并附超限提示。"""
     assembler = _make_assembler(tmp_path)
-    memory_dir = user_memory_dir((tmp_path / "projects").resolve(), DEFAULT_USER_ID)
+    memory_dir = DataRootLayout((tmp_path / "projects").resolve()).user_memory_dir(DEFAULT_USER_ID)
     memory_dir.mkdir(parents=True)
     (memory_dir / "MEMORY.md").write_text("\n".join(f"- 第 {i} 条" for i in range(300)), encoding="utf-8")
 
@@ -365,7 +367,7 @@ async def test_append_prompt_truncates_user_memory_index_over_line_limit(tmp_pat
 async def test_append_prompt_truncates_user_memory_index_over_byte_limit(tmp_path: Path) -> None:
     """索引行数不超但字节超 25 000：按最后一个换行截断并附超限提示。"""
     assembler = _make_assembler(tmp_path)
-    memory_dir = user_memory_dir((tmp_path / "projects").resolve(), DEFAULT_USER_ID)
+    memory_dir = DataRootLayout((tmp_path / "projects").resolve()).user_memory_dir(DEFAULT_USER_ID)
     memory_dir.mkdir(parents=True)
     # 10 行 × 每行 3 000 余字节（中文 3 字节/字）≈ 30 KB，行数远在 200 以内
     index = "\n".join(f"- 第 {i} 条：" + "记" * 1000 for i in range(10))
@@ -383,7 +385,7 @@ async def test_append_prompt_truncates_user_memory_index_over_byte_limit(tmp_pat
 async def test_append_prompt_omits_index_when_user_memory_index_not_utf8(tmp_path: Path) -> None:
     """索引不是 UTF-8（用户用别的编码存回）：省略索引要点，会话照常装配。"""
     assembler = _make_assembler(tmp_path)
-    memory_dir = user_memory_dir((tmp_path / "projects").resolve(), DEFAULT_USER_ID)
+    memory_dir = DataRootLayout((tmp_path / "projects").resolve()).user_memory_dir(DEFAULT_USER_ID)
     memory_dir.mkdir(parents=True)
     (memory_dir / "MEMORY.md").write_bytes("- [配音偏好](voice.md) — 固定用女声\n".encode("gbk"))
 
@@ -402,3 +404,62 @@ async def test_append_prompt_omits_user_memory_for_invalid_user_id(tmp_path: Pat
 
     assert "## 用户记忆" not in prompt
     assert "## 语言规范" in prompt
+
+
+#: 内置工具：只读三件之外，涵盖写文件、跑命令、派生子会话、联网与提问。
+_BUILTIN_TOOLS = (
+    "Read",
+    "Glob",
+    "Grep",
+    "Write",
+    "Edit",
+    "NotebookEdit",
+    "Bash",
+    "BashOutput",
+    "KillBash",
+    "Task",
+    "Agent",
+    "Skill",
+    "WebFetch",
+    "WebSearch",
+    "TodoWrite",
+    "AskUserQuestion",
+)
+
+#: 审片子智能体能调用的全部工具：只看素材、读项目文件。
+_REVIEW_FOOTAGE_TOOLS = {"Read", "Glob", "Grep", "mcp__arcreel__inspect_video_units"}
+
+
+async def _denied_by_pre_tool_use(options, tool_name: str, **context: str) -> bool:
+    """按 SDK 的做法把一次调用依次交给匹配的 PreToolUse hook，任一 hook 拒绝即拒绝。"""
+
+    payload = {"hook_event_name": "PreToolUse", "tool_name": tool_name, "tool_input": {}, **context}
+    for matcher in options.hooks["PreToolUse"]:
+        if matcher.matcher is not None and not re.fullmatch(matcher.matcher, tool_name):
+            continue
+        for hook in matcher.hooks:
+            output = await hook(payload, "toolu_1", None)
+            if (output.get("hookSpecificOutput") or {}).get("permissionDecision") == "deny":
+                return True
+    return False
+
+
+@pytest.mark.asyncio
+async def test_review_footage_subagent_cannot_call_any_tool_beyond_reading(tmp_path: Path) -> None:
+    """审片子智能体只能看素材与读文件：任何写入、命令、派生与其余 ArcReel 工具都在 PreToolUse 被拒。"""
+
+    async def fake_loader():
+        return {}
+
+    options = await _make_assembler(tmp_path, provider_env_loader=fake_loader).build("demo")
+    every_tool = [*_BUILTIN_TOOLS, *(f"mcp__arcreel__{tool_id}" for tool_id in ARCREEL_MCP_TOOL_IDS)]
+    reviewer = {"agent_type": "review-footage", "agent_id": "agent-1"}
+
+    allowed = {tool for tool in every_tool if not await _denied_by_pre_tool_use(options, tool, **reviewer)}
+
+    assert allowed == _REVIEW_FOOTAGE_TOOLS
+    for writer in ("Write", "Edit", "Bash", "mcp__arcreel__edit_timeline", "mcp__arcreel__select_video_version"):
+        assert not await _denied_by_pre_tool_use(options, writer), f"主对话的 {writer} 不受审片名单约束"
+        assert not await _denied_by_pre_tool_use(options, writer, agent_type="generate-assets", agent_id="agent-2"), (
+            f"其他子智能体的 {writer} 不受审片名单约束"
+        )

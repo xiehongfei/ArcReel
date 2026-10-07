@@ -7,11 +7,11 @@
  * 省略表示不要求特定路由。
  *
  * 全程 12 步，跨三个页面：大厅段（欢迎 → 新建项目入口 → 设置入口）→ 设置页段（供应商
- * → Agent）→ 回大厅（演示卡，进工作台的桥）→ 演示工作台段（项目概览 → Agent →
- * 角色/场景/道具 → 剧集分镜 → 导出）→ 收尾。每一次换页都由上一步高亮的入口提供动机：
+ * → ArcReel Agent）→ 回大厅（演示卡，进工作台的桥）→ 演示工作台段（Agent → 项目概览 →
+ * 角色/场景/道具 → 分镜 → 导出）→ 收尾。Agent 面板默认展开、位置最显眼，工作台段先讲它。每一次换页都由上一步高亮的入口提供动机：
  * 设置图标讲完进设置页，演示卡讲完进工作台，不存在没有来路的跳转。
  *
- * 步骤文案里指路用的名字（「供应商」「Agent」等）一律取被高亮元素在界面上的实际标签，
+ * 步骤文案里指路用的名字（「供应商」「ArcReel Agent」等）一律取被高亮元素在界面上的实际标签，
  * 不另造概念——用户照着文案在界面上找得到，才算指对了路。
  *
  * 工作台段落在演示项目的只读工作台上（`demo-project.ts`）。第 6 步的演示卡是
@@ -23,7 +23,14 @@
  */
 
 import type { TFunction } from "i18next";
-import { ROUTE_APP_PROJECTS, ROUTE_APP_SETTINGS, WORKSPACE_ROUTE_CHARACTERS, WORKSPACE_ROUTE_EPISODES } from "@/app-routes";
+import {
+  ROUTE_APP_PROJECTS,
+  ROUTE_APP_SETTINGS,
+  EPISODE_VIEW_PARAM,
+  WORKSPACE_ROUTE_CHARACTERS,
+  WORKSPACE_ROUTE_EPISODES,
+  type SettingsSection,
+} from "@/app-routes";
 import { ONBOARDING_ANCHORS } from "./anchors";
 import { DEMO_PROJECT_NAME, DEMO_SCRIPTED_EPISODE } from "./demo-project";
 import type { TourStep } from "./tour";
@@ -55,15 +62,15 @@ export function buildTourSteps(t: TFunction<"onboarding">): TourStep[] {
       route: ROUTE_APP_SETTINGS,
       // 设置页的内容区由 `section` 查询参数驱动（`SystemConfigPage`），锚点只在侧栏
       // 入口上——不声明查询参数的话，两步之间内容区不会跟着切，讲 Agent 时右边还摆着
-      // 供应商。取值须与 `SystemConfigPage` 的 SettingsSection id 一致。
-      query: { section: "providers" },
+      // 供应商。
+      query: { section: "providers" satisfies SettingsSection },
     },
     {
       anchor: ONBOARDING_ANCHORS.settingsAgent,
       title: t("settings_agent_title"),
       body: t("settings_agent_body"),
       route: ROUTE_APP_SETTINGS,
-      query: { section: "agent" },
+      query: { section: "arcreel-agent" satisfies SettingsSection },
     },
     {
       anchor: ONBOARDING_ANCHORS.lobbyDemoCard,
@@ -79,16 +86,16 @@ export function buildTourSteps(t: TFunction<"onboarding">): TourStep[] {
       interactiveTarget: DEMO_WORKBENCH,
     },
     {
-      anchor: ONBOARDING_ANCHORS.workbenchOverview,
-      title: t("workbench_overview_title"),
-      body: t("workbench_overview_body"),
-      route: DEMO_WORKBENCH,
-    },
-    {
       anchor: ONBOARDING_ANCHORS.workbenchAgent,
       title: t("workbench_agent_title"),
       body: t("workbench_agent_body"),
-      // Agent 面板挂在工作台布局壳上，所有工作台路由都渲染；留在概览页讲，省一次导航。
+      // Agent 面板挂在工作台外壳上，所有工作台路由都渲染；落在概览页讲，下一步不必导航。
+      route: DEMO_WORKBENCH,
+    },
+    {
+      anchor: ONBOARDING_ANCHORS.workbenchOverview,
+      title: t("workbench_overview_title"),
+      body: t("workbench_overview_body"),
       route: DEMO_WORKBENCH,
     },
     {
@@ -102,6 +109,8 @@ export function buildTourSteps(t: TFunction<"onboarding">): TourStep[] {
       title: t("workbench_timeline_title"),
       body: t("workbench_timeline_body"),
       route: DEMO_EPISODE,
+      // 集页的视图记在 `view` 查询参数上，显式落到分镜视图，锚点挂在分镜视图主体上。
+      query: { [EPISODE_VIEW_PARAM]: "board" },
     },
     {
       anchor: ONBOARDING_ANCHORS.workbenchExport,

@@ -5,6 +5,7 @@ from unittest.mock import patch
 
 import pytest
 
+from lib.infra.data_root_layout import DataRootLayout
 from server.agent_runtime.session_manager import SessionManager
 
 
@@ -27,7 +28,7 @@ async def _fake_provider_env():
 class TestSessionManagerProjectScope:
     @pytest.mark.asyncio
     async def test_build_options_uses_project_directory_as_cwd(self, tmp_path, monkeypatch, meta_store):
-        project_dir = tmp_path / "projects" / "demo"
+        project_dir = DataRootLayout(tmp_path / "projects").projects_dir / "demo"
         project_dir.mkdir(parents=True)
         manager = SessionManager(
             project_root=tmp_path,
@@ -68,7 +69,7 @@ class TestSessionManagerProjectScope:
     @pytest.mark.asyncio
     async def test_build_options_always_adds_file_access_hook(self, tmp_path, monkeypatch, meta_store):
         """File access hook is always registered, even without can_use_tool."""
-        project_dir = tmp_path / "projects" / "demo"
+        project_dir = DataRootLayout(tmp_path / "projects").projects_dir / "demo"
         project_dir.mkdir(parents=True)
         manager = SessionManager(
             project_root=tmp_path,
@@ -93,14 +94,14 @@ class TestSessionManagerProjectScope:
         assert "PreToolUse" in hooks
         matcher = hooks["PreToolUse"][0]
         assert matcher.matcher is None
-        # Without can_use_tool: only file_access_hook
-        assert len(matcher.hooks) == 1
+        # Without can_use_tool: subagent tool allowlist + file_access_hook
+        assert len(matcher.hooks) == 2
         assert matcher.hooks[0] is not manager._options_assembler._keep_stream_open_hook
 
     @pytest.mark.asyncio
     async def test_build_options_with_can_use_tool_adds_keep_alive_hook(self, tmp_path, monkeypatch, meta_store):
-        """With can_use_tool: keep_stream_open + file_access hooks."""
-        project_dir = tmp_path / "projects" / "demo"
+        """With can_use_tool: keep_stream_open + subagent tool allowlist + file_access hooks."""
+        project_dir = DataRootLayout(tmp_path / "projects").projects_dir / "demo"
         project_dir.mkdir(parents=True)
         manager = SessionManager(
             project_root=tmp_path,
@@ -131,13 +132,13 @@ class TestSessionManagerProjectScope:
         assert "PreToolUse" in hooks
         matcher = hooks["PreToolUse"][0]
         assert matcher.matcher is None
-        assert len(matcher.hooks) == 2
+        assert len(matcher.hooks) == 3
         assert matcher.hooks[0] is manager._options_assembler._keep_stream_open_hook
 
     @pytest.mark.asyncio
     async def test_build_project_context_excludes_mutable_metadata(self, tmp_path, meta_store):
         """Mutable metadata must NOT leak into the session-fixed system prompt."""
-        project_dir = tmp_path / "projects" / "demo"
+        project_dir = DataRootLayout(tmp_path / "projects").projects_dir / "demo"
         project_dir.mkdir(parents=True)
         project_json = project_dir / "project.json"
         project_json.write_text(
@@ -201,7 +202,7 @@ class TestSessionManagerProjectScope:
     @pytest.mark.asyncio
     async def test_build_project_context_emits_block_without_project_json(self, tmp_path, meta_store):
         """Output is independent of project.json: the stable block is emitted even when it is absent."""
-        project_dir = tmp_path / "projects" / "empty"
+        project_dir = DataRootLayout(tmp_path / "projects").projects_dir / "empty"
         project_dir.mkdir(parents=True)
         # No project.json created
 

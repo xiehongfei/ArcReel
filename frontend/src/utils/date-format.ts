@@ -50,3 +50,42 @@ export function formatShortDateTime(value: string | null | undefined): string | 
   const pad = (n: number) => n.toString().padStart(2, "0");
   return `${pad(d.getMonth() + 1)}/${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
 }
+
+const RELATIVE_UNITS: [Intl.RelativeTimeFormatUnit, number][] = [
+  ["day", 86_400_000],
+  ["hour", 3_600_000],
+  ["minute", 60_000],
+];
+
+const JUST_NOW_MS = 60_000;
+
+// 与当前相差不足一分钟（含时钟偏差造成的略晚于当前）算「刚刚」；解析失败返回 false。
+// 「刚刚」要嵌进整句话，措辞因句子而异，由调用方各自选文案，不交给 Intl 的「现在」。
+export function isJustNow(value: string | null | undefined, now: number = Date.now()): boolean {
+  if (!value) return false;
+  const time = parseIsoTimestamp(value).getTime();
+  return !Number.isNaN(time) && Math.abs(time - now) < JUST_NOW_MS;
+}
+
+// 相对当前的粗粒度时间（「3 小时前」），按界面语言成文；不足一分钟交给 Intl 成文（「现在」），解析失败返回 null。
+// 需要「刚刚」的调用方先用 isJustNow 判断。
+export function formatRelativeTime(
+  value: string | null | undefined,
+  lang: string,
+  now: number = Date.now(),
+): string | null {
+  if (!value) return null;
+  const time = parseIsoTimestamp(value).getTime();
+  if (Number.isNaN(time)) return null;
+  const diff = time - now;
+  let fmt: Intl.RelativeTimeFormat;
+  try {
+    fmt = new Intl.RelativeTimeFormat(lang, { numeric: "auto" });
+  } catch {
+    fmt = new Intl.RelativeTimeFormat(undefined, { numeric: "auto" });
+  }
+  for (const [unit, ms] of RELATIVE_UNITS) {
+    if (Math.abs(diff) >= ms) return fmt.format(Math.round(diff / ms), unit);
+  }
+  return fmt.format(0, "second");
+}

@@ -27,7 +27,6 @@ function caps(lastFrame: boolean): VideoCapabilities {
       resolution: null,
       uses_reference_images: false,
       allowed: [5, 8],
-      allowed_without_reference_images: [5, 8],
       excluded: {},
     },
   };
@@ -76,6 +75,7 @@ function renderRow(props: Partial<Parameters<typeof EndFrameRow>[0]> = {}) {
 const refreshProject = vi.fn().mockResolvedValue("success" satisfies RefreshProjectResult);
 
 beforeEach(() => {
+  useAppStore.setState({ toast: null });
   vi.spyOn(API, "getVideoCapabilities").mockResolvedValue(caps(true));
   vi.spyOn(API, "listGrids").mockResolvedValue([]);
   useProjectsStore.setState({
@@ -153,6 +153,11 @@ describe("EndFrameRow 能力警告", () => {
     await waitFor(() => {
       expect(clear).toHaveBeenCalledWith(PROJECT, SHOT, SCRIPT);
     });
+    await waitFor(() => {
+      expect(refreshProject).toHaveBeenCalledWith(PROJECT);
+    });
+    // 清除尾帧是即时动作，成功不弹提示
+    expect(useAppStore.getState().toast).toBeNull();
   });
 
   it("模型不支持不禁用写入控件", async () => {
@@ -180,7 +185,7 @@ describe("EndFrameRow 能力警告", () => {
     fireEvent.click(chooseBtn);
 
     // 选图器内部同样不得残留禁用：候选可选、确认可点。
-    const candidate = await findByRole("button", { name: /分镜 E1S01/ });
+    const candidate = await findByRole("button", { name: /分镜 S01/ });
     expect(candidate).toBeEnabled();
     fireEvent.click(candidate);
     const confirmBtn = getByRole("button", { name: "设为尾帧" });
@@ -303,7 +308,7 @@ describe("EndFrameRow 占用态", () => {
     fireEvent.click(getByRole("button", { name: "选择图片" }));
 
     // 选中本集分镜图（项目内通道）
-    fireEvent.click(await findByRole("button", { name: /分镜 E1S01/ }));
+    fireEvent.click(await findByRole("button", { name: /分镜 S01/ }));
 
     // 打开选图器之后该分镜才被入队——只查开窗时刻会漏掉这个窗口
     useTasksStore.setState({ tasks: [videoTask("queued")] });
@@ -323,7 +328,7 @@ describe("EndFrameRow 占用态", () => {
 
     fireEvent.click(getByRole("button", { name: /^尾帧/ }));
     fireEvent.click(getByRole("button", { name: "选择图片" }));
-    fireEvent.click(await findByRole("button", { name: /分镜 E1S01/ }));
+    fireEvent.click(await findByRole("button", { name: /分镜 S01/ }));
     fireEvent.click(getByRole("button", { name: "设为尾帧" }));
 
     await waitFor(() => {
@@ -332,6 +337,8 @@ describe("EndFrameRow 占用态", () => {
     await waitFor(() => {
       expect(refreshProject).toHaveBeenCalledWith(PROJECT);
     });
+    // 设置尾帧是即时动作，成功不弹提示
+    expect(useAppStore.getState().toast).toBeNull();
   });
 
   it("写入成功但刷新项目失败：提示刷新失败而非写入失败", async () => {
@@ -344,7 +351,7 @@ describe("EndFrameRow 占用态", () => {
 
     fireEvent.click(getByRole("button", { name: /^尾帧/ }));
     fireEvent.click(getByRole("button", { name: "选择图片" }));
-    fireEvent.click(await findByRole("button", { name: /分镜 E1S01/ }));
+    fireEvent.click(await findByRole("button", { name: /分镜 S01/ }));
     fireEvent.click(getByRole("button", { name: "设为尾帧" }));
 
     await waitFor(() => {
@@ -362,15 +369,13 @@ describe("EndFrameRow 占用态", () => {
 
     fireEvent.click(getByRole("button", { name: /^尾帧/ }));
     fireEvent.click(getByRole("button", { name: "选择图片" }));
-    fireEvent.click(await findByRole("button", { name: /分镜 E1S01/ }));
+    fireEvent.click(await findByRole("button", { name: /分镜 S01/ }));
     fireEvent.click(getByRole("button", { name: "设为尾帧" }));
 
     await waitFor(() => {
       expect(refreshProject).toHaveBeenCalledWith(PROJECT);
     });
-    // 写入成功的提示保留，不被追加或覆盖为刷新失败提示。
-    expect(useAppStore.getState().toast?.text).not.toMatch(/页面数据刷新失败/);
-    expect(useAppStore.getState().toast?.tone).toBe("success");
+    expect(useAppStore.getState().toast).toBeNull();
   });
 
   it("提交在途状态经 onSubmittingChange 回传父级", async () => {
@@ -387,7 +392,7 @@ describe("EndFrameRow 占用态", () => {
 
     fireEvent.click(getByRole("button", { name: /^尾帧/ }));
     fireEvent.click(getByRole("button", { name: "选择图片" }));
-    fireEvent.click(await findByRole("button", { name: /分镜 E1S01/ }));
+    fireEvent.click(await findByRole("button", { name: /分镜 S01/ }));
     fireEvent.click(getByRole("button", { name: "设为尾帧" }));
 
     await waitFor(() => {

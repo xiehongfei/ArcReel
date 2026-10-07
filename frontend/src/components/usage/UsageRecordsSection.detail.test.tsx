@@ -33,9 +33,8 @@ describe("UsageRecordsSection detail", () => {
 
     renderUsageRecordsSection("section=usage&record=42");
 
-    expect(await screen.findByRole("dialog")).toBeInTheDocument();
+    expect(await screen.findByRole("dialog", { name: /S10\s*未命名集/ })).toBeInTheDocument();
     expect(detail).toHaveBeenCalledWith(42, { signal: expect.any(AbortSignal) });
-    expect(screen.getByText("Record · #42")).toBeInTheDocument();
   });
 
   it("renders every group of a finished text call", async () => {
@@ -64,13 +63,32 @@ describe("UsageRecordsSection detail", () => {
     expect(dialog.getByRole("heading", { name: "调用" })).toBeInTheDocument();
     expect(dialog.getByText("MiniMax")).toBeInTheDocument();
     expect(dialog.getByRole("heading", { name: "产出" })).toBeInTheDocument();
-    expect(dialog.getByText("星海列车/E1S10.txt")).toBeInTheDocument();
+    expect(dialog.getByText("星海列车/S10.txt")).toBeInTheDocument();
     expect(dialog.getByRole("heading", { name: "用量" })).toBeInTheDocument();
     expect(dialog.getByText("150")).toBeInTheDocument();
     expect(dialog.getByText("按你配置的单价估算，只作参考")).toBeInTheDocument();
     expect(
       dialog.getByRole("button", { name: "供应商原始响应" }),
     ).toHaveAttribute("aria-expanded", "false");
+  });
+
+  it("resolves a project-relative image output as a thumbnail", async () => {
+    vi.spyOn(API, "getUsageRecord").mockResolvedValue(
+      makeUsageRecordDetail({
+        id: 42,
+        project_name: "demo",
+        media_type: "image",
+        output_path: "storyboards/scene_E1S10.png",
+      }),
+    );
+
+    renderUsageRecordsSection("section=usage&record=42");
+    const dialog = within(await screen.findByRole("dialog"));
+
+    expect(dialog.getByRole("img", { name: "storyboards/scene_S10.png" })).toHaveAttribute(
+      "src",
+      "/api/v1/files/demo/storyboards/scene_E1S10.png",
+    );
   });
 
   it("renders the production input field names for media calls", async () => {

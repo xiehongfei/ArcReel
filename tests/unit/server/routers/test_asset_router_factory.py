@@ -30,7 +30,7 @@ class _FakePM(FakeProjectAssetMutationMixin):
         self.projects = {"demo": {"characters": {}, "scenes": {}, "props": {}, "products": {}}}
 
     def _add_asset(self, asset_type, project_name, name, entry):
-        from lib.asset_types import ASSET_SPECS, ensure_project_asset_name_available
+        from lib.project.asset_types import ASSET_SPECS, ensure_project_asset_name_available
 
         if project_name not in self.projects:
             raise FileNotFoundError(project_name)
@@ -47,8 +47,8 @@ class _FakePM(FakeProjectAssetMutationMixin):
         return self.projects[project_name]
 
     def rename_asset(self, project_name, table, old_name, new_name, *, dry_run=False):
-        from lib.asset_rename import AssetRenameConflictError, AssetRenameNotFoundError, AssetRenameReport
-        from lib.asset_types import resolve_asset_key
+        from lib.project.asset_rename import AssetRenameConflictError, AssetRenameNotFoundError, AssetRenameReport
+        from lib.project.asset_types import resolve_asset_key
 
         if project_name not in self.projects:
             raise FileNotFoundError(project_name)
@@ -69,6 +69,20 @@ class _FakePM(FakeProjectAssetMutationMixin):
             references=5,
             files=3,
             dry_run=dry_run,
+        )
+
+    def preview_asset_deletion(self, project_name, table, name):
+        from lib.project.asset_rename import AssetDeletionPreview, AssetEpisodeReferences
+        from lib.project.asset_types import resolve_asset_key
+
+        key = resolve_asset_key(self.load_project(project_name).get(table), name)
+        if key is None:
+            raise KeyError(name)
+        return AssetDeletionPreview(
+            table=table,
+            name=key,
+            references=3,
+            episodes=(AssetEpisodeReferences(episode=1, references=2), AssetEpisodeReferences(episode=4, references=1)),
         )
 
     def save_project(self, project_name, project):
@@ -207,6 +221,17 @@ class TestAssetRouterFactory:
             entry = fake_pm.projects["demo"]["characters"]["Alice"]
             assert entry["voice_style"] == "strong"
             assert entry["reference_image"] == "characters/refs/Alice.png"
+
+    def test_character_patch_normalizes_aliases(self, monkeypatch):
+        client, fake_pm = _client(monkeypatch)
+        fake_pm.projects["demo"]["characters"]["Alice"] = {"description": "old", "aliases": ["旧称"]}
+        with client:
+            resp = client.patch(
+                "/api/v1/projects/demo/characters/Alice",
+                json={"aliases": [" 阿离 ", "阿离", "Alice", ""]},
+            )
+        assert resp.status_code == 200
+        assert fake_pm.projects["demo"]["characters"]["Alice"]["aliases"] == ["阿离"]
 
     def test_character_patch_rejects_non_string_value(self, monkeypatch):
         client, fake_pm = _client(monkeypatch)
@@ -440,3 +465,23 @@ class TestRenameEndpoint:
         client, _fake_pm = _client(monkeypatch)
         resp = client.post("/api/v1/projects/demo/characters/Bob/rename", json={"new_name": "bad/name"})
         assert resp.status_code == 400
+
+
+class TestDeleteDryRun:
+    """删除端点的 dry_run：只返回按集列出的引用数，资产保留。"""
+
+    def test_dry_run_returns_references_by_episode_and_keeps_the_asset(self, monkeypatch):
+        client, fake_pm = _client(monkeypatch)
+        fake_pm.projects["demo"]["characters"]["Bob"] = {"description": "hero"}
+
+        resp = client.delete("/api/v1/projects/demo/characters/Bob", params={"dry_run": "true"})
+
+        assert resp.status_code == 200
+        assert resp.json() == {
+            "success": True,
+            "dry_run": True,
+            "name": "Bob",
+            "references": 3,
+            "episodes": [{"episode": 1, "references": 2}, {"episode": 4, "references": 1}],
+        }
+        assert "Bob" in fake_pm.projects["demo"]["characters"]

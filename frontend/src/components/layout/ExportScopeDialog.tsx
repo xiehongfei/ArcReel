@@ -1,429 +1,116 @@
-import { useState, useEffect } from "react";
-import {
-  Package,
-  History,
-  Clapperboard,
-  ArrowLeft,
-  Loader2,
-  PackageCheck,
-} from "lucide-react";
-import { GlassPopover } from "@/components/ui/GlassPopover";
-import { PrimaryButton } from "@/components/ui/PrimaryButton";
+import { useState } from "react";
+import { Scissors } from "lucide-react";
 import { useTranslation } from "react-i18next";
-import type { RefObject, ReactNode } from "react";
-import type { EpisodeMeta } from "@/types/project";
-import type { PresentationVariant } from "@/types/presentation";
-import { WARM_TONE } from "@/utils/severity-tone";
+import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
+import {
+  Dialog,
+  DialogBody,
+  DialogClose,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
+import { RadioGroup, RadioGroupItem } from "@/components/ui/radio-group";
 
-export type ExportScope = "current" | "full" | "jianying-draft";
-
-const DRAFT_PATH_STORAGE_KEY = "arcreel_jianying_draft_path";
+export type ExportScope = "current" | "full";
 
 interface ExportScopeDialogProps {
   open: boolean;
   onClose: () => void;
+  /** 点击「导出」时以选中的范围调用；对话框随即关闭，导出进度由调用方展示。 */
   onSelect: (scope: ExportScope) => void;
-  anchorRef: RefObject<HTMLElement | null>;
-  episodes?: EpisodeMeta[];
-  onJianyingExport?: (
-    episode: number,
-    draftPath: string,
-    jianyingVersion: string,
-    narrationDelivery: PresentationVariant,
-  ) => void;
-  jianyingExporting?: boolean;
+  /** 提示里「打开剪辑视图」链接指向的集（集 ID 与集名）；不传或为 null 时只显示提示。 */
+  editViewEpisode?: { episode: number; name: string } | null;
+  onOpenEditView?: (episode: number) => void;
 }
 
+/** 「导出项目」的范围选择：只有项目归档；成片与剪映草稿在各集的剪辑视图中导出。 */
 export function ExportScopeDialog({
   open,
   onClose,
   onSelect,
-  anchorRef,
-  episodes = [],
-  onJianyingExport,
-  jianyingExporting = false,
+  editViewEpisode,
+  onOpenEditView,
 }: ExportScopeDialogProps) {
   const { t } = useTranslation(["dashboard", "common"]);
-  const [mode, setMode] = useState<"select" | "jianying-form">("select");
-  const [selectedEpisode, setSelectedEpisode] = useState<number>(
-    episodes.length > 0 ? episodes[0].episode : 1,
-  );
-  const isWindows =
-    typeof navigator !== "undefined" && navigator.userAgent.includes("Windows");
-  const defaultDraftPath = isWindows
-    ? t("dashboard:draft_path_default_windows")
-    : t("dashboard:draft_path_default_mac");
-  const [draftPath, setDraftPath] = useState<string>(
-    () => localStorage.getItem(DRAFT_PATH_STORAGE_KEY) || defaultDraftPath,
-  );
-  const [jianyingVersion, setJianyingVersion] = useState("6");
-  const [narrationDelivery, setNarrationDelivery] = useState<PresentationVariant>("post_production");
+  const [scope, setScope] = useState<ExportScope>("current");
 
-  useEffect(() => {
-    if (!open) {
-      // eslint-disable-next-line react-hooks/set-state-in-effect -- 弹窗关闭时重置到初始选择界面，是有意的 UI 状态重置
-      setMode("select");
-    }
-  }, [open]);
-
-  useEffect(() => {
-    if (episodes.length > 0) {
-      // eslint-disable-next-line react-hooks/set-state-in-effect -- episodes prop 变化时同步表单默认值，受控拷贝是有意设计
-      setSelectedEpisode(episodes[0].episode);
-    }
-  }, [episodes]);
-
-  const handleJianyingSubmit = () => {
-    if (!draftPath.trim() || !onJianyingExport) return;
-    localStorage.setItem(DRAFT_PATH_STORAGE_KEY, draftPath.trim());
-    onJianyingExport(selectedEpisode, draftPath.trim(), jianyingVersion, narrationDelivery);
-  };
+  const options: { value: ExportScope; title: string; hint: string; recommended?: boolean }[] = [
+    {
+      value: "current",
+      title: t("dashboard:current_version_only"),
+      hint: t("dashboard:small_size_hint"),
+      recommended: true,
+    },
+    { value: "full", title: t("dashboard:all_data"), hint: t("dashboard:full_history_hint") },
+  ];
 
   return (
-    <GlassPopover
+    <Dialog
       open={open}
-      onClose={onClose}
-      anchorRef={anchorRef}
-      sideOffset={8}
-      width="w-[22rem]"
+      onOpenChange={(next) => {
+        if (!next) onClose();
+      }}
+      // 每次打开都回到推荐的范围
+      onOpenChangeComplete={(next) => {
+        if (!next) setScope("current");
+      }}
     >
-      {mode === "select" ? (
-        <div className="px-4 pb-3 pt-3.5">
-          <div className="mb-2.5 flex items-center gap-2">
-            <span
-              aria-hidden
-              className="grid h-7 w-7 place-items-center rounded-lg"
-              style={{
-                background:
-                  "linear-gradient(135deg, var(--color-accent-dim), oklch(0.76 0.09 295 / 0.05))",
-                border: "1px solid var(--color-accent-soft)",
-                color: "var(--color-accent-2)",
-                boxShadow: "0 8px 18px -8px var(--color-accent-glow)",
-              }}
+      <DialogContent size="sm">
+        <DialogHeader>
+          <DialogTitle>{t("dashboard:export_scope_title")}</DialogTitle>
+          <DialogDescription>{t("dashboard:export_scope_description")}</DialogDescription>
+        </DialogHeader>
+        <DialogBody>
+          <div className="flex flex-col gap-4">
+            <RadioGroup
+              aria-label={t("dashboard:export_scope_title")}
+              value={scope}
+              onValueChange={(next) => setScope(next as ExportScope)}
             >
-              <PackageCheck className="h-3.5 w-3.5" />
-            </span>
-            <div className="min-w-0">
-              <div
-                className="display-serif text-[14px] font-semibold tracking-tight"
-                style={{ color: "var(--color-text)" }}
-              >
-                {t("dashboard:export_scope_title")}
-              </div>
-              <div
-                className="num text-[10px] uppercase"
-                style={{
-                  color: "var(--color-text-4)",
-                  letterSpacing: "1.0px",
-                }}
-              >
-                {t("dashboard:eyebrow_export_scope")}
-              </div>
-            </div>
-          </div>
-
-          <div className="flex flex-col gap-2">
-            <ScopeOption
-              icon={<Package className="h-4 w-4" />}
-              title={
-                <span className="inline-flex items-center gap-1.5">
-                  <span>{t("dashboard:current_version_only")}</span>
-                  <span
-                    className="num rounded-[3px] px-1.5 py-px text-[9.5px] uppercase"
-                    style={{
-                      letterSpacing: "0.6px",
-                      color: "var(--color-accent-2)",
-                      background: "var(--color-accent-dim)",
-                      border: "1px solid var(--color-accent-soft)",
-                    }}
-                  >
-                    {t("dashboard:recommended")}
-                  </span>
-                </span>
-              }
-              hint={t("dashboard:small_size_hint")}
-              tone="accent"
-              onClick={() => onSelect("current")}
-            />
-            <ScopeOption
-              icon={<History className="h-4 w-4" />}
-              title={t("dashboard:all_data")}
-              hint={t("dashboard:full_history_hint")}
-              tone="neutral"
-              onClick={() => onSelect("full")}
-            />
-            <ScopeOption
-              icon={<Clapperboard className="h-4 w-4" />}
-              title={t("dashboard:export_jianying_draft")}
-              hint={t("dashboard:generate_jianying_zip_hint")}
-              tone="warm"
-              onClick={() => setMode("jianying-form")}
-            />
-          </div>
-        </div>
-      ) : (
-        <div className="px-4 pb-4 pt-3.5">
-          <div className="mb-3 flex items-center gap-2">
-            <button
-              type="button"
-              onClick={() => setMode("select")}
-              className="arc-close-btn focus-ring grid h-6 w-6 place-items-center rounded-md"
-              aria-label={t("common:back")}
-            >
-              <ArrowLeft className="h-3.5 w-3.5" />
-            </button>
-            <span
-              aria-hidden
-              className="grid h-7 w-7 place-items-center rounded-lg"
-              style={{
-                background:
-                  "linear-gradient(135deg, var(--color-warm-tint), var(--color-warm-tint-faint))",
-                border: `1px solid ${WARM_TONE.ring}`,
-                color: WARM_TONE.color,
-                boxShadow: `0 8px 18px -8px ${WARM_TONE.glow}`,
-              }}
-            >
-              <Clapperboard className="h-3.5 w-3.5" />
-            </span>
-            <div
-              className="display-serif text-[14px] font-semibold tracking-tight"
-              style={{ color: "var(--color-text)" }}
-            >
-              {t("dashboard:export_jianying_draft")}
-            </div>
-          </div>
-          <div className="flex flex-col gap-3">
-            {episodes.length > 1 && (
-              <FormField
-                htmlFor="jianying-episode-select"
-                label={t("dashboard:select_episode")}
-              >
-                <select
-                  id="jianying-episode-select"
-                  value={selectedEpisode}
-                  onChange={(e) => setSelectedEpisode(Number(e.target.value))}
-                  className="focus-ring w-full rounded-md px-2.5 py-1.5 text-[13px] outline-none"
-                  style={{
-                    background: "oklch(0.16 0.010 265 / 0.6)",
-                    border: "1px solid var(--color-hairline)",
-                    color: "var(--color-text)",
-                  }}
+              {options.map((option) => (
+                // eslint-disable-next-line jsx-a11y/label-has-associated-control -- 控件是嵌套的 RadioGroupItem（Base UI 单选），规则识别不到
+                <label
+                  key={option.value}
+                  className="flex cursor-pointer items-start gap-3 rounded-lg border px-3 py-2.5 transition-colors duration-fast hover:bg-muted/50 has-data-checked:border-primary"
                 >
-                  {episodes.map((ep) => (
-                    <option key={ep.episode} value={ep.episode}>
-                      {t("dashboard:episode_with_title", {
-                        episode: ep.episode,
-                        title: ep.title,
-                      })}
-                    </option>
-                  ))}
-                </select>
-              </FormField>
-            )}
-
-            <FormField
-              htmlFor="jianying-presentation-variant"
-              label={t("dashboard:presentation_variant")}
-            >
-              <select
-                id="jianying-presentation-variant"
-                value={narrationDelivery}
-                onChange={(event) => setNarrationDelivery(event.target.value as PresentationVariant)}
-                className="focus-ring w-full rounded-md px-2.5 py-1.5 text-[13px] outline-none"
-                style={{
-                  background: "oklch(0.16 0.010 265 / 0.6)",
-                  border: "1px solid var(--color-hairline)",
-                  color: "var(--color-text)",
-                }}
-              >
-                <option value="post_production">{t("dashboard:presentation_post_production")}</option>
-                <option value="use_tts">{t("dashboard:presentation_use_tts")}</option>
-              </select>
-            </FormField>
-
-            <FormField
-              htmlFor="jianying-version-select"
-              label={t("dashboard:jianying_version")}
-            >
-              <select
-                id="jianying-version-select"
-                value={jianyingVersion}
-                onChange={(e) => setJianyingVersion(e.target.value)}
-                className="focus-ring w-full rounded-md px-2.5 py-1.5 text-[13px] outline-none"
-                style={{
-                  background: "oklch(0.16 0.010 265 / 0.6)",
-                  border: "1px solid var(--color-hairline)",
-                  color: "var(--color-text)",
-                }}
-              >
-                <option value="6">{t("dashboard:jianying_v6_plus")}</option>
-                <option value="5">{t("dashboard:jianying_v5_x")}</option>
-              </select>
-            </FormField>
-
-            <FormField
-              htmlFor="jianying-draft-path"
-              label={t("dashboard:draft_path")}
-              hint={t("dashboard:draft_path_hint")}
-            >
-              <input
-                id="jianying-draft-path"
-                type="text"
-                value={draftPath}
-                onChange={(e) => setDraftPath(e.target.value)}
-                placeholder={t("dashboard:draft_path_placeholder")}
-                className="focus-ring w-full rounded-md px-2.5 py-1.5 text-[13px] outline-none"
-                style={{
-                  background: "oklch(0.16 0.010 265 / 0.6)",
-                  border: "1px solid var(--color-hairline)",
-                  color: "var(--color-text)",
-                  fontFamily: "var(--font-mono)",
-                }}
-              />
-            </FormField>
-
-            <PrimaryButton
-              tone="warm"
-              size="sm"
-              onClick={handleJianyingSubmit}
-              disabled={!draftPath.trim() || jianyingExporting}
-              leadingIcon={
-                jianyingExporting ? (
-                  <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                ) : undefined
-              }
-            >
-              {jianyingExporting
-                ? t("dashboard:exporting")
-                : t("dashboard:export_draft")}
-            </PrimaryButton>
+                  <RadioGroupItem value={option.value} className="mt-0.5" />
+                  <span className="flex min-w-0 flex-col gap-1">
+                    <span className="flex items-center gap-1.5 text-sm font-medium">
+                      {option.title}
+                      {option.recommended && <Badge variant="secondary">{t("dashboard:recommended")}</Badge>}
+                    </span>
+                    <span className="text-xs text-muted-foreground">{option.hint}</span>
+                  </span>
+                </label>
+              ))}
+            </RadioGroup>
+            <div className="flex items-start gap-2 text-xs text-muted-foreground">
+              <Scissors aria-hidden className="mt-0.5 size-3.5 shrink-0" />
+              <div className="flex min-w-0 flex-col items-start gap-1">
+                <p>{t("dashboard:export_renders_moved_hint")}</p>
+                {editViewEpisode && onOpenEditView && (
+                  // 集名可能很长，链接要能换行，不用不换行的 Button
+                  <button
+                    type="button"
+                    onClick={() => onOpenEditView(editViewEpisode.episode)}
+                    className="rounded-sm text-left break-all text-primary underline underline-offset-2 focus-ring"
+                  >
+                    {t("dashboard:export_open_edit_view", { name: editViewEpisode.name })}
+                  </button>
+                )}
+              </div>
+            </div>
           </div>
-        </div>
-      )}
-    </GlassPopover>
-  );
-}
-
-type ScopeTone = "accent" | "neutral" | "warm";
-
-const SCOPE_PALETTE: Record<
-  ScopeTone,
-  { color: string; ring: string; hoverBg: string; hoverBorder: string }
-> = {
-  accent: {
-    color: "var(--color-accent-2)",
-    ring: "var(--color-accent-soft)",
-    hoverBg: "var(--color-accent-dim)",
-    hoverBorder: "var(--color-accent-soft)",
-  },
-  warm: {
-    color: WARM_TONE.color,
-    ring: WARM_TONE.ring,
-    hoverBg: WARM_TONE.soft,
-    hoverBorder: WARM_TONE.ring,
-  },
-  neutral: {
-    color: "var(--color-text-3)",
-    ring: "var(--color-hairline)",
-    hoverBg: "oklch(1 0 0 / 0.04)",
-    hoverBorder: "var(--color-hairline-strong)",
-  },
-};
-
-function ScopeOption({
-  icon,
-  title,
-  hint,
-  tone,
-  onClick,
-}: {
-  icon: ReactNode;
-  title: ReactNode;
-  hint: string;
-  tone: ScopeTone;
-  onClick: () => void;
-}) {
-  const palette = SCOPE_PALETTE[tone];
-
-  return (
-    <button
-      type="button"
-      onClick={onClick}
-      className="focus-ring group flex items-start gap-3 rounded-lg px-3 py-2.5 text-left transition-colors"
-      style={{
-        border: "1px solid var(--color-hairline)",
-        background: "oklch(0.20 0.011 265 / 0.4)",
-      }}
-      onMouseEnter={(e) => {
-        e.currentTarget.style.background = palette.hoverBg;
-        e.currentTarget.style.borderColor = palette.hoverBorder;
-      }}
-      onMouseLeave={(e) => {
-        e.currentTarget.style.background = "oklch(0.20 0.011 265 / 0.4)";
-        e.currentTarget.style.borderColor = "var(--color-hairline)";
-      }}
-    >
-      <span
-        aria-hidden
-        className="mt-0.5 grid h-7 w-7 shrink-0 place-items-center rounded-md"
-        style={{
-          background: "oklch(0.16 0.010 265 / 0.6)",
-          border: `1px solid ${palette.ring}`,
-          color: palette.color,
-        }}
-      >
-        {icon}
-      </span>
-      <div className="min-w-0 flex-1">
-        <div
-          className="text-[13px] font-medium leading-tight"
-          style={{ color: "var(--color-text)" }}
-        >
-          {title}
-        </div>
-        <p
-          className="mt-1 text-[11.5px] leading-[1.5]"
-          style={{ color: "var(--color-text-4)" }}
-        >
-          {hint}
-        </p>
-      </div>
-    </button>
-  );
-}
-
-function FormField({
-  htmlFor,
-  label,
-  hint,
-  children,
-}: {
-  htmlFor: string;
-  label: string;
-  hint?: string;
-  children: ReactNode;
-}) {
-  return (
-    <div>
-      <label
-        htmlFor={htmlFor}
-        className="num mb-1 block text-[10px] uppercase"
-        style={{
-          color: "var(--color-text-4)",
-          letterSpacing: "1.0px",
-        }}
-      >
-        {label}
-      </label>
-      {children}
-      {hint && (
-        <p
-          className="mt-1.5 text-[11px] leading-[1.55]"
-          style={{ color: "var(--color-text-4)" }}
-        >
-          {hint}
-        </p>
-      )}
-    </div>
+        </DialogBody>
+        <DialogFooter>
+          <DialogClose render={<Button variant="outline" />}>{t("common:cancel")}</DialogClose>
+          <Button onClick={() => onSelect(scope)}>{t("dashboard:export_scope_confirm")}</Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
   );
 }

@@ -1,6 +1,6 @@
 /**
  * 步骤大纲的形状：大厅三步（欢迎 + 新建项目 + 设置入口）跨页进设置页两步，回大厅讲演示卡，
- * 再进演示工作台五步，最后落回大厅收尾。
+ * 再进演示工作台五步（Agent → 概览 → 角色、场景与道具 → 分镜 → 导出），最后落回大厅收尾。
  *
  * 锚点名漂移由类型拦，步骤被顺手删掉只有这里拦 —— 收尾气泡里带着「重看引导」的去处，
  * 中间任何一段落地时都不该把它挤掉。`route` 一并断言，跨页步骤的导航目标写错也会在
@@ -9,7 +9,6 @@
 
 import { describe, expect, it } from "vitest";
 import type { TFunction } from "i18next";
-import i18n from "@/i18n";
 import { ROUTE_APP_PROJECTS, ROUTE_APP_SETTINGS } from "@/app-routes";
 import { ONBOARDING_ANCHORS } from "./anchors";
 import { DEMO_PROJECT_NAME, DEMO_SCRIPTED_EPISODE } from "./demo-project";
@@ -30,8 +29,8 @@ describe("buildTourSteps", () => {
       [ONBOARDING_ANCHORS.settingsProviders, "settings_providers_title", ROUTE_APP_SETTINGS],
       [ONBOARDING_ANCHORS.settingsAgent, "settings_agent_title", ROUTE_APP_SETTINGS],
       [ONBOARDING_ANCHORS.lobbyDemoCard, "lobby_demo_title", ROUTE_APP_PROJECTS],
-      [ONBOARDING_ANCHORS.workbenchOverview, "workbench_overview_title", WORKBENCH],
       [ONBOARDING_ANCHORS.workbenchAgent, "workbench_agent_title", WORKBENCH],
+      [ONBOARDING_ANCHORS.workbenchOverview, "workbench_overview_title", WORKBENCH],
       [ONBOARDING_ANCHORS.workbenchLorebook, "workbench_lorebook_title", `${WORKBENCH}/characters`],
       [ONBOARDING_ANCHORS.workbenchTimeline, "workbench_timeline_title", EPISODE],
       [ONBOARDING_ANCHORS.workbenchExport, "workbench_export_title", EPISODE],
@@ -42,15 +41,13 @@ describe("buildTourSteps", () => {
   it("declares the settings section for both settings steps so the content pane follows the tour", () => {
     const settingsSteps = buildTourSteps(t).filter((s) => s.route === ROUTE_APP_SETTINGS);
 
-    expect(settingsSteps.map((s) => s.query)).toEqual([{ section: "providers" }, { section: "agent" }]);
+    expect(settingsSteps.map((s) => s.query)).toEqual([{ section: "providers" }, { section: "arcreel-agent" }]);
   });
 
-  it("mentions external agent access in step 5 without changing the tour shape", () => {
-    const steps = buildTourSteps(i18n.getFixedT("zh", "onboarding"));
+  it("lands the shot step on the board view, where the anchor is mounted", () => {
+    const timeline = buildTourSteps(t).find((s) => s.anchor === ONBOARDING_ANCHORS.workbenchTimeline);
 
-    expect(steps).toHaveLength(12);
-    expect(steps[4].anchor).toBe(ONBOARDING_ANCHORS.settingsAgent);
-    expect(steps[4].body).toContain("外部 agent 接入");
+    expect(timeline?.query).toEqual({ view: "board" });
   });
 
   it("declares the demo card's landing route so the guard can tell 'followed the tour' from 'wandered off'", () => {

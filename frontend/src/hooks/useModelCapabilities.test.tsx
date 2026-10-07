@@ -1,6 +1,6 @@
 import { act, renderHook, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { API } from "@/api";
+import { API, ApiRequestError } from "@/api";
 import { durationOutOfRangeReason, useModelCapabilities } from "@/hooks/useModelCapabilities";
 import { DEMO_PROJECT_NAME } from "@/onboarding/demo-project";
 import { useCapabilitiesStore } from "@/stores/capabilities-store";
@@ -15,7 +15,6 @@ function constraints(overrides: Partial<DurationConstraints> = {}): DurationCons
     resolution: null,
     uses_reference_images: false,
     allowed: [4, 6, 8],
-    allowed_without_reference_images: [4, 6, 8],
     excluded: {},
     ...overrides,
   };
@@ -47,6 +46,13 @@ afterEach(() => {
 });
 
 describe("useModelCapabilities 时长维度", () => {
+  it.each([true, false])("reads the endpoint-fixed flag from the server (%s)", async (fixed) => {
+    vi.spyOn(API, "getVideoCapabilities").mockResolvedValue(caps({ duration_endpoint_fixed: fixed }));
+    const { result } = renderHook(() => useModelCapabilities({ projectName: PROJECT }));
+    await waitFor(() => expect(result.current.loading).toBe(false));
+    expect(result.current.durationEndpointFixed).toBe(fixed);
+  });
+
   it("全集与收窄结果都取服务端值，全集按升序整理", async () => {
     vi.spyOn(API, "getVideoCapabilities").mockResolvedValue(
       caps({
@@ -66,22 +72,21 @@ describe("useModelCapabilities 时长维度", () => {
     expect(result.current.resolvedVideoBackend).toBe("gemini/veo-3");
   });
 
-  it("参考生视频画布用的无参考图档位同样来自服务端", async () => {
+  it("剧本规划档位取服务端的 planning：端点固定时收窄结果为空、规划仍有借用档位", async () => {
     vi.spyOn(API, "getVideoCapabilities").mockResolvedValue(
-      caps({
-        duration_constraints: constraints({
-          uses_reference_images: true,
-          allowed: [8],
-          allowed_without_reference_images: [4, 6, 8],
-          excluded: { "4": "reference", "6": "reference" },
-        }),
-      }),
+      caps({ duration_endpoint_fixed: true, duration_constraints: constraints({ allowed: [], planning: [4, 8] }) }),
     );
-    const { result } = renderHook(() =>
-      useModelCapabilities({ projectName: PROJECT, videoBackend: BACKEND }),
-    );
-    await waitFor(() => expect(result.current.supportedDurations).toEqual([8]));
-    expect(result.current.supportedDurationsWithoutReference).toEqual([4, 6, 8]);
+    const { result } = renderHook(() => useModelCapabilities({ projectName: PROJECT }));
+    await waitFor(() => expect(result.current.loading).toBe(false));
+    expect(result.current.supportedDurations).toEqual([]);
+    expect(result.current.planningDurations).toEqual([4, 8]);
+  });
+
+  it("载荷不带 planning（无项目端点）时剧本规划档位同收窄结果", async () => {
+    vi.spyOn(API, "getVideoCapabilities").mockResolvedValue(caps());
+    const { result } = renderHook(() => useModelCapabilities({ projectName: PROJECT }));
+    await waitFor(() => expect(result.current.loading).toBe(false));
+    expect(result.current.planningDurations).toEqual([4, 6, 8]);
   });
 
   it("查询未落地 / 失败时时长为未知（null），不谎报成空集合", async () => {
@@ -220,6 +225,38 @@ describe("useModelCapabilities 无项目上下文", () => {
     expect(result.current.supportedDurations).toBeNull();
     expect(result.current.loading).toBe(false);
     expect(modelSpy).not.toHaveBeenCalled();
+  });
+});
+
+describe("useModelCapabilities 视频模型可解析性", () => {
+  it("能力闸拒绝候选模型时保留修复指引", async () => {
+    vi.spyOn(API, "getModelVideoCapabilities").mockRejectedValue(
+      new ApiRequestError("请重新选择支持参考生视频的模型", undefined, 400),
+    );
+    const { result } = renderHook(() => useModelCapabilities({ videoBackend: BACKEND, usesReferenceImages: true }));
+    await waitFor(() => expect(result.current.videoModelUnresolved).toBe(true));
+    expect(result.current.videoModelError).toBe("请重新选择支持参考生视频的模型");
+    expect(result.current.resolvedVideoBackend).toBeNull();
+  });
+  it("服务端答复无法解析（422）时标记未解析", async () => {
+    vi.spyOn(API, "getVideoCapabilities").mockRejectedValue(new ApiRequestError("无法解析", undefined, 422));
+    const { result } = renderHook(() => useModelCapabilities({ projectName: PROJECT }));
+    await waitFor(() => expect(result.current.videoModelUnresolved).toBe(true));
+    expect(result.current.resolvedVideoBackend).toBeNull();
+  });
+
+  it("能力已解析时不标记", async () => {
+    vi.spyOn(API, "getVideoCapabilities").mockResolvedValue(caps());
+    const { result } = renderHook(() => useModelCapabilities({ projectName: PROJECT }));
+    await waitFor(() => expect(result.current.loading).toBe(false));
+    expect(result.current.videoModelUnresolved).toBe(false);
+  });
+
+  it("网络等其他失败只算能力未知，不标记未解析", async () => {
+    vi.spyOn(API, "getVideoCapabilities").mockRejectedValue(new TypeError("Failed to fetch"));
+    const { result } = renderHook(() => useModelCapabilities({ projectName: PROJECT }));
+    await waitFor(() => expect(result.current.loading).toBe(false));
+    expect(result.current.videoModelUnresolved).toBe(false);
   });
 });
 

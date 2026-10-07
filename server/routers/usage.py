@@ -4,19 +4,24 @@ API 调用统计路由
 提供调用记录查询和统计摘要接口。
 """
 
+import asyncio
+from collections.abc import Callable, Iterable
 from datetime import UTC, datetime
-from typing import Annotated, Any, Literal
+from typing import Annotated, Any, Literal, cast
 from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, Query
 from pydantic import BaseModel, Field
 
-from lib.api_errors import NotFoundError, UnprocessableError
+from lib.backends.providers import CallStatus, CallType
+from lib.billing.usage_summary import UsageFilterOptions, UsageWindowTooWideError, build_summary
 from lib.db import async_session_factory
 from lib.db.repositories.usage_repo import UsageCursor, UsageCursorError, UsageFilters, UsageRepository, as_utc
-from lib.i18n import Locale, translate_or
-from lib.providers import CallStatus, CallType
-from lib.usage_summary import UsageFilterOptions, UsageWindowTooWideError, build_summary
+from lib.i18n import _, translate_or
+from lib.infra.api_errors import NotFoundError, UnprocessableError
+from lib.project.project_manager import get_project_manager
+from server.i18n import Locale, Translator
+from server.services.project.episode_item_refs import with_episode_item_refs
 
 router = APIRouter()
 _CALL_STATUS_DESCRIPTION = f"状态 ({'/'.join(CallStatus)})"
@@ -27,11 +32,21 @@ _CALL_STATUS_DESCRIPTION = f"状态 ({'/'.join(CallStatus)})"
 # ---------------------------------------------------------------------------
 
 
+class EpisodeItemRef(BaseModel):
+    """条目所属集的标题与播出位置、集内 ID；界面据此显示「标题 · S01」，不显示集 ID。"""
+
+    episode_title: str
+    episode_position: int
+    item_id: str
+
+
 class UsageRecord(BaseModel):
     """一次供应商调用在列表里的投影。``user_id`` 不出现。"""
 
     id: int
     project_name: str
+    # 项目标题；项目已删除、读不到或未设标题时为 None，界面回退到项目名。
+    project_title: str | None = None
     purpose: str | None = None
     task_id: str | None = None
     task_type: str | None = None
@@ -43,6 +58,7 @@ class UsageRecord(BaseModel):
     error_params: Any = None
     error_message: str | None = None
     segment_id: str | None = None
+    segment_ref: EpisodeItemRef | None = None
     output_path: str | None = None
     started_at: str
     finished_at: str | None = None
@@ -103,6 +119,7 @@ def _multi(value: str | None) -> tuple[str, ...]:
 
 @router.get("/usage/records", response_model=UsageRecordPage)
 async def list_usage_records(
+    _t: Translator,
     project_name: str | None = Query(None, description="项目名称；端点试跑记录用空串"),
     provider: str | None = Query(None, description="供应商 id，逗号分隔多选"),
     model: str | None = Query(None, description="模型，逗号分隔多选"),
@@ -134,21 +151,56 @@ async def list_usage_records(
             limit=limit,
             cursor=decoded,
         )
+    page["items"] = await asyncio.to_thread(_present_records, page["items"], _t)
     return UsageRecordPage.model_validate(page)
 
 
+def _with_segment_refs(items: list[dict[str, Any]], translate: Callable[..., str] = _) -> list[dict[str, Any]]:
+    return with_episode_item_refs(
+        items, id_field="segment_id", ref_field="segment_ref", projects=get_project_manager(), translate=translate
+    )
+
+
+def _project_titles(project_names: Iterable[str]) -> dict[str, str]:
+    """项目名 → 标题，只含读得到且标题非空的项目。
+
+    记录按项目名（目录名）落账，界面显示标题。已删除项目的记录挂在墓碑名上，读不到项目，
+    与读取失败、未设标题的项目一样不进映射，由界面回退显示项目名。
+    """
+    projects = get_project_manager()
+    titles: dict[str, str] = {}
+    for name in set(project_names):
+        if not name:
+            continue
+        try:
+            title = projects.load_project(name).get("title")
+        except (OSError, ValueError):
+            continue
+        if isinstance(title, str) and title.strip():
+            titles[name] = title.strip()
+    return titles
+
+
+def _present_records(items: list[dict[str, Any]], translate: Callable[..., str] = _) -> list[dict[str, Any]]:
+    titles = _project_titles(item["project_name"] for item in items)
+    return [
+        {**item, "project_title": titles.get(item["project_name"])} for item in _with_segment_refs(items, translate)
+    ]
+
+
 @router.get("/usage/records/{record_id}", response_model=UsageRecordDetail)
-async def get_usage_record(record_id: int) -> UsageRecordDetail:
+async def get_usage_record(record_id: int, _t: Translator) -> UsageRecordDetail:
     async with async_session_factory() as session:
         record = await UsageRepository(session).get_record(record_id)
     if record is None:
         raise NotFoundError("usage_record_not_found")
+    [record] = await asyncio.to_thread(_present_records, [record], _t)
     return UsageRecordDetail.model_validate(record)
 
 
 # --- 汇总读接口（GET /usage/summary）---------------------------------------------------
 # 设置页总览与顶栏入口共用这一次请求：KPI、日桶趋势、三维构成、需要关注与筛选候选值。
-# 聚合规则在 lib/usage_summary.py，这里只负责取参、取行与形状声明。
+# 聚合规则在 lib/billing/usage_summary.py，这里只负责取参、取行与形状声明。
 
 
 class UsageStats(BaseModel):
@@ -232,6 +284,7 @@ class UsageConsecutiveFailuresAttention(BaseModel):
     project_name: str
     media_type: str
     segment_id: str
+    segment_ref: EpisodeItemRef | None = None
     count: int
     first_failed_at: str
     last_failed_at: str
@@ -250,6 +303,8 @@ class UsageModelOption(BaseModel):
 
 class UsageFilterOptionsResponse(BaseModel):
     projects: list[str]
+    # 候选项目里读得到标题的那部分：项目名 → 标题。构成表与需要关注里的项目名同样在候选范围内。
+    project_titles: dict[str, str] = Field(default_factory=dict)
     providers: list[UsageProviderOption]
     models: list[UsageModelOption]
 
@@ -317,6 +372,10 @@ async def get_usage_summary(
         models=options.models,
     )
     try:
-        return build_summary(rows, tz=zone, since=since_utc, until=until_utc, filter_options=localized)
+        summary = build_summary(rows, tz=zone, since=since_utc, until=until_utc, filter_options=localized)
     except UsageWindowTooWideError as exc:
         raise UnprocessableError("usage_range_too_wide") from exc
+    summary["attention"] = await asyncio.to_thread(_with_segment_refs, cast(list[dict[str, Any]], summary["attention"]))
+    filter_options = cast(dict[str, Any], summary["filter_options"])
+    filter_options["project_titles"] = await asyncio.to_thread(_project_titles, filter_options["projects"])
+    return summary

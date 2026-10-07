@@ -1,4 +1,4 @@
-import { fireEvent, render } from "@testing-library/react";
+import { fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { DEMO_PROJECT_NAME } from "@/onboarding/demo-project";
 import { useProjectsStore } from "@/stores/projects-store";
@@ -33,27 +33,14 @@ describe("MediaCard upload", () => {
     expect(container.querySelector('input[type="file"]')).toBeNull();
   });
 
-  it("keeps upload entry visible in grid mode where the generate CTA is hidden", () => {
-    const { container } = renderCard({
-      onUpload: vi.fn(),
-      onGenerate: vi.fn(),
-      hideGenerateButton: true,
-    });
-    expect(container.querySelector('input[type="file"]')).not.toBeNull();
-  });
-
   it("disables upload button while generating", () => {
-    const { container } = renderCard({ onUpload: vi.fn(), generating: true });
-    const input = container.querySelector<HTMLInputElement>('input[type="file"]');
-    const button = input?.nextElementSibling as HTMLButtonElement;
-    expect(button).toBeDisabled();
+    renderCard({ onUpload: vi.fn(), generating: true });
+    expect(screen.getByRole("button", { name: "上传分镜图" })).toBeDisabled();
   });
 
   it("disables upload button when a sibling upload is in flight (uploadDisabled)", () => {
-    const { container } = renderCard({ onUpload: vi.fn(), uploadDisabled: true });
-    const input = container.querySelector<HTMLInputElement>('input[type="file"]');
-    const button = input?.nextElementSibling as HTMLButtonElement;
-    expect(button).toBeDisabled();
+    renderCard({ onUpload: vi.fn(), uploadDisabled: true });
+    expect(screen.getByRole("button", { name: "上传分镜图" })).toBeDisabled();
   });
 
   it("accepts video formats for the video card", () => {
@@ -102,7 +89,7 @@ describe("MediaCard in the demo workbench", () => {
 
     expect(container.querySelector('input[type="file"]')).not.toBeNull();
     expect(getByRole("button", { name: /版本/ })).toBeInTheDocument();
-    expect(getByRole("button", { name: /编辑/ })).toBeInTheDocument();
+    expect(getByRole("button", { name: /局部修改/ })).toBeInTheDocument();
     expect(getByRole("button", { name: /重新生成分镜/ })).toBeInTheDocument();
   });
 });

@@ -23,54 +23,75 @@ from typing import Any
 
 from fastapi import Depends, FastAPI, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, RedirectResponse
+from fastapi.responses import FileResponse
 from starlette.datastructures import MutableHeaders
 from starlette.types import Message, Receive, Scope, Send
 
 from lib import PROJECT_ROOT
-from lib.agent_session_store import session_store_enabled
-from lib.agent_session_store.import_local import migrate_local_transcripts_to_store
-from lib.agent_session_store.store import DbSessionStore
-from lib.app_data_dir import app_data_dir
+from lib.agent.agent_session_store import session_store_enabled
+from lib.agent.agent_session_store.import_local import migrate_local_transcripts_to_store
+from lib.agent.agent_session_store.store import DbSessionStore
 from lib.config.env_keys import PROVIDER_SECRET_KEYS
 from lib.db import async_session_factory, close_db, init_db
-from lib.generation_worker import GenerationWorker
-from lib.httpx_shared import shutdown_http_client, startup_http_client
-from lib.logging_config import attach_file_handler, migrate_legacy_log_dir, setup_logging
-from lib.path_safety import try_safe_join
-from lib.project_migrations import cleanup_stale_backups, run_project_migrations
-from lib.source_loader.migration import migrate_project_source_encoding
-from server.auth import ensure_auth_password, get_current_user
+from lib.generation.generation_worker import GenerationWorker
+from lib.infra.data_root_layout import DataRootLayout, list_project_dirs
+from lib.infra.data_root_layout_migration import default_sdk_config_dir, migrate_data_root_layout
+from lib.infra.ffmpeg import log_ffmpeg_status
+from lib.infra.httpx_shared import shutdown_http_client, startup_http_client
+from lib.infra.logging_config import (
+    attach_file_handler,
+    migrate_legacy_log_dir,
+    setup_logging,
+    warn_if_log_dir_env_set,
+)
+from lib.infra.path_safety import try_safe_join
+from lib.project.project_migrations import cleanup_stale_backups, run_project_migrations
+from lib.script.source_loader.migration import migrate_project_source_encoding
+from server.auth import ensure_auth_password, get_current_user, warn_if_auth_disabled
 from server.cors_config import resolve_cors_policy
-from server.dependencies import require_project_migration_ok
+from server.dependencies import require_project_migration_ok, require_valid_project_name
 from server.error_handlers import register_error_handlers
-from server.remote_mcp import remote_mcp_host
+from server.remote_mcp import mount_remote_mcp, remote_mcp_host
 from server.routers import (
+    ad_script,
     agent_config,
     agent_memory,
     api_keys,
+    asset_sheets,
     assets,
     assistant,
     characters,
     cost_estimation,
     custom_endpoints,
     custom_providers,
+    edit_timelines,
     end_frames,
+    episode_drafts,
+    episode_management,
+    episode_planning,
+    episodes_view,
     files,
     generate,
     grids,
+    market,
+    market_submissions,
+    official_service,
     onboarding,
     presentations,
     products,
     project_events,
+    project_migration,
     projects,
+    prompt_authoring,
     prompt_templates,
     props,
     providers,
     reference_videos,
     scenes,
+    script_plan,
     script_review,
     shot_uploads,
+    storyboard_batches,
     system,
     system_config,
     tasks,
@@ -78,7 +99,10 @@ from server.routers import (
     versions,
 )
 from server.routers import auth as auth_router
-from server.services.project_events import ProjectEventService
+from server.services.project.episode_id_records import recorded_episode_ids_on
+from server.services.project.project_events import ProjectEventService
+from server.services.tasks.generation_tasks import execute_generation_task
+from server.services.tasks.resume_executor import execute_resume_video_task
 
 
 def assert_no_provider_secrets_in_environ() -> None:
@@ -266,8 +290,8 @@ def detect_docker_environment(
 
 # 初始化日志：模块导入期只挂 stream handler。
 # file handler 推迟到 lifespan，前面要先跑 migrate_legacy_log_dir()
-# 把旧 app_data_dir()/logs 平移到 PROJECT_ROOT/logs，否则新目录在 import
-# 期被创建会堵掉 rename；同时也避免 pytest 收集阶段 import server.app 时
+# 把代码目录下的旧 logs 迁入数据根，否则 handler 先在新位置开出同名日志文件，
+# 旧文件就迁不过去；同时也避免 pytest 收集阶段 import server.app 时
 # 对真实文件系统产生副作用。
 setup_logging(file=False)
 logger = logging.getLogger(__name__)
@@ -289,14 +313,14 @@ def _log_profile_sync_outcome(stats: dict, *, log: logging.Logger = logger) -> N
 
 
 async def _migrate_source_encoding_on_startup(
-    projects_root: Path,
+    projects_dir: Path,
     *,
     migrate_source_encoding: Callable[[Path], Any] | None = None,
 ) -> dict[str, dict]:
     """对每个项目执行幂等编码迁移。失败被捕获并写日志，不阻塞启动。"""
     summary: dict[str, dict] = {}
     migrate = migrate_source_encoding or migrate_project_source_encoding
-    if not projects_root.exists():  # noqa: ASYNC240 -- 启动期一次性存在性检查，本地元数据
+    if not projects_dir.exists():  # noqa: ASYNC240 -- 启动期一次性存在性检查，本地元数据
         return summary
 
     def _run_one(project_dir: Path) -> dict:
@@ -332,9 +356,7 @@ async def _migrate_source_encoding_on_startup(
                 pass
             return {"error": str(exc)}
 
-    for project_dir in projects_root.iterdir():  # noqa: ASYNC240 -- 启动期一次列举项目根目录，单次 readdir；每个项目的迁移已 to_thread 卸载
-        if not project_dir.is_dir() or project_dir.name.startswith("."):
-            continue
+    for project_dir in list_project_dirs(projects_dir):
         summary[project_dir.name] = await asyncio.to_thread(_run_one, project_dir)
     return summary
 
@@ -354,22 +376,33 @@ async def lifespan(app: FastAPI):
     app.state.in_docker = is_docker
     app.state.sandbox_enabled = sandbox_enabled
 
-    # 日志文件持久化：先一次性平移旧 app_data_dir()/logs，再挂 file handler。
-    # 顺序很重要——file handler 会 mkdir 新目录，提前挂会让 migrate 的 rename
-    # 撞到 "新旧都存在" 分支放弃迁移。
+    # 随包 ffmpeg 自检一次，结论缓存在进程内；不可用不阻断启动。
+    await asyncio.to_thread(log_ffmpeg_status)
+
+    # 日志文件持久化：先把代码目录下的旧日志迁入数据根，再挂 file handler。
+    # 顺序很重要——handler 会在新位置创建 arcreel.log，提前挂会让旧的同名文件因冲突留在原处。
     await asyncio.to_thread(migrate_legacy_log_dir)
     attach_file_handler()
+    warn_if_log_dir_env_set()
 
     ensure_auth_password()
+    warn_if_auth_disabled()
 
     # Run Alembic migrations (auto-creates tables on first start)
     await init_db()
 
-    projects_root = app_data_dir()
+    # 数据根布局迁移：排在挂文件日志 handler（迁移过程写进日志）与 Alembic（步骤会改写库）之后、
+    # 所有遍历项目的步骤之前——那些步骤按当前布局找项目，不能跑在半迁移的数据根上。失败即中止启动。
+    layout = DataRootLayout.current()
+    await migrate_data_root_layout(
+        layout.root,
+        session_factory=async_session_factory,
+        sdk_config_dir=default_sdk_config_dir(),
+    )
 
     # 源文件编码迁移（幂等；失败不阻塞启动）。先于 schema 迁移跑：源文一律先归到 UTF-8，
     # 之后所有按 UTF-8 读源文的链路（分集规划、派生文件对账）才有统一的输入。
-    source_migration_summary = await _migrate_source_encoding_on_startup(projects_root)
+    source_migration_summary = await _migrate_source_encoding_on_startup(layout.projects_dir)
     migrated_total = sum(len(s.get("migrated") or []) for s in source_migration_summary.values())
     failed_total = sum(len(s.get("failed") or []) for s in source_migration_summary.values())
     if migrated_total or failed_total:
@@ -383,7 +416,11 @@ async def lifespan(app: FastAPI):
     # Run any pending project.json schema migrations (file-based).
     # Both calls are synchronous filesystem walks — offload to a worker thread
     # so they don't block the event loop during uvicorn startup.
-    migration_summary = await asyncio.to_thread(run_project_migrations, projects_root)
+    migration_summary = await asyncio.to_thread(
+        run_project_migrations,
+        layout.projects_dir,
+        recorded_episode_ids=recorded_episode_ids_on(asyncio.get_running_loop()),
+    )
     if migration_summary.migrated or migration_summary.failed:
         logger.info(
             "Project migrations: migrated=%s skipped=%d failed=%s",
@@ -391,18 +428,14 @@ async def lifespan(app: FastAPI):
             len(migration_summary.skipped),
             migration_summary.failed,
         )
-    await asyncio.to_thread(cleanup_stale_backups, projects_root, 7)
+    await asyncio.to_thread(cleanup_stale_backups, layout.projects_dir, 7)
 
     # Migrate any pre-existing local SDK jsonl transcripts into the DbSessionStore.
     # Runs once (marker-gated); failures are non-fatal and logged.
     if session_store_enabled():
         try:
             store = DbSessionStore(async_session_factory)
-            await migrate_local_transcripts_to_store(
-                store,
-                projects_root=projects_root,
-                data_dir=projects_root,  # same place .arcreel.db lives, so docker volume catches it
-            )
+            await migrate_local_transcripts_to_store(store, data_root=layout.root)
         except Exception:
             logger.exception("session-store transcript migration failed (non-fatal)")
 
@@ -410,9 +443,8 @@ async def lifespan(app: FastAPI):
     try:
         from lib.config.migration import migrate_json_to_db
 
-        json_path = app_data_dir() / ".system_config.json"
         async with async_session_factory() as session:
-            await migrate_json_to_db(session, json_path)
+            await migrate_json_to_db(session, layout.root)
     except Exception as exc:
         logger.warning("JSON→DB config migration failed (non-fatal): %s", exc)
 
@@ -426,8 +458,17 @@ async def lifespan(app: FastAPI):
     except Exception as exc:
         logger.warning("text tier settings migration failed (non-fatal): %s", exc)
 
+    # 官方市场源 seed：不存在则插入，地址常量变了就同步；不抓取
+    try:
+        from lib.market.sources import seed_official_source
+
+        async with async_session_factory() as session:
+            await seed_official_source(session)
+    except Exception as exc:
+        logger.warning("official market source seed failed (non-fatal): %s", exc)
+
     # 把 agent_runtime_profile 物化到存量项目（文件 I/O → worker 线程）
-    from lib.project_manager import get_project_manager
+    from lib.project.project_manager import get_project_manager
 
     _pm = get_project_manager()
     _profile_sync_stats = await asyncio.to_thread(_pm.sync_all_agent_profiles)
@@ -443,16 +484,11 @@ async def lifespan(app: FastAPI):
     logger.info("启动 GenerationWorker...")
     worker = create_generation_worker()
     app.state.generation_worker = worker
-    # 注入 in-process cancel 回调必须在 worker.start() 之前，
-    # 否则有窗口期 callback 为 None、cancel running 信号丢失（违反 ADR 0006 秒级响应）。
-    from lib.generation_queue import get_generation_queue
-
-    get_generation_queue().set_worker_cancel_callback(worker.request_cancel)
     await worker.start()
     logger.info("GenerationWorker 已启动")
 
     logger.info("启动 ProjectEventService...")
-    project_event_service = ProjectEventService(PROJECT_ROOT, projects_root=app_data_dir())
+    project_event_service = ProjectEventService(PROJECT_ROOT, data_root=layout.root)
     app.state.project_event_service = project_event_service
     await project_event_service.start()
     logger.info("ProjectEventService 已启动")
@@ -469,18 +505,8 @@ async def lifespan(app: FastAPI):
     worker = getattr(app.state, "generation_worker", None)
     if worker:
         logger.info("正在停止 GenerationWorker...")
-        from lib.generation_queue import get_generation_queue
-
-        # 先 stop（内部 drain inflight + 退出主循环）：期间 cancel API 仍可发起，
-        # callback 仍可用，避免重新部署窗口期 cancel 信号被丢弃。
-        # 依赖 worker.stop() 内部已 await _wait_inflight_completion——若后续重构
-        # stop 拆掉 drain 步骤，需同时回访这里的顺序假设。
-        # try/finally 保证 callback 清理必达：worker.stop 抛错时 _worker_cancel_callback
-        # 仍能清空，避免污染后续生命周期/测试。
-        try:
-            await worker.stop()
-        finally:
-            get_generation_queue().set_worker_cancel_callback(None)
+        # 关停不取消在跑任务：worker.stop() 等在跑任务跑完再退出主循环。
+        await worker.stop()
         logger.info("GenerationWorker 已停止")
     # 测试连接的 run 不可续跑：随事件循环消亡会把账本 pending 行永远留下，关停前按取消路径结算。
     from lib.custom_provider.endpoint_test import shutdown_trial_runs
@@ -496,6 +522,7 @@ app = FastAPI(
     description="AI 视频生成工作空间的 Web 管理界面",
     version="1.0.0",
     lifespan=lifespan,
+    dependencies=[Depends(require_valid_project_name)],
 )
 
 # CORS 配置（env 驱动，解析见 server/cors_config.py；远程 MCP 挂载共用同一份白名单）。
@@ -544,7 +571,9 @@ _QUIET_SLOW_THRESHOLD_MS = 500.0
 
 
 @app.middleware("http")
-async def request_logging_middleware(request: Request, call_next):
+async def request_logging_middleware(
+    request: Request, call_next, *, quiet_slow_threshold_ms: float = _QUIET_SLOW_THRESHOLD_MS
+):
     start = time.perf_counter()
     path = request.url.path
     _skip_log = path.startswith("/assets") or path == "/health"
@@ -565,7 +594,7 @@ async def request_logging_middleware(request: Request, call_next):
         is_quiet = (
             (request.method, path) in _QUIET_POLL_ENDPOINTS
             and response.status_code < 400
-            and elapsed_ms < _QUIET_SLOW_THRESHOLD_MS
+            and elapsed_ms < quiet_slow_threshold_ms
         )
         log = logger.debug if is_quiet else logger.info
         log(
@@ -589,7 +618,14 @@ app.include_router(scenes.router, prefix="/api/v1", dependencies=[Depends(get_cu
 app.include_router(props.router, prefix="/api/v1", dependencies=[Depends(get_current_user)], tags=["道具管理"])
 app.include_router(products.router, prefix="/api/v1", dependencies=[Depends(get_current_user)], tags=["商品管理"])
 app.include_router(presentations.router, prefix="/api/v1", dependencies=[Depends(get_current_user)], tags=["成片演示"])
+app.include_router(
+    edit_timelines.router, prefix="/api/v1", dependencies=[Depends(get_current_user)], tags=["剪辑时间线"]
+)
 app.include_router(files.router, prefix="/api/v1", dependencies=[Depends(get_current_user)], tags=["文件管理"])
+app.include_router(episodes_view.router, prefix="/api/v1", dependencies=[Depends(get_current_user)], tags=["分集视图"])
+app.include_router(
+    episode_management.router, prefix="/api/v1", dependencies=[Depends(get_current_user)], tags=["集管理"]
+)
 app.include_router(
     generate.router,
     prefix="/api/v1",
@@ -597,10 +633,52 @@ app.include_router(
     tags=["生成"],
 )
 app.include_router(
+    storyboard_batches.router,
+    prefix="/api/v1",
+    dependencies=[Depends(get_current_user), Depends(require_project_migration_ok)],
+    tags=["生成"],
+)
+app.include_router(
+    asset_sheets.router,
+    prefix="/api/v1",
+    dependencies=[Depends(get_current_user), Depends(require_project_migration_ok)],
+    tags=["资产图"],
+)
+app.include_router(
     script_review.router,
     prefix="/api/v1",
     dependencies=[Depends(get_current_user), Depends(require_project_migration_ok)],
     tags=["内容确认"],
+)
+app.include_router(
+    episode_drafts.router,
+    prefix="/api/v1",
+    dependencies=[Depends(get_current_user), Depends(require_project_migration_ok)],
+    tags=["内容确认"],
+)
+app.include_router(
+    prompt_authoring.router,
+    prefix="/api/v1",
+    dependencies=[Depends(get_current_user), Depends(require_project_migration_ok)],
+    tags=["提示词编写"],
+)
+app.include_router(
+    episode_planning.router,
+    prefix="/api/v1",
+    dependencies=[Depends(get_current_user), Depends(require_project_migration_ok)],
+    tags=["分集规划"],
+)
+app.include_router(
+    script_plan.router,
+    prefix="/api/v1",
+    dependencies=[Depends(get_current_user), Depends(require_project_migration_ok)],
+    tags=["脚本规划"],
+)
+app.include_router(
+    ad_script.router,
+    prefix="/api/v1",
+    dependencies=[Depends(get_current_user), Depends(require_project_migration_ok)],
+    tags=["广告/短片脚本"],
 )
 app.include_router(
     shot_uploads.router,
@@ -613,6 +691,9 @@ app.include_router(
     prefix="/api/v1",
     dependencies=[Depends(get_current_user), Depends(require_project_migration_ok)],
     tags=["分镜尾帧"],
+)
+app.include_router(
+    project_migration.router, prefix="/api/v1", dependencies=[Depends(get_current_user)], tags=["项目数据升级"]
 )
 app.include_router(versions.router, prefix="/api/v1", dependencies=[Depends(get_current_user)], tags=["版本管理"])
 app.include_router(usage.router, prefix="/api/v1", dependencies=[Depends(get_current_user)], tags=["费用统计"])
@@ -637,6 +718,11 @@ app.include_router(
 )
 app.include_router(
     custom_endpoints.router, prefix="/api/v1", dependencies=[Depends(get_current_user)], tags=["自定义调用端点"]
+)
+app.include_router(market.router, prefix="/api/v1", dependencies=[Depends(get_current_user)], tags=["市场"])
+app.include_router(market_submissions.router, prefix="/api/v1", dependencies=[Depends(get_current_user)], tags=["市场"])
+app.include_router(
+    official_service.router, prefix="/api/v1", dependencies=[Depends(get_current_user)], tags=["官方服务"]
 )
 app.include_router(
     cost_estimation.router, prefix="/api/v1", dependencies=[Depends(get_current_user)], tags=["费用估算"]
@@ -675,18 +761,14 @@ app.include_router(files.public_router, prefix="/api/v1", tags=["文件管理"])
 # 自带认证端点：浏览器原生下载导航带不了 Authorization header，
 # 端点内 verify_download_token 校验短时效下载 token（见 docs/adr/0071）。
 app.include_router(projects.self_auth_router, prefix="/api/v1", tags=["项目管理"])
+app.include_router(edit_timelines.self_auth_router, prefix="/api/v1", tags=["剪辑时间线"])
 
 
-@app.api_route("/mcp", methods=["DELETE", "GET", "HEAD", "POST"], include_in_schema=False)
-async def redirect_remote_mcp() -> RedirectResponse:
-    return RedirectResponse("/mcp/", status_code=307)
-
-
-app.mount("/mcp", remote_mcp_host)
+mount_remote_mcp(app, remote_mcp_host)
 
 
 def create_generation_worker() -> GenerationWorker:
-    return GenerationWorker()
+    return GenerationWorker(executor=execute_generation_task, resume_executor=execute_resume_video_task)
 
 
 @app.get("/health")

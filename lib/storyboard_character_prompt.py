@@ -4,9 +4,9 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 
-from lib.asset_types import asset_name_comparison_key
-from lib.reference_image_numbering import ReferenceImageSlot, mention_replacements
-from lib.reference_video.text_parser import render_mentions
+from lib.project.asset_types import asset_name_comparison_key
+from lib.prompts.reference_image_numbering import ReferenceImageSlot, mention_replacements
+from lib.script.reference_video.text_parser import render_mentions
 from lib.storyboard_character_identity import CharacterContext
 
 GRID_ROSTER_UNIT = "格"

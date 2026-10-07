@@ -1,39 +1,73 @@
 import type { TFunction } from "i18next";
+import {
+  WORKSPACE_ROUTE_CHARACTERS,
+  WORKSPACE_ROUTE_PRODUCTS,
+  WORKSPACE_ROUTE_PROPS,
+  WORKSPACE_ROUTE_SCENES,
+} from "@/app-routes";
 import type { ProjectData, TaskItem, WorkspaceNotificationTarget } from "@/types";
+import { episodeDisplayName, episodeItemLabel, itemIdsInEpisodeText } from "@/utils/episode-display";
 
 /**
  * 由失败任务构建可点击回跳的通知 target，以及人类可读的失败文案。
  *
  * 回跳路由按 task_type 区分：
- * - character/scene/prop → 资产页（不需要剧集），resource_id 即资产名
+ * - character/scene/prop/product → 资产页（不需要剧集），resource_id 即资产名
  * - storyboard/video → 对应剧集的分镜（ShotSplitView 按 segment id 选中）
  * - grid → 对应剧集的宫格画布（导航即回跳，无 DOM 锚点）
  * - reference_video → 对应剧集的参考单元（ReferenceVideoCanvas 选中 unit）
- * - image_edit → 按 resource_type 转发到上述对应路由；product 暂无路由（与既有
- *   product 生成任务缺口一致），仅推送文案不可点击
+ * - image_edit → 按 resource_type 转发到上述对应路由
  *
  * 剧集路由由 task.script_file 反查 projectData.episodes 得到；查不到时返回
  * null，让通知仍然推送、仅不可点击（优雅降级）。
  */
 
-const ASSET_ROUTES: Record<"character" | "scene" | "prop", string> = {
-  character: "/characters",
-  scene: "/scenes",
-  prop: "/props",
+const ASSET_ROUTES: Record<"character" | "scene" | "prop" | "product", string> = {
+  character: `/${WORKSPACE_ROUTE_CHARACTERS}`,
+  scene: `/${WORKSPACE_ROUTE_SCENES}`,
+  prop: `/${WORKSPACE_ROUTE_PROPS}`,
+  product: `/${WORKSPACE_ROUTE_PRODUCTS}`,
 };
 
+/** 资产页上某张资产的回跳 target（衍生定位到其本体卡片）。 */
+export function assetNotificationTarget(
+  assetType: keyof typeof ASSET_ROUTES,
+  name: string,
+): WorkspaceNotificationTarget {
+  return { type: assetType, id: name, route: ASSET_ROUTES[assetType], highlight_style: "flash" };
+}
+
 const FAILURE_TEXT_KEYS: Partial<
-  Record<TaskItem["task_type"], { key: string; idParam: "id" | "unitId" }>
+  Record<TaskItem["task_type"], { key: string; idParam: "id" | "unitId" | "episode" }>
 > = {
   storyboard: { key: "storyboard_task_failed", idParam: "id" },
   video: { key: "video_task_failed", idParam: "id" },
   character: { key: "character_task_failed", idParam: "id" },
   scene: { key: "scene_task_failed", idParam: "id" },
   prop: { key: "prop_task_failed", idParam: "id" },
+  product: { key: "product_task_failed", idParam: "id" },
   grid: { key: "grid_task_failed", idParam: "id" },
   reference_video: { key: "reference_generation_task_failed", idParam: "unitId" },
   image_edit: { key: "image_edit_task_failed", idParam: "id" },
+  text_drama_script_plan: { key: "script_plan_task_failed", idParam: "episode" },
+  text_narration_script_plan: { key: "script_plan_task_failed", idParam: "episode" },
+  text_reference_script_plan: { key: "script_plan_task_failed", idParam: "episode" },
 };
+
+/** 集级任务的 resource_id 形如 `episode-3`，失败文案按集名指称。 */
+const EPISODE_RESOURCE_ID = /^episode-(\d+)$/;
+
+function failureTarget(
+  idParam: "id" | "unitId" | "episode",
+  task: TaskItem,
+  projectData: ProjectData | null,
+  t: TFunction,
+): string {
+  const episodes = projectData?.episodes ?? [];
+  if (idParam !== "episode") return episodeItemLabel(task.resource_id, episodes, t);
+  const match = EPISODE_RESOURCE_ID.exec(task.resource_id);
+  return match ? episodeDisplayName(episodes, Number(match[1]), t) : task.resource_id;
+}
 
 /**
  * 归一化 script_file：episode 元数据固定带 `scripts/` 前缀，任务行与 grid 记录
@@ -63,6 +97,7 @@ export function buildTaskFailureTarget(
     case "character":
     case "scene":
     case "prop":
+    case "product":
       return {
         type: task.task_type,
         id: task.resource_id,
@@ -86,12 +121,12 @@ export function buildTaskFailureTarget(
     }
     case "image_edit": {
       // image_edit 跨 character/scene/prop/product/storyboard 共用 task_type，真正
-      // 的资源种类在 resource_type；product 目前无对应 WorkspaceFocusTarget 路由
-      // （与既有 product 生成任务的通知目标缺口一致），优雅降级为不可点击。
+      // 的资源种类在 resource_type。
       switch (task.resource_type) {
         case "character":
         case "scene":
         case "prop":
+        case "product":
           return {
             type: task.resource_type,
             id: task.resource_id,
@@ -121,14 +156,14 @@ const PROVIDER_REASON_MAX_LENGTH = 120;
 
 /**
  * 上游拒因摘要：后端在 `provider_rejected` 的 error_params 里单独回传的上游原文，
- * 不参与翻译，与走 i18n 模板的 error_message 分开渲染。级联失败等其它失败码没有
+ * 不参与翻译，显示时剥去条目的集 ID 前缀，与 i18n 模板的 error_message 分开渲染。其它失败码没有
  * 这个字段，返回 null。
  */
 export function providerReasonOf(task: TaskItem): string | null {
   if (task.error_code !== "provider_rejected") return null;
   const reason = task.error_params?.provider_reason;
   if (typeof reason !== "string") return null;
-  const trimmed = reason.trim();
+  const trimmed = itemIdsInEpisodeText(reason.trim());
   return trimmed || null;
 }
 
@@ -142,13 +177,18 @@ function truncateProviderReason(reason: string): string {
 
 /**
  * 失败任务的通知文案。未知 task_type 返回 null（调用方据此跳过推送）。
- * 有上游拒因摘要时追加在按 task_type 选出的文案之后。
+ * 条目按「标题 · S01」指称；有上游拒因摘要时追加在按 task_type 选出的文案之后。
  */
-export function describeTaskFailure(t: TFunction, task: TaskItem): string | null {
+export function describeTaskFailure(
+  t: TFunction,
+  task: TaskItem,
+  projectData: ProjectData | null = null,
+): string | null {
   const reason = task.error_message ?? t("reference_status_failed");
   const config = FAILURE_TEXT_KEYS[task.task_type];
   if (!config) return null;
-  const message = t(config.key, { [config.idParam]: task.resource_id, reason });
+  const target = failureTarget(config.idParam, task, projectData, t);
+  const message = t(config.key, { [config.idParam]: target, reason });
   const providerReason = providerReasonOf(task);
   if (!providerReason) return message;
   // 拒因后缀单独取模板再拼接，不把已渲染的 message 当插值变量传回 i18next：插值

@@ -5,6 +5,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from lib.infra.data_root_layout import DataRootLayout
 from server.agent_runtime import session_manager as sm_mod
 from server.agent_runtime.agent_access_policy import AgentAccessPolicy
 from server.agent_runtime.message_utils import extract_plain_user_content
@@ -69,7 +70,7 @@ def _dummy_actor() -> SessionActor:
 async def _cold_revival_clients(session_manager, monkeypatch):
     """Patch the SDK symbols so a non-resident session revives against a fake
     client, and yield the list capturing every constructed client. Each client's
-    ``options.kwargs["system_prompt"]["append"]`` carries the rebuilt prompt, so
+    ``options.kwargs["system_prompt"]["append"]`` carries the rendered prompt, so
     tests can assert which locale the language regulation was rendered with."""
 
     async def _fake_env():
@@ -133,7 +134,7 @@ class TestSessionManager:
         assert managed.get_pending_question_payloads() == []
 
     @pytest.mark.asyncio
-    async def test_build_options_and_connect_paths(self, session_manager, meta_store, tmp_path, monkeypatch):
+    async def test_build_options_and_connect_paths(self, session_manager, meta_store, monkeypatch):
         async def _fake_env():
             return {}
 
@@ -144,7 +145,7 @@ class TestSessionManager:
             with pytest.raises(RuntimeError):
                 await session_manager._build_options("demo")
 
-        projects_demo = tmp_path / "projects" / "demo"
+        projects_demo = session_manager.layout.projects_dir / "demo"
         projects_demo.mkdir(parents=True)
         meta = await meta_store.create("demo", "sdk-build-opts")
 
@@ -172,32 +173,30 @@ class TestSessionManager:
         assert await session_manager._options_assembler._keep_stream_open_hook({}, None, None) == {"continue_": True}
 
     @pytest.mark.asyncio
-    async def test_get_or_connect_threads_locale_into_system_prompt(
-        self, session_manager, meta_store, tmp_path, monkeypatch
-    ):
-        """Cold-recovery revival rebuilds the language regulation from the
-        caller's locale instead of falling back to the default zh."""
+    async def test_get_or_connect_threads_locale_into_system_prompt(self, session_manager, meta_store, monkeypatch):
+        """Revival renders the language regulation from the caller's locale instead
+        of the default zh, and pins the system prompt as a session snapshot: a
+        resumed session keeps its first-turn prompt, a fresh one records this."""
 
-        (tmp_path / "projects" / "demo").mkdir(parents=True)
+        (session_manager.layout.projects_dir / "demo").mkdir(parents=True)
         meta = await meta_store.create("demo", "sdk-locale-vi")
 
         async with _cold_revival_clients(session_manager, monkeypatch) as created_clients:
             await session_manager.get_or_connect(meta.id, locale="vi")
             await asyncio.sleep(0)
             assert created_clients
-            append = created_clients[0].options.kwargs["system_prompt"]["append"]
-            assert "Tiếng Việt" in append
-            assert "中文" not in append
+            system_prompt = created_clients[0].options.kwargs["system_prompt"]
+            assert "Tiếng Việt" in system_prompt["append"]
+            assert "中文" not in system_prompt["append"]
+            assert system_prompt["snapshot"] is True
             await session_manager.close_session(meta.id)
 
     @pytest.mark.asyncio
-    async def test_stream_messages_threads_locale_into_cold_revival(
-        self, session_manager, meta_store, tmp_path, monkeypatch
-    ):
+    async def test_stream_messages_threads_locale_into_cold_revival(self, session_manager, meta_store, monkeypatch):
         """The SSE stream path is a second cold-revival entry: subscribing to a
-        non-resident session must rebuild the language regulation from the
-        caller's locale, matching the send-message path."""
-        (tmp_path / "projects" / "demo").mkdir(parents=True)
+        non-resident session renders the language regulation from the caller's
+        locale, matching the send-message path."""
+        (session_manager.layout.projects_dir / "demo").mkdir(parents=True)
         meta = await meta_store.create("demo", "sdk-locale-stream-en")
 
         async with _cold_revival_clients(session_manager, monkeypatch) as created_clients:
@@ -440,9 +439,10 @@ class TestSessionManager:
     async def test_file_access_hook_allows_read_within_project_root(self, tmp_path, meta_store):
         """Hook allows Read within cwd and cwd-external (non-projects) paths;
         cross-project read is denied per new sandbox policy."""
-        own_project = tmp_path / "projects" / "alpha"
+        projects_dir = DataRootLayout(tmp_path / "projects").projects_dir
+        own_project = projects_dir / "alpha"
         own_project.mkdir(parents=True)
-        other_project = tmp_path / "projects" / "beta"
+        other_project = projects_dir / "beta"
         other_project.mkdir(parents=True)
         docs_dir = tmp_path / "docs"
         docs_dir.mkdir(parents=True)
@@ -640,7 +640,7 @@ class TestSessionManager:
     async def _make_sdk_hook_env(self, tmp_path, meta_store):
         """Create a SessionManager + hook with SDK dir outside project_root."""
         app_root = tmp_path / "app"
-        own_project = app_root / "projects" / "alpha"
+        own_project = DataRootLayout(app_root / "projects").projects_dir / "alpha"
         own_project.mkdir(parents=True)
 
         claude_home = tmp_path / "claude_home" / "projects"
@@ -696,7 +696,7 @@ class TestSessionManager:
         """
         hook, _, _ = await self._make_sdk_hook_env(tmp_path, meta_store)
 
-        other_project = tmp_path / "app" / "projects" / "beta"
+        other_project = DataRootLayout(tmp_path / "app" / "projects").projects_dir / "beta"
         other_project.mkdir(parents=True)
         other_file = other_project / "secret.json"
         other_file.write_text("{}")

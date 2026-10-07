@@ -3,15 +3,6 @@ import { describe, expect, it, vi } from "vitest";
 import { ShotList } from "./ShotList";
 import type { AdShot } from "@/types";
 
-// jsdom 中滚动容器无高度，真实 virtualizer 渲染 0 行；mock 成全量渲染以断言行内容
-vi.mock("@tanstack/react-virtual", () => ({
-  useVirtualizer: ({ count }: { count: number }) => ({
-    getTotalSize: () => count * 96,
-    getVirtualItems: () => Array.from({ length: count }, (_, index) => ({ index, start: index * 96 })),
-    measureElement: () => {},
-  }),
-}));
-
 function makeShot(overrides: Partial<AdShot> = {}): AdShot {
   return {
     shot_id: "E1S01",
@@ -28,7 +19,6 @@ function makeShot(overrides: Partial<AdShot> = {}): AdShot {
       ambiance_audio: "水声",
       dialogue: [],
     },
-    transition_to_next: "cut",
     ...overrides,
   };
 }
@@ -48,6 +38,11 @@ function renderList(shots: AdShot[]) {
 }
 
 describe("ShotList 广告/短片", () => {
+  it("pending_authoring 为真的分镜标「待编写」", () => {
+    renderList([makeShot({ pending_authoring: true }), makeShot({ shot_id: "E1S02" })]);
+    expect(screen.getAllByText("待编写")).toHaveLength(1);
+  });
+
   it("列表预览展示口播文案与 section 标签", () => {
     renderList([makeShot()]);
     expect(screen.getByText("还在等杯子干？")).toBeInTheDocument();

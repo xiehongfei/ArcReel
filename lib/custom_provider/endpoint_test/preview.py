@@ -13,15 +13,16 @@ from dataclasses import dataclass
 from typing import Any
 from urllib.parse import quote
 
-from lib.custom_provider.builtin_definitions import declarative_video_capabilities
-from lib.custom_provider.declarative_backend import normalize_declarative_base_url
-from lib.custom_provider.endpoint_definition import (
+from arcreel_market_core.endpoint_definition import (
     RenderedRequest,
     TemplateRenderError,
     build_context,
+    definition_media_type,
     render_request,
 )
-from lib.video_frame_slots import resolve_first_frame_aspect_ratio
+from lib.backends.video_frame_slots import resolve_first_frame_aspect_ratio
+from lib.custom_provider.builtin_definitions import declarative_video_capabilities
+from lib.custom_provider.declarative_backend import normalize_declarative_base_url
 
 from .errors import EndpointTestDefinitionError
 from .inputs import ASSET_SOURCES, EndpointTestAssets, EndpointTestCredentials, EndpointTestParameters
@@ -52,11 +53,17 @@ class PreviewedRequest:
 
 @dataclass(frozen=True)
 class RequestPreview:
-    """一次预览的全部产出：提交、轮询，以及定义声明了二次取件节时的取件请求。"""
+    """一次预览的全部产出：提交、轮询，以及定义声明了二次取件节时的取件请求。
+
+    ``conversions`` 是「这份请求是怎么算出来的」的说明，形状由 kind 决定、原样进响应体：声明式
+    端点的请求全部来自模板直填，没有可说明的换算，故为 ``None``；ComfyUI 端点的尺寸、帧数、种子
+    与改图都是算出来的，键见 :class:`~.comfyui.ComfyuiConversions`。
+    """
 
     submit: PreviewedRequest
     poll: PreviewedRequest
     result: PreviewedRequest | None
+    conversions: Mapping[str, Any] | None = None
 
 
 def preview_request(
@@ -73,9 +80,44 @@ def preview_request(
     好让用户对照文档核字段。测试连接的结果体传 False——记录的必须是真发出去的形状，运行时对
     缺席素材是整个字段删除。
     """
-    api_key = _masked_api_key(credentials.api_key) if credentials else UNRESOLVED_API_KEY
+    api_key = masked_api_key(credentials.api_key) if credentials else UNRESOLVED_API_KEY
     base_url = _preview_base_url(definition, credentials)
     inputs = asset_summaries(definition.get("inputs") or {}, assets, placeholder_missing=placeholder_missing_assets)
+    media_type = definition_media_type(definition)
+    generation = (
+        _video_variables(definition, parameters, inputs)
+        if media_type == "video"
+        else {
+            "prompt": parameters.prompt,
+            "aspect_ratio": parameters.aspect_ratio,
+            "resolution": parameters.resolution,
+            "seed": None,
+        }
+    )
+    context = build_context(
+        {
+            "api_key": api_key,
+            "base_url": base_url,
+            "model": parameters.model,
+            **generation,
+            "task_id": UNRESOLVED_TASK_ID,
+            "result_id": UNRESOLVED_RESULT_ID,
+        },
+        inputs,
+        definition.get("defaults"),
+        media_type=media_type,
+    )
+    return RequestPreview(
+        submit=_preview_section(definition, "submit", context),
+        poll=_preview_section(definition, "poll", context),
+        result=_preview_section(definition, "result", context) if "result" in definition else None,
+    )
+
+
+def _video_variables(
+    definition: Mapping[str, Any], parameters: EndpointTestParameters, inputs: Mapping[str, object]
+) -> dict[str, object]:
+    """视频定义的生成参数变量。"""
     # 渲染出的请求要与真发的一致：声明 first_frame_ratio_adaptive_only 的端点在带首帧的请求上
     # 只接受 adaptive，按实际渲进请求的首帧有无施加同一条覆盖。
     aspect_ratio = resolve_first_frame_aspect_ratio(
@@ -87,29 +129,15 @@ def preview_request(
             if declaration.get("source") == "start_image"
         ),
     )
-    context = build_context(
-        {
-            "api_key": api_key,
-            "base_url": base_url,
-            "model": parameters.model,
-            "prompt": parameters.prompt,
-            "duration": parameters.duration_seconds,
-            "duration_seconds": parameters.duration_seconds,
-            "aspect_ratio": aspect_ratio,
-            "resolution": parameters.resolution,
-            "generate_audio": parameters.generate_audio,
-            "seed": None,
-            "task_id": UNRESOLVED_TASK_ID,
-            "result_id": UNRESOLVED_RESULT_ID,
-        },
-        inputs,
-        definition.get("defaults"),
-    )
-    return RequestPreview(
-        submit=_preview_section(definition, "submit", context),
-        poll=_preview_section(definition, "poll", context),
-        result=_preview_section(definition, "result", context) if "result" in definition else None,
-    )
+    return {
+        "prompt": parameters.prompt,
+        "duration": parameters.duration_seconds,
+        "duration_seconds": parameters.duration_seconds,
+        "aspect_ratio": aspect_ratio,
+        "resolution": parameters.resolution,
+        "generate_audio": parameters.generate_audio,
+        "seed": None,
+    }
 
 
 def asset_summaries(
@@ -144,11 +172,19 @@ def asset_summaries(
     return summaries
 
 
-def _masked_api_key(api_key: str) -> str:
+def masked_api_key(api_key: str) -> str:
     """凭证的打码形：``****`` 加尾 4 位。空串原样返回——空凭证没有可打码的内容。"""
     if not api_key:
         return api_key
     return f"{_MASK}{api_key[-_MASK_TAIL:]}" if len(api_key) > _MASK_TAIL else _MASK
+
+
+def restore_mask_in_url(url: str) -> str:
+    """把 URL 里百分号编码过的打码记号还原成 ``****``。
+
+    只替换编码形，不对凭证本身做任何子串替换——``****`` 的编码形不会出现在一个真实的地址里。
+    """
+    return url.replace(_ENCODED_MASK, _MASK)
 
 
 def _preview_base_url(definition: Mapping[str, Any], credentials: EndpointTestCredentials | None) -> str:

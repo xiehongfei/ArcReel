@@ -99,8 +99,7 @@ def _make_mock_svc(
                     media_types=list(meta.media_types),
                     capabilities=list(meta.capabilities),
                     required_keys=list(meta.required_keys),
-                    configured_keys=list(meta.required_keys) if name in ready else [],
-                    missing_keys=[] if name in ready else list(meta.required_keys),
+                    credential_count=1 if name in ready else 0,
                 )
             )
         return statuses
@@ -128,6 +127,17 @@ class TestGetSystemConfig:
         body = res.json()
         assert "settings" in body
         assert "options" in body
+
+    def test_agnes_text_options_exclude_legacy_model(self):
+        mock_svc = _make_mock_svc(ready_providers=["agnes"])
+        with TestClient(_make_app_with_mock(mock_svc)) as client:
+            res = client.get("/api/v1/system/config")
+
+        text_backends = res.json()["options"]["text_backends"]
+        assert "agnes/agnes-3.0-flash" in text_backends
+        assert "agnes/agnes-2.5-flash" in text_backends
+        assert "agnes/agnes-2.5-pro" in text_backends
+        assert "agnes/agnes-2.0-flash" not in text_backends
 
     def test_settings_keys(self):
         mock_svc = _make_mock_svc()
@@ -158,6 +168,7 @@ class TestGetSystemConfig:
             "default_audio_backend",
             "narration_voice",
             "narration_speed",
+            "market_github_proxy_prefix",
         }
         assert set(settings.keys()) == expected_keys
 
@@ -466,6 +477,42 @@ class TestPatchSystemConfig:
         assert settings["narration_voice"] == "Cherry"
         assert settings["narration_speed"] == 1.5
 
+    def test_patch_sets_and_clears_market_github_proxy_prefix(self):
+        mock_svc = _make_mock_svc()
+        with TestClient(self._make_patch_app(mock_svc)) as client:
+            res = client.patch(
+                "/api/v1/system/config",
+                json={"market_github_proxy_prefix": "  https://proxy.example.net/  "},
+            )
+            assert res.status_code == 200
+            assert res.json()["settings"]["market_github_proxy_prefix"] == "https://proxy.example.net/"
+
+            res = client.patch("/api/v1/system/config", json={"market_github_proxy_prefix": ""})
+            assert res.status_code == 200
+            assert res.json()["settings"]["market_github_proxy_prefix"] == ""
+
+    def test_patch_rejects_invalid_market_github_proxy_prefix(self):
+        mock_svc = _make_mock_svc(settings={"market_github_proxy_prefix": "https://proxy.example.net/"})
+        with TestClient(self._make_patch_app(mock_svc)) as client:
+            for raw in (
+                "http://proxy.example.net/",
+                "proxy.example.net",
+                "https://",
+                "https://user:secret@proxy.example.net/",
+                "https://user@proxy.example.net/",
+                "https://proxy.example.net:bad/",
+                "https://proxy.example.net/#ignored",
+                "https://proxy.example.net/#",
+                "https://proxy.example.net/?token=abc",
+                "https://proxy.example.net/?",
+                "https://proxy.example.net/a\nb/",
+                "https://proxy.example.net/a b/",
+            ):
+                res = client.patch("/api/v1/system/config", json={"market_github_proxy_prefix": raw})
+                assert res.status_code == 422, raw
+            res = client.get("/api/v1/system/config")
+        assert res.json()["settings"]["market_github_proxy_prefix"] == "https://proxy.example.net/"
+
     def test_patch_rejects_non_positive_narration_speed(self):
         mock_svc = _make_mock_svc()
         with TestClient(self._make_patch_app(mock_svc)) as client:
@@ -572,3 +619,38 @@ class TestPatchSystemConfig:
         assert "text_backend_script" not in settings
         assert "text_backend_overview" not in settings
         assert "text_backend_style" not in settings
+
+
+class TestNarrationDefaults:
+    """新建 TTS 项目的预填值取自全局设置。"""
+
+    def test_returns_global_tts_defaults(self, monkeypatch, db_factory):
+        import asyncio
+
+        async def _seed():
+            async with db_factory() as session:
+                svc = ConfigService(session)
+                await svc.set_setting("default_audio_backend", "dashscope/qwen3-tts-flash")
+                await svc.set_setting("narration_voice", "Ethan")
+                await svc.set_setting("narration_speed", "1.2")
+                await session.commit()
+
+        asyncio.run(_seed())
+        monkeypatch.setattr(system_config_router, "async_session_factory", db_factory)
+        with TestClient(_make_app_with_mock(_make_mock_svc())) as client:
+            resp = client.get("/api/v1/system/narration-defaults")
+        assert resp.status_code == 200
+        assert resp.json() == {
+            "audio_backend": "dashscope/qwen3-tts-flash",
+            "narration_voice": "Ethan",
+            "narration_speed": 1.2,
+        }
+
+
+class TestTtsModelCapabilities:
+    def test_rejects_incomplete_backend(self):
+        app = _make_app_with_mock(_make_mock_svc())
+        register_error_handlers(app)
+        with TestClient(app) as client:
+            resp = client.get("/api/v1/system/tts-model-capabilities", params={"backend": "dashscope"})
+        assert resp.status_code == 422

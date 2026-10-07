@@ -1,4 +1,5 @@
 import { fireEvent, render, waitFor } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { API } from "@/api";
 import { useProjectsStore } from "@/stores/projects-store";
@@ -110,7 +111,7 @@ describe("EndFramePicker 项目内通道", () => {
     expect(getByText("本集分镜图")).toBeInTheDocument();
 
     // 无分镜图的分镜不出现
-    expect(queryByRole("button", { name: /分镜 E1S02/ })).not.toBeInTheDocument();
+    expect(queryByRole("button", { name: /分镜 S02/ })).not.toBeInTheDocument();
 
     // 角色/场景分组已移除：即使 currentProjectData 里有对应素材也不展示
     expect(queryByText("角色")).not.toBeInTheDocument();
@@ -128,7 +129,7 @@ describe("EndFramePicker 项目内通道", () => {
     const onPickProjectImage = vi.fn();
     const { getByRole, findByRole } = renderPicker({ onPickProjectImage });
 
-    const cell = await findByRole("button", { name: /分镜 E1S01/ });
+    const cell = await findByRole("button", { name: /分镜 S01/ });
     fireEvent.click(cell);
     expect(cell).toHaveAttribute("aria-pressed", "true");
 
@@ -146,7 +147,7 @@ describe("EndFramePicker 项目内通道", () => {
 describe("EndFramePicker 上传通道", () => {
   it("选定文件后交回父级（与项目内通道同一落点）", async () => {
     const onPickUpload = vi.fn();
-    // GlassModal 走 portal，file input 不在 render 的 container 子树内
+    // Dialog 走 portal，file input 不在 render 的 container 子树内
     const { baseElement, findByText } = renderPicker({ onPickUpload });
     await findByText("本集分镜图");
 
@@ -169,12 +170,36 @@ describe("EndFramePicker 上传通道", () => {
     const { getByRole, findByRole, findByText } = renderPicker({ disabled: true });
     await findByText("本集分镜图");
 
-    const cell = await findByRole("button", { name: /分镜 E1S01/ });
+    const cell = await findByRole("button", { name: /分镜 S01/ });
     fireEvent.click(cell);
 
     expect(getByRole("button", { name: /上传/ })).toBeDisabled();
     expect(getByRole("button", { name: "设为尾帧" })).toBeDisabled();
     expect(getByRole("button", { name: "取消" })).toBeEnabled();
+  });
+
+  it("提交在途时忽略 Esc 关闭，落定后可以关掉", async () => {
+    const onClose = vi.fn();
+    const user = userEvent.setup();
+    const { findByText, rerender } = renderPicker({ onClose, submitting: true });
+    await findByText("本集分镜图");
+
+    await user.keyboard("{Escape}");
+    expect(onClose).not.toHaveBeenCalled();
+
+    rerender(
+      <EndFramePicker
+        projectName={PROJECT}
+        scriptFile={SCRIPT}
+        contentMode="narration"
+        aspectRatio="9:16"
+        onClose={onClose}
+        onPickProjectImage={vi.fn()}
+        onPickUpload={vi.fn()}
+      />,
+    );
+    await user.keyboard("{Escape}");
+    expect(onClose).toHaveBeenCalledTimes(1);
   });
 
   it("宫格接口失败不阻断其余分组", async () => {

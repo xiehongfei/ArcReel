@@ -6,12 +6,15 @@
 或 monkeypatch 注入的调用记录容器），没有任何针对返回值、状态、副作用的断言。
 
 类 2「patch 被测公共入口或私有符号」：`patch(...)` / `patch.object(...)` /
-`monkeypatch.setattr(...)` 的目标以 `lib.` / `server.` 开头且命中 `_` 前缀私有符号；
+`monkeypatch.setattr(...)` 的目标以生产包（`lib.` / `server.` / `arcreel_market_core.`）开头且命中
+`_` 前缀私有符号；
 以及 integration 标记用例 patch 了被测 module 自身的公共入口。
 
 类 3「共享设施结构」：conftest 被 import；测试文件定义与生效 conftest 同名的 fixture；
 同名 fixture 在 ≥3 个测试文件重复定义；局部 conftest 与祖先 conftest 同名 fixture。
 只统计模块顶层 fixture——类内 fixture 的作用域限于该类，不构成跨文件的共享设施重复。
+同一 `patch` / `patch.object` 目标出现在 ≥3 个测试文件；`tests/fakes.py` 与
+`tests/factories.py` 的公开符号被少于 2 个其他测试文件使用。
 
 类 4「文件形态」：`_more` / `_full` / `_coverage` / `_extra` / `_additional` 分裂后缀；
 单文件 3000 行熔断；前端测试文件位于 `__tests__/` 目录。后端 `tests/**/*.py` 与前端
@@ -24,6 +27,8 @@
 `--check` 是闸门形态：以 `规则号 file:line 修复指引` 列出上述全部命中，非零即退出码 1。
 零容忍，无基线、无豁免标注——误报通过修改本脚本解决。
 
+后端测试目录缺省为 `tests/` 与 workspace 子包的 `packages/*/tests/`，可用 `--tests` 重复指定。
+
 零第三方依赖，只用 `ast`。用法见 `--help`。
 """
 
@@ -35,7 +40,7 @@ import json
 import re
 import sys
 from collections import Counter, defaultdict
-from collections.abc import Callable, Container, Iterable, Mapping
+from collections.abc import Callable, Container, Iterable, Mapping, Sequence
 from copy import deepcopy
 from dataclasses import asdict, dataclass
 from fnmatch import fnmatch
@@ -187,7 +192,8 @@ IO_MODULE_HINTS = (
     ".database",
     ".http",
     ".client",
-    "lib.media",
+    "lib.generation.media_generator",
+    "lib.artifacts.media_artifact_currency",
     "lib.ffmpeg",
     "server.db",
 )
@@ -200,27 +206,24 @@ MOTIVE_LOGIC = "绕被测逻辑本身"
 # 其余目标按正则归档。改动这张表就改动了报告里的三档数字，增删条目请附判定依据。
 MOTIVE_OVERRIDES = {
     # 名字不像 I/O，实际经 ConfigResolver / 文件系统 / 远端探测
-    "server.agent_runtime.sdk_tools._context.resolve_video_caps": MOTIVE_IO,
     "server.media_tools.image_edits._i2i_provider_available": MOTIVE_IO,
-    "lib.artifact_manifest._O_NOFOLLOW": MOTIVE_IO,
+    "lib.artifacts.artifact_manifest._O_NOFOLLOW": MOTIVE_IO,
     "server.routers.system_config._read_app_version": MOTIVE_IO,
-    "server.services.diagnostics._app_version": MOTIVE_IO,
+    "server.services.system.diagnostics._app_version": MOTIVE_IO,
     "server.app._DOCKERENV_PATH": MOTIVE_IO,
     "server.app._CGROUP_PATH": MOTIVE_IO,
     "server.app._migrate_source_encoding_on_startup": MOTIVE_IO,
     "server.routers.custom_providers._run_discover": MOTIVE_IO,
     "server.routers.custom_providers._test_google": MOTIVE_IO,
-    "lib.project_manager.ProjectManager._write_script_unlocked": MOTIVE_IO,
-    "lib.project_manager.ProjectManager._read_script_unlocked": MOTIVE_IO,
-    "lib.artifact_activation._ensure_activation_backup": MOTIVE_IO,
-    "server.services.reference_video_tasks._stage_provider_media_for_task": MOTIVE_IO,
-    "server.services.grid_split._register_split_entries_atomically": MOTIVE_IO,
+    "lib.project.project_manager.ProjectManager._write_script_unlocked": MOTIVE_IO,
+    "lib.project.project_manager.ProjectManager._read_script_unlocked": MOTIVE_IO,
+    "lib.artifacts.artifact_activation._ensure_activation_backup": MOTIVE_IO,
+    "server.services.tasks.reference_video_tasks._stage_provider_media_for_task": MOTIVE_IO,
+    "server.services.grid.grid_split._register_split_entries_atomically": MOTIVE_IO,
     # 名字像 I/O，实际是纯判断 / 阈值常量 / 内部编排
     "server.agent_runtime.event_log._is_client_key_violation": MOTIVE_LOGIC,
-    "lib.video_backends.v2_video_generations._LARGE_IMAGE_WARN_BYTES": MOTIVE_LOGIC,
-    "server.services.cost_estimation.quote_video_request_from_price": MOTIVE_LOGIC,
-    "server.services.generation_tasks._execute_reference_video_task_proxy": MOTIVE_LOGIC,
-    "lib.generation_worker.GenerationWorker._dispatch_resume_orphans_background": MOTIVE_LOGIC,
+    "lib.backends.video_backends.v2_video_generations._LARGE_IMAGE_WARN_BYTES": MOTIVE_LOGIC,
+    "server.services.admission.cost_estimation.quote_video_request_from_price": MOTIVE_LOGIC,
 }
 
 MONKEYPATCH_SETTERS = {"setattr", "delattr"}
@@ -254,6 +257,8 @@ class PatchSite:
     module_under_test: str | None
     hits_module_under_test: bool
     motive: str
+    # 目标根部还原到了 import（字符串字面量目标恒为真）；为假时根部是局部对象，同名不代表同一对象
+    import_rooted: bool
 
 
 @dataclass
@@ -624,6 +629,17 @@ def _declares_abstract(node: ast.ClassDef) -> bool:
 
 TIER_MARKS = ("unit", "integration", "e2e")
 
+#: 生产代码的顶层包 → 相对仓库根的源码目录。workspace 子包是 src 布局，源码不在仓库根下。
+PRODUCTION_PACKAGES: Mapping[str, str] = {
+    "lib": ".",
+    "server": ".",
+    "arcreel_market_core": "packages/arcreel-market-core/src",
+}
+PRODUCTION_PREFIXES = tuple(f"{name}." for name in PRODUCTION_PACKAGES)
+
+#: 缺省扫描的后端测试目录：主仓 `tests/` 之外，workspace 子包各有独立的测试目录。
+DEFAULT_TESTS_DIRS = ("tests", "packages/arcreel-market-core/tests")
+
 
 def tier_from_path(path: Path, tests_dir: Path) -> str | None:
     """档位 marker 取 `tests/unit|integration|e2e/` 的第一段目录名。
@@ -681,11 +697,11 @@ class AliasIndex:
             if isinstance(node, ast.Import):
                 for alias in node.names:
                     self.imported_modules.add(alias.name)
-                    if alias.name.startswith(("lib.", "server.")):
+                    if alias.name.startswith(PRODUCTION_PREFIXES):
                         self.import_counter[alias.name] += 1
             elif isinstance(node, ast.ImportFrom) and node.module and node.level == 0:
                 self.imported_modules.add(node.module)
-                if node.module.split(".")[0] in ("lib", "server"):
+                if node.module.split(".")[0] in PRODUCTION_PACKAGES:
                     for alias in node.names:
                         # `from lib.x import y`：y 可能是子模块也可能是符号，两种都登记
                         self.import_counter[f"{node.module}.{alias.name}"] += 1
@@ -704,8 +720,8 @@ class AliasIndex:
         stem = path.stem
         if stem.startswith("test_"):
             stem = stem[5:]
-        pool = {m for m in self.imported_modules if m.startswith(("lib.", "server."))}
-        pool |= {m for m in self.import_counter if m.startswith(("lib.", "server."))}
+        pool = {m for m in self.imported_modules if m.startswith(PRODUCTION_PREFIXES)}
+        pool |= {m for m in self.import_counter if m.startswith(PRODUCTION_PREFIXES)}
         # 必须排序后遍历：并列长度下不定的迭代顺序会让「被测 module」在多次运行间抖动。
         candidates = sorted(m for m in pool if is_module(m))
         best: str | None = None
@@ -928,7 +944,7 @@ def classify_motive(target: str) -> str:
 
 
 def is_private_target(target: str) -> bool:
-    if not target.startswith(("lib.", "server.")):
+    if not target.startswith(PRODUCTION_PREFIXES):
         return False
     return any(seg.startswith("_") and not seg.startswith("__") for seg in target.split(".")[1:])
 
@@ -961,7 +977,8 @@ class ProductionIndex:
 
     def _module_file(self, module: str) -> Path | None:
         rel = module.replace(".", "/")
-        for candidate in (self.root / f"{rel}.py", self.root / rel / "__init__.py"):
+        base = self.root / PRODUCTION_PACKAGES.get(module.split(".")[0], ".")
+        for candidate in (base / f"{rel}.py", base / rel / "__init__.py"):
             if candidate.is_file():
                 return candidate
         return None
@@ -1156,6 +1173,9 @@ class FileScanner:
                 continue
             func, marks, local_aliases = enclosing.get(node.lineno, ("<module>", self.module_marks, {}))
             resolved = self.aliases.resolve(target, local_aliases)
+            head = target.partition(".")[0]
+            literal = bool(node.args) and const_str(node.args[0]) is not None
+            import_rooted = literal or head in local_aliases or head in self.aliases.alias_to_module
             private = is_private_target(resolved)
             module, _symbol = self.prod.split(resolved)
             if module is None:
@@ -1174,6 +1194,7 @@ class FileScanner:
                 module_under_test=self.mut,
                 hits_module_under_test=hits_mut,
                 motive=classify_motive(resolved),
+                import_rooted=import_rooted,
             )
             self.patches.append(site)
             if private:
@@ -1357,6 +1378,97 @@ def scan_shared_facilities(root: Path, parsed: list[tuple[Path, ast.Module]]) ->
             )
 
     return sorted(findings, key=lambda f: (f.rule, f.path, f.line))
+
+
+PATCH_SPREAD_THRESHOLD = 3
+PATCH_SPREAD_KINDS = {"patch", "patch.object"}
+
+
+def scan_patch_spread(patches: Sequence[PatchSite]) -> list[StructureFinding]:
+    """同一 `patch` / `patch.object` 目标出现在 ≥3 个测试文件：缺一个共享替身或 seam。
+
+    每个文件只报该目标的第一处。`monkeypatch.setattr` 不在本规则内，归 review；根部是局部
+    对象的 `patch.object` 目标只在文件内有意义，不跨文件聚合。
+    """
+    first_site: dict[str, dict[str, int]] = defaultdict(dict)
+    for site in patches:
+        if site.kind not in PATCH_SPREAD_KINDS or not site.import_rooted:
+            continue
+        lines = first_site[site.target]
+        lines[site.path] = min(lines.get(site.path, site.line), site.line)
+    findings: list[StructureFinding] = []
+    for target, lines in sorted(first_site.items()):
+        if len(lines) < PATCH_SPREAD_THRESHOLD:
+            continue
+        findings.extend(
+            StructureFinding(
+                "PATCH-SPREAD",
+                rel,
+                line,
+                f"patch 目标 `{target}` 出现在 {len(lines)} 个测试文件",
+                "收编为 tests/fakes.py 或专题共享模块中的共享 helper / fixture，各文件改用它",
+            )
+            for rel, line in sorted(lines.items())
+        )
+    return findings
+
+
+SHARED_SYMBOL_MODULES = ("tests/fakes.py", "tests/factories.py")
+SHARED_SYMBOL_MIN_USERS = 2
+
+
+def shared_symbol_users(tree: ast.Module, module: str) -> set[str]:
+    """本文件从 *module* 用到的符号名：`from m import x` 与 `import m` / `from pkg import m` 后的 `m.x`。"""
+    package, _, leaf = module.rpartition(".")
+    used: set[str] = set()
+    aliases: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom):
+            if node.module == module:
+                used.update(alias.name for alias in node.names)
+            elif node.module == package:
+                aliases.update(alias.asname or alias.name for alias in node.names if alias.name == leaf)
+        elif isinstance(node, ast.Import):
+            aliases.update(alias.asname or alias.name for alias in node.names if alias.name == module)
+    if aliases:
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Attribute) and dotted(node.value) in aliases:
+                used.add(node.attr)
+    return used
+
+
+def scan_shared_symbol_usage(root: Path, parsed: Sequence[tuple[Path, ast.Module]]) -> list[StructureFinding]:
+    """`tests/fakes.py` 与 `tests/factories.py` 的公开顶层符号须被 ≥2 个其他测试文件使用。
+
+    只被一个文件用的移回该文件，模块内部自用的改下划线名，无人使用的删除。
+    """
+    trees = {path.relative_to(root).as_posix(): tree for path, tree in parsed}
+    findings: list[StructureFinding] = []
+    for rel in SHARED_SYMBOL_MODULES:
+        tree = trees.get(rel)
+        if tree is None:
+            continue
+        module = rel.removesuffix(".py").replace("/", ".")
+        users: dict[str, int] = Counter()
+        for other, other_tree in trees.items():
+            if other != rel:
+                users.update(shared_symbol_users(other_tree, module))
+        for node in tree.body:
+            if not isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef) or node.name.startswith("_"):
+                continue
+            count = users[node.name]
+            if count >= SHARED_SYMBOL_MIN_USERS:
+                continue
+            findings.append(
+                StructureFinding(
+                    "SHARED-SYMBOL-USAGE",
+                    rel,
+                    node.lineno,
+                    f"公开符号 `{node.name}` 只被 {count} 个测试文件使用",
+                    "只有一个文件用的移回该文件；模块内部自用的改下划线名；无人使用的删除",
+                )
+            )
+    return findings
 
 
 # ---------------------------------------------------------------- 类 4：文件形态
@@ -1745,8 +1857,9 @@ def scan_module_duplicates(rel: str, tree: ast.Module, scope: CollectionScope) -
 # ---------------------------------------------------------------- 汇总输出
 
 
-def run(root: Path, tests_dir: Path, top: int, frontend_src: Path | None = None) -> dict[str, object]:
-    files = sorted(p for p in tests_dir.rglob("*.py") if p.name != "__init__.py")
+def run(root: Path, tests_dir: Path | Sequence[Path], top: int, frontend_src: Path | None = None) -> dict[str, object]:
+    tests_dirs = [tests_dir] if isinstance(tests_dir, Path) else list(tests_dir)
+    files = sorted((p, base) for base in tests_dirs for p in base.rglob("*.py") if p.name != "__init__.py")
     stats: list[FileStat] = []
     double_only: list[DoubleOnlyTest] = []
     no_assertion_cases: list[NoAssertionTest] = []
@@ -1756,9 +1869,9 @@ def run(root: Path, tests_dir: Path, top: int, frontend_src: Path | None = None)
     parsed: list[tuple[Path, ast.Module]] = []
     prod = ProductionIndex(root)
 
-    for path in files:
+    for path, base in files:
         try:
-            scanner = FileScanner(path, root, tests_dir, prod)
+            scanner = FileScanner(path, root, base, prod)
             scanner.scan()
         except SyntaxError as exc:
             failures.append(
@@ -1814,11 +1927,14 @@ def run(root: Path, tests_dir: Path, top: int, frontend_src: Path | None = None)
             samples_by_motive[p.motive].append(asdict(p))
 
     double_by_file = Counter(d.path for d in double_only)
-    structure = scan_shared_facilities(root, parsed)
+    structure = (
+        scan_shared_facilities(root, parsed) + scan_patch_spread(patches) + scan_shared_symbol_usage(root, parsed)
+    )
     structure_counter = Counter(f.rule for f in structure)
 
     frontend_files = frontend_test_files(frontend_src) if frontend_src and frontend_src.is_dir() else []
-    shape = scan_file_shape(root, files + frontend_files) + scan_frontend_layout(root, frontend_files)
+    backend_files = [path for path, _ in files]
+    shape = scan_file_shape(root, backend_files + frontend_files) + scan_frontend_layout(root, frontend_files)
     shape_counter = Counter(f.rule for f in shape)
 
     return {
@@ -1839,6 +1955,8 @@ def run(root: Path, tests_dir: Path, top: int, frontend_src: Path | None = None)
             "conftest_fixture_override_sites": structure_counter["FIXTURE-OVERRIDE"],
             "conftest_shadow_sites": structure_counter["CONFTEST-SHADOW"],
             "duplicate_fixture_sites": structure_counter["FIXTURE-DUP"],
+            "patch_spread_sites": structure_counter["PATCH-SPREAD"],
+            "underused_shared_symbols": structure_counter["SHARED-SYMBOL-USAGE"],
             "frontend_test_files": len(frontend_files),
             "split_suffix_files": shape_counter["NAME-SPLIT"],
             "oversized_files": shape_counter["SIZE-LIMIT"],
@@ -1963,7 +2081,11 @@ def main(argv: list[str] | None = None) -> int:
         description="审计 tests/ 中「测 mock 本身」与「patch 私有符号/被测公共入口」的用例",
     )
     parser.add_argument("--root", default=".", help="仓库根目录（默认当前目录）")
-    parser.add_argument("--tests", default="tests", help="测试目录，相对 root（默认 tests）")
+    parser.add_argument(
+        "--tests",
+        action="append",
+        help=f"测试目录，相对 root，可重复指定（默认 {' '.join(DEFAULT_TESTS_DIRS)}，其中不存在的子包目录跳过）",
+    )
     parser.add_argument("--top", type=int, default=30, help="Top N 榜单长度（默认 30）")
     parser.add_argument("--json", dest="json_out", help="把完整明细写入该 JSON 文件")
     parser.add_argument(
@@ -1979,12 +2101,17 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     root = Path(args.root).resolve()
-    tests_dir = root / args.tests
-    if not tests_dir.is_dir():
-        print(f"测试目录不存在：{tests_dir}", file=sys.stderr)
-        return 2
+    if args.tests:
+        tests_dirs = [root / name for name in args.tests]
+    else:
+        primary, *packages = DEFAULT_TESTS_DIRS
+        tests_dirs = [root / primary, *(root / name for name in packages if (root / name).is_dir())]
+    for tests_dir in tests_dirs:
+        if not tests_dir.is_dir():
+            print(f"测试目录不存在：{tests_dir}", file=sys.stderr)
+            return 2
 
-    result = run(root, tests_dir, args.top, root / args.frontend)
+    result = run(root, tests_dirs, args.top, root / args.frontend)
     totals = result["totals"]
     assert isinstance(totals, dict)
 

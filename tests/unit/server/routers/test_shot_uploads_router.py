@@ -9,15 +9,16 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from PIL import Image
 
+from lib.artifacts.version_manager import VersionManager
 from lib.i18n.zh import errors as zh_errors
-from lib.project_change_hints import get_project_change_source
-from lib.project_manager import ProjectManager
-from lib.version_manager import VersionManager
+from lib.project.project_change_hints import get_project_change_source
+from lib.project.project_manager import ProjectManager
 from server.auth import CurrentUserInfo, get_current_user
 from server.error_handlers import register_error_handlers
 from server.routers import reference_videos, shot_uploads
 from server.routers import versions as versions_router
-from server.services import generation_tasks, reference_video_tasks, upload_finalize
+from server.services.currency import upload_finalize
+from server.services.tasks import formal_image_commit, generation_tasks, reference_video_tasks
 from tests.auth_deps import AUTH_DEPENDENCIES
 
 
@@ -106,7 +107,7 @@ class TestShotStoryboardUpload:
         def _fail_registration(*_args, **_kwargs):
             raise RuntimeError("injected registration failure")
 
-        monkeypatch.setattr(generation_tasks, "register_formal_task_artifact", _fail_registration)
+        monkeypatch.setattr(formal_image_commit, "register_formal_task_artifact", _fail_registration)
 
         with client:
             response = _upload(client, "storyboard", "replacement.png", _img_bytes("PNG"))
@@ -147,8 +148,8 @@ class TestShotStoryboardUpload:
         assert info["versions"][0]["original_filename"] == "board.jpg"
 
     def test_restoring_a_manual_upload_preserves_its_manifest_claim(self, tmp_path, monkeypatch):
-        from lib.artifact_activation import ArtifactCurrencyResolver
-        from lib.artifact_manifest import ArtifactKey, ArtifactStatus
+        from lib.artifacts.artifact_activation import ArtifactCurrencyResolver
+        from lib.artifacts.artifact_manifest import ArtifactKey, ArtifactStatus
 
         client, pm = _client(monkeypatch, tmp_path)
         with client:
@@ -156,11 +157,6 @@ class TestShotStoryboardUpload:
             second = _upload(client, "storyboard", "second.png", _img_bytes("PNG", size=(16, 16)))
             assert first.status_code == 200, first.text
             assert second.status_code == 200, second.text
-
-            first_record = VersionManager(pm.get_project_path("demo")).get_versions("storyboards", "E1S01")["versions"][
-                0
-            ]
-            assert "artifact_image_basis" in first_record, first_record
 
             restored = client.post("/api/v1/projects/demo/versions/storyboards/E1S01/restore/1")
             assert restored.status_code == 200, restored.text
@@ -293,7 +289,7 @@ class TestShotStoryboardUpload:
 
 
 class TestShotVideoUpload:
-    def test_claim_removal_failure_restores_every_formal_video_file(self, tmp_path, monkeypatch):
+    def test_claim_registration_failure_restores_every_formal_video_file(self, tmp_path, monkeypatch):
         client, pm = _client(monkeypatch, tmp_path)
         project_path = pm.get_project_path("demo")
         video = project_path / "videos" / "scene_E1S01.mp4"
@@ -330,8 +326,8 @@ class TestShotVideoUpload:
         monkeypatch.setattr(upload_finalize, "extract_video_thumbnail", _new_thumbnail)
         monkeypatch.setattr(
             upload_finalize,
-            "forget_current_resource_artifact",
-            lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("claim removal failed")),
+            "register_current_resource_artifact",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("claim registration failed")),
         )
 
         with client:
@@ -499,7 +495,7 @@ def _upload_unit(client, unit_id="E1U1", filename="clip.mp4", content=b"\x00" * 
 
 
 class TestReferenceUnitVideoUpload:
-    def test_claim_removal_failure_restores_every_formal_video_file(self, tmp_path, monkeypatch):
+    def test_claim_registration_failure_restores_every_formal_video_file(self, tmp_path, monkeypatch):
         client, pm = _ref_client(monkeypatch, tmp_path)
         project_path = pm.get_project_path("demo")
         video = project_path / "reference_videos" / "E1U1.mp4"
@@ -529,10 +525,10 @@ class TestReferenceUnitVideoUpload:
         version_dir = project_path / "versions" / "reference_videos"
         before_version_copies = {path.name: path.read_bytes() for path in version_dir.glob("*") if path.is_file()}
 
-        def _fail_claim_removal(*_args, **_kwargs):
-            raise RuntimeError("claim removal failed")
+        def _fail_claim_registration(*_args, **_kwargs):
+            raise RuntimeError("claim registration failed")
 
-        monkeypatch.setattr(upload_finalize, "forget_current_resource_artifact", _fail_claim_removal)
+        monkeypatch.setattr(upload_finalize, "register_current_resource_artifact", _fail_claim_registration)
 
         with client:
             response = _upload_unit(client, content=b"new-video")

@@ -124,10 +124,10 @@ describe("OnboardingTour", () => {
     await waitFor(() => expect(status).toHaveBeenCalled());
   });
 
-  it("runs on the source files list page, which has no filename segment", async () => {
+  it("runs on the project-level episodes view, which has no episode segment", async () => {
     const status = vi.spyOn(API, "getOnboardingStatus").mockResolvedValue({ seen: false });
 
-    renderAt("/app/projects/my-novel/source");
+    renderAt("/app/projects/my-novel/episodes");
 
     await waitFor(() => expect(status).toHaveBeenCalled());
   });
@@ -377,8 +377,8 @@ describe("OnboardingTour", () => {
     await waitFor(() => expect(popoverTitle()).toBe("欢迎使用 ArcReel"));
 
     for (let i = 0; i < 4; i++) click(".driver-popover-next-btn"); // → 配置 Agent
-    await waitFor(() => expect(popoverTitle()).toBe("配置 Agent"));
-    expect(history.at(-1)).toBe("/app/settings?section=agent");
+    await waitFor(() => expect(popoverTitle()).toBe("配置 ArcReel Agent"));
+    expect(history.at(-1)).toBe("/app/settings?section=arcreel-agent");
 
     // 两步同在 /app/settings，退回时 pathname 不变——内容区必须靠 section 参数切回
     // 供应商，否则讲供应商时右边还摆着 Agent（正向同理）。
@@ -483,13 +483,13 @@ describe("OnboardingTour", () => {
       ["新建项目", "/app/projects"],
       ["设置", "/app/projects"],
       ["配置供应商", "/app/settings?section=providers"],
-      ["配置 Agent", "/app/settings?section=agent"],
+      ["配置 ArcReel Agent", "/app/settings?section=arcreel-agent"],
       ["演示项目", "/app/projects"],
-      ["项目概览", DEMO_WORKBENCH],
       ["Agent", DEMO_WORKBENCH],
+      ["项目概览", DEMO_WORKBENCH],
       ["角色、场景与道具", `${DEMO_WORKBENCH}/characters`],
-      ["分镜画布", DEMO_EPISODE],
-      ["导出", DEMO_EPISODE],
+      ["分镜", `${DEMO_EPISODE}?view=board`],
+      ["导出项目", `${DEMO_EPISODE}?view=board`],
       ["开始你的第一个项目", "/app/projects"],
     ];
 
@@ -525,11 +525,11 @@ describe("OnboardingTour", () => {
     for (let i = 0; i < 5; i++) click(".driver-popover-next-btn"); // → 演示卡（interactive）
     await waitFor(() => expect(popoverTitle()).toBe("演示项目"));
 
-    // 顺着这一步给的入口点进演示工作台：不拽回大厅，引导顺势推进到工作台首步——
+    // 顺着这一步给的入口点进演示工作台：不拽回大厅，引导顺势推进到工作台首步（Agent）——
     // 点卡片和点「下一步」殊途同归。
     act(() => navigate(DEMO_WORKBENCH));
 
-    await waitFor(() => expect(popoverTitle()).toBe("项目概览"));
+    await waitFor(() => expect(popoverTitle()).toBe("Agent"));
     expect(history.at(-1)).toBe(DEMO_WORKBENCH);
     expect(API.markOnboardingSeen).not.toHaveBeenCalled();
 
@@ -548,8 +548,8 @@ describe("OnboardingTour", () => {
     );
     await waitFor(() => expect(popoverTitle()).toBe("欢迎使用 ArcReel"));
 
-    for (let i = 0; i < 6; i++) click(".driver-popover-next-btn"); // → 项目概览（工作台第一步）
-    await waitFor(() => expect(popoverTitle()).toBe("项目概览"));
+    for (let i = 0; i < 6; i++) click(".driver-popover-next-btn"); // → Agent（工作台第一步）
+    await waitFor(() => expect(popoverTitle()).toBe("Agent"));
     expect(history.at(-1)).toBe(DEMO_WORKBENCH);
 
     click(".arc-tour-skip-btn");

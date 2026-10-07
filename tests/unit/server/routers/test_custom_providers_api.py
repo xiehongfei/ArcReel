@@ -6,26 +6,27 @@
 
 from __future__ import annotations
 
-import asyncio
 import json
 from collections.abc import Generator
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
-from fastapi import FastAPI
 from fastapi.testclient import TestClient
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from lib.config.service import ConfigService
-from lib.custom_provider.endpoints import ENDPOINT_REGISTRY, declarative_endpoint_spec
-from lib.db import get_async_session
-from server.auth import CurrentUserInfo, get_current_user
-from server.error_handlers import register_error_handlers
+from lib.custom_provider.endpoints import (
+    ENDPOINT_REGISTRY,
+    EndpointSpec,
+    declarative_endpoint_spec,
+    get_endpoint_spec,
+)
 from server.routers import custom_providers
-from tests.auth_deps import AUTH_DEPENDENCIES
+from tests.factories import custom_endpoint_definition
 from tests.http_capture import capture_http, only_request
 
 _EXAMPLE_TEMPLATE_PATH = (
@@ -44,29 +45,8 @@ def _example_template_definition() -> dict[str, Any]:
 
 
 @pytest.fixture
-async def app_session_factory(db_engine):
-    return async_sessionmaker(db_engine, expire_on_commit=False)
-
-
-@pytest.fixture
-def app(app_session_factory) -> FastAPI:
-    """创建绑定内存数据库的 FastAPI 应用。"""
-    _app = FastAPI()
-
-    async def _override_session():
-        async with app_session_factory() as db_session:
-            yield db_session
-
-    _app.dependency_overrides[get_async_session] = _override_session
-    _app.dependency_overrides[get_current_user] = lambda: CurrentUserInfo(id="test", sub="test", role="admin")
-    _app.include_router(custom_providers.router, prefix="/api/v1", dependencies=AUTH_DEPENDENCIES)
-    register_error_handlers(_app)
-    return _app
-
-
-@pytest.fixture
-def custom_providers_client(app) -> Generator[TestClient, None, None]:
-    with TestClient(app) as c:
+def custom_providers_client(custom_providers_app) -> Generator[TestClient, None, None]:
+    with TestClient(custom_providers_app) as c:
         yield c
 
 
@@ -137,7 +117,7 @@ class TestCreateProvider:
         assert resp.json()["models"] == []
 
     def test_create_openai_discovery_format_provider(self, custom_providers_client: TestClient):
-        """回归: POST /custom-providers 接受 discovery_format=openai 且持久化正确字段。"""
+        """POST /custom-providers 接受 discovery_format=openai 且持久化正确字段。"""
         resp = custom_providers_client.post(
             "/api/v1/custom-providers",
             json={
@@ -246,6 +226,11 @@ class TestEndpointCatalog:
                 "request_path_template",
                 "image_capabilities",
                 "end_image_capable",
+                "size_fixed",
+                "duration_fixed",
+                "duration_frame_rate_missing",
+                "duration_tier_empty",
+                "native_resolution",
             }
             assert entry["request_method"] == "POST"
             assert entry["request_path_template"].startswith("/")
@@ -292,7 +277,7 @@ class TestEndpointCatalog:
         assert sorted(by_key["gemini-image"]["image_capabilities"]) == ["image_to_image", "text_to_image"]
 
     def test_endpoint_route_not_shadowed_by_provider_id(self, custom_providers_client: TestClient):
-        """回归：/endpoints 必须先于 /{provider_id} 注册，不能被解析为整型 provider_id。"""
+        """/endpoints 必须先于 /{provider_id} 注册，不能被解析为整型 provider_id。"""
         resp = custom_providers_client.get("/api/v1/custom-providers/endpoints")
         assert resp.status_code == 200, resp.text
 
@@ -434,94 +419,6 @@ class TestDeleteProvider:
 
 
 # ---------------------------------------------------------------------------
-# Model management
-# ---------------------------------------------------------------------------
-
-
-class TestReplaceModels:
-    def test_replace_entire_model_list(self, custom_providers_client: TestClient):
-        create_resp = custom_providers_client.post(
-            "/api/v1/custom-providers",
-            json={
-                "display_name": "Model Test",
-                "discovery_format": "openai",
-                "base_url": "https://api.example.com/v1",
-                "api_key": "sk-model-test-1234",
-                "models": [
-                    {
-                        "model_id": "old-model",
-                        "display_name": "Old Model",
-                        "endpoint": "openai-chat",
-                    }
-                ],
-            },
-        )
-        pid = create_resp.json()["id"]
-
-        new_models = [
-            {
-                "model_id": "new-text",
-                "display_name": "New Text Model",
-                "endpoint": "openai-chat",
-                "is_default": True,
-            },
-            {
-                "model_id": "new-image",
-                "display_name": "New Image Model",
-                "endpoint": "openai-images",
-                "is_default": True,
-            },
-        ]
-        resp = custom_providers_client.put(f"/api/v1/custom-providers/{pid}/models", json={"models": new_models})
-        assert resp.status_code == 200
-        body = resp.json()
-        assert len(body) == 2
-        assert {m["model_id"] for m in body} == {"new-text", "new-image"}
-
-    def test_returns_404_for_nonexistent_provider(self, custom_providers_client: TestClient):
-        resp = custom_providers_client.put("/api/v1/custom-providers/9999/models", json={"models": []})
-        assert resp.status_code == 404
-
-    def test_verify_old_models_removed(self, custom_providers_client: TestClient):
-        create_resp = custom_providers_client.post(
-            "/api/v1/custom-providers",
-            json={
-                "display_name": "Replace Verify",
-                "discovery_format": "openai",
-                "base_url": "https://api.example.com/v1",
-                "api_key": "sk-replace-test-12",
-                "models": [
-                    {
-                        "model_id": "original",
-                        "display_name": "Original",
-                        "endpoint": "openai-chat",
-                    }
-                ],
-            },
-        )
-        pid = create_resp.json()["id"]
-
-        custom_providers_client.put(
-            f"/api/v1/custom-providers/{pid}/models",
-            json={
-                "models": [
-                    {
-                        "model_id": "replacement",
-                        "display_name": "Replacement",
-                        "endpoint": "newapi-video",
-                    }
-                ]
-            },
-        )
-
-        # Verify via get provider
-        get_resp = custom_providers_client.get(f"/api/v1/custom-providers/{pid}")
-        models = get_resp.json()["models"]
-        assert len(models) == 1
-        assert models[0]["model_id"] == "replacement"
-
-
-# ---------------------------------------------------------------------------
 # Discover models (mock)
 # ---------------------------------------------------------------------------
 
@@ -553,6 +450,20 @@ class TestDiscoverModels:
         assert resp.status_code == 200
         assert len(resp.json()["models"]) == 1
         assert resp.json()["models"][0]["model_id"] == "gpt-4"
+
+    def test_discover_refuses_a_metadata_destination_with_a_redacted_reason(self, custom_providers_client: TestClient):
+        """出站目的地被拒按 502 回显，正文是截断脱敏后的失败串，与上游故障同一条出口。"""
+        with capture_http() as router:
+            route = router.get("http://169.254.169.254/v1/models").respond(json={"data": []})
+            resp = custom_providers_client.post(
+                "/api/v1/custom-providers/discover",
+                json={"discovery_format": "anthropic", "base_url": "http://169.254.169.254", "api_key": "sk-secret"},
+            )
+        assert route.call_count == 0
+        assert resp.status_code == 502
+        detail = resp.json()["detail"]
+        assert "disallowed address" in detail
+        assert "sk-secret" not in detail
 
     def test_discover_google(self, custom_providers_client: TestClient):
         """google discovery_format 透传到 discover_models。"""
@@ -586,21 +497,16 @@ class TestDiscoverModels:
     def test_discover_rejects_credential_bearing_base_url(self, custom_providers_client: TestClient):
         """带查询串 / 权限段凭证的 anthropic base_url 在发起请求前就被拒，回给前端的文案不含凭证。"""
         base_url = "https://ant-user:sk-leaked-userinfo@relay.example.com/anthropic?api_key=sk-leaked-query"
-        discovery_client = httpx.AsyncClient()
-        try:
-            with capture_http() as http:
-                route = http.get(host="relay.example.com").respond(status_code=401, text="unauthorized")
-                with patch("lib.custom_provider.discovery.get_http_client", return_value=discovery_client):
-                    resp = custom_providers_client.post(
-                        "/api/v1/custom-providers/discover",
-                        json={
-                            "discovery_format": "anthropic",
-                            "base_url": base_url,
-                            "api_key": "sk-ant",
-                        },
-                    )
-        finally:
-            asyncio.run(discovery_client.aclose())
+        with capture_http() as http:
+            route = http.get(host="relay.example.com").respond(status_code=401, text="unauthorized")
+            resp = custom_providers_client.post(
+                "/api/v1/custom-providers/discover",
+                json={
+                    "discovery_format": "anthropic",
+                    "base_url": base_url,
+                    "api_key": "sk-ant",
+                },
+            )
 
         assert route.call_count == 0
         assert resp.status_code == 422
@@ -662,7 +568,7 @@ class TestDiscoverModels:
 
 
 class TestDiscoverModelsByStoredProvider:
-    """回归: 编辑已保存供应商时，前端无法重新提交明文 api_key，需用 stored 凭证调用 by-id 端点。"""
+    """编辑已保存供应商时，前端无法重新提交明文 api_key，需用 stored 凭证调用 by-id 端点。"""
 
     def _create(self, custom_providers_client: TestClient) -> int:
         resp = custom_providers_client.post(
@@ -816,7 +722,7 @@ class TestConnectionTest:
 
 
 # ---------------------------------------------------------------------------
-# 回归测试：修复过的高危 bug
+# 供应商整表写入、删除与引用清理
 # ---------------------------------------------------------------------------
 
 _PROVIDER_PAYLOAD = {
@@ -844,7 +750,7 @@ _PROVIDER_PAYLOAD = {
 
 
 class TestDeleteProviderCleansGlobalSettings:
-    """回归: 删除 provider 时应清理全局 DB 中引用该 provider 的 default_*_backend。"""
+    """删除 provider 时应清理全局 DB 中引用该 provider 的 default_*_backend。"""
 
     async def test_global_settings_cleaned_on_delete(
         self, custom_providers_client: TestClient, db_session: AsyncSession
@@ -877,7 +783,7 @@ class TestDeleteProviderCleansGlobalSettings:
 
 
 class TestDeleteProviderCleansProjectRefs:
-    """回归: 删除 provider 时应清理项目级 project.json 中的悬空引用。"""
+    """删除 provider 时应清理项目级 project.json 中的悬空引用。"""
 
     def test_project_refs_cleaned_on_delete(self, custom_providers_client: TestClient):
         resp = custom_providers_client.post("/api/v1/custom-providers", json=_PROVIDER_PAYLOAD)
@@ -917,22 +823,30 @@ class TestDeleteProviderCleansProjectRefs:
         assert test_proj["title"] == "Test"  # 无关字段保留
 
 
-class TestReplaceModelsCleansStaleRefs:
-    """回归: 替换 models 时应清理引用已删除 model 的全局配置。"""
+class TestFullUpdateCleansStaleModelRefs:
+    """设置页保存走 PUT /{provider_id} 整表替换模型：全局默认里指向被删模型的键随之清空。"""
 
-    async def test_stale_model_refs_cleaned(self, custom_providers_client: TestClient, db_session: AsyncSession):
-        resp = custom_providers_client.post("/api/v1/custom-providers", json=_PROVIDER_PAYLOAD)
-        pid = resp.json()["id"]
+    async def test_only_refs_to_deleted_models_of_this_provider_are_cleared(
+        self, custom_providers_client: TestClient, db_session: AsyncSession
+    ):
+        pid = custom_providers_client.post("/api/v1/custom-providers", json=_PROVIDER_PAYLOAD).json()["id"]
+        other_pid = custom_providers_client.post("/api/v1/custom-providers", json=_PROVIDER_PAYLOAD).json()["id"]
 
-        # 模拟全局配置引用 gpt-4o
         svc = ConfigService(db_session)
         await svc.set_setting("default_text_backend", f"custom-{pid}/gpt-4o")
+        await svc.set_setting("default_image_backend", f"custom-{pid}/dall-e-3")
+        # 另一个供应商下的同名 model_id
+        await svc.set_setting("text_backend_simple", f"custom-{other_pid}/gpt-4o")
+        # 视频桶键的悬空引用由解析闸报错兜底，写入侧不级联清理
+        await svc.set_setting("default_video_backend_i2v", f"custom-{pid}/gpt-4o")
         await db_session.commit()
 
-        # 替换 models — 移除 gpt-4o，保留 dall-e-3
-        replace_resp = custom_providers_client.put(
-            f"/api/v1/custom-providers/{pid}/models",
+        # 保存时移除 gpt-4o，保留 dall-e-3
+        resp = custom_providers_client.put(
+            f"/api/v1/custom-providers/{pid}",
             json={
+                "display_name": "Regression Test",
+                "base_url": "https://api.example.com/v1",
                 "models": [
                     {
                         "model_id": "dall-e-3",
@@ -941,17 +855,19 @@ class TestReplaceModelsCleansStaleRefs:
                         "is_default": True,
                         "is_enabled": True,
                     },
-                ]
+                ],
             },
         )
-        assert replace_resp.status_code == 200
+        assert resp.status_code == 200
 
-        # gpt-4o 被删除，引用它的全局配置应被清空
         assert await svc.get_setting("default_text_backend", "") == ""
+        assert await svc.get_setting("default_image_backend", "") == f"custom-{pid}/dall-e-3"
+        assert await svc.get_setting("text_backend_simple", "") == f"custom-{other_pid}/gpt-4o"
+        assert await svc.get_setting("default_video_backend_i2v", "") == f"custom-{pid}/gpt-4o"
 
 
 class TestGlobalBucketRefsHint:
-    """回归: 能力编辑响应应非阻塞地提示模型正被哪些全局桶键引用。"""
+    """能力编辑响应应非阻塞地提示模型正被哪些全局桶键引用。"""
 
     async def test_referenced_model_lists_global_keys(
         self, custom_providers_client: TestClient, db_session: AsyncSession
@@ -991,8 +907,10 @@ class TestGlobalBucketRefsHint:
         await db_session.commit()
 
         replace_resp = custom_providers_client.put(
-            f"/api/v1/custom-providers/{pid}/models",
+            f"/api/v1/custom-providers/{pid}",
             json={
+                "display_name": "Regression Test",
+                "base_url": "https://api.example.com/v1",
                 "models": [
                     {
                         "model_id": "gpt-4o",
@@ -1001,11 +919,11 @@ class TestGlobalBucketRefsHint:
                         "is_default": True,
                         "is_enabled": True,
                     },
-                ]
+                ],
             },
         )
         assert replace_resp.status_code == 200
-        assert replace_resp.json()[0]["global_bucket_refs"] == ["default_video_backend_i2v"]
+        assert replace_resp.json()["models"][0]["global_bucket_refs"] == ["default_video_backend_i2v"]
 
     def test_global_bucket_keys_have_i18n_labels(self):
         """每个提示键都须有三语文案：前端按 `global_bucket_label_<key>` 动态取词，缺文案会把
@@ -1018,7 +936,7 @@ class TestGlobalBucketRefsHint:
 
 
 class TestEmptyModelIdRejected:
-    """回归: 启用模型必须有非空 model_id。"""
+    """启用模型必须有非空 model_id。"""
 
     def test_create_with_empty_model_id(self, custom_providers_client: TestClient):
         resp = custom_providers_client.post(
@@ -1035,22 +953,24 @@ class TestEmptyModelIdRejected:
         )
         assert resp.status_code == 422
 
-    def test_replace_models_with_empty_model_id(self, custom_providers_client: TestClient):
+    def test_full_update_with_whitespace_model_id(self, custom_providers_client: TestClient):
         create_resp = custom_providers_client.post("/api/v1/custom-providers", json=_PROVIDER_PAYLOAD)
         pid = create_resp.json()["id"]
         resp = custom_providers_client.put(
-            f"/api/v1/custom-providers/{pid}/models",
+            f"/api/v1/custom-providers/{pid}",
             json={
+                "display_name": "Regression Test",
+                "base_url": "https://api.example.com/v1",
                 "models": [
                     {"model_id": "  ", "display_name": "Blank", "endpoint": "openai-chat", "is_enabled": True},
-                ]
+                ],
             },
         )
         assert resp.status_code == 422
 
 
 class TestUnknownEndpointRejected:
-    """回归：写入路径用未注册 endpoint key 应被 AfterValidator 拦下，返回 422。"""
+    """写入路径用未注册 endpoint key 应被 AfterValidator 拦下，返回 422。"""
 
     def test_create_with_unknown_endpoint(self, custom_providers_client: TestClient):
         resp = custom_providers_client.post(
@@ -1075,7 +995,7 @@ class TestUnknownEndpointRejected:
 
 
 class TestDuplicateModelIdRejected:
-    """回归: 同一供应商下不允许重复 model_id。"""
+    """同一供应商下不允许重复 model_id。"""
 
     def test_create_with_duplicate(self, custom_providers_client: TestClient):
         resp = custom_providers_client.post(
@@ -1096,7 +1016,7 @@ class TestDuplicateModelIdRejected:
 
 
 class TestFullUpdateProvider:
-    """回归: PUT 全量更新端点应原子更新 provider + models。"""
+    """PUT 全量更新端点应原子更新 provider + models。"""
 
     def test_full_update(self, custom_providers_client: TestClient):
         create_resp = custom_providers_client.post("/api/v1/custom-providers", json=_PROVIDER_PAYLOAD)
@@ -1238,10 +1158,10 @@ class TestConcurrencyFields:
 
 
 class TestValidateBackendValueCustomPrefix:
-    """回归: validate_backend_value 应接受 custom-* 前缀。"""
+    """validate_backend_value 应接受 custom-* 前缀。"""
 
     def test_custom_prefix_accepted(self):
-        from lib.api_errors import BadRequestError
+        from lib.infra.api_errors import BadRequestError
         from server.routers._validators import validate_backend_value
 
         # custom- 前缀不在 PROVIDER_REGISTRY 中，仍须放行（逐模型能力由供应商 API 把关）
@@ -1250,7 +1170,7 @@ class TestValidateBackendValueCustomPrefix:
         assert validate_backend_value("custom-3/gpt-4o", "default_text_backend") is None
 
     def test_unknown_provider_rejected(self):
-        from lib.api_errors import BadRequestError
+        from lib.infra.api_errors import BadRequestError
         from server.routers._validators import validate_backend_value
 
         with pytest.raises(BadRequestError) as exc_info:
@@ -1261,7 +1181,7 @@ class TestValidateBackendValueCustomPrefix:
 
 
 class TestDuplicateDefaultRejected:
-    """回归: 同一 media_type 下最多只能有一个 is_default=True 的模型。"""
+    """同一 media_type 下最多只能有一个 is_default=True 的模型。"""
 
     def test_create_with_duplicate_defaults(self, custom_providers_client: TestClient):
         """创建供应商时同一 media_type 有两个 is_default=true 的模型，期望 422。"""
@@ -1331,7 +1251,7 @@ class TestDuplicateDefaultRejected:
 
 
 class TestPriceFieldConsistency:
-    """回归: price_output 不能脱离 price_input 单独存在；currency 可独立存在。"""
+    """price_output 不能脱离 price_input 单独存在；currency 可独立存在。"""
 
     def test_output_without_input_rejected(self, custom_providers_client: TestClient):
         resp = custom_providers_client.post(
@@ -1459,8 +1379,8 @@ class TestResolutionField:
         assert resp.status_code == 200
         assert resp.json()["models"][0]["resolution"] is None
 
-    def test_replace_models_updates_resolution_to_null(self, custom_providers_client: TestClient):
-        """通过 PUT /models 更新 resolution 为 null。"""
+    def test_full_update_clears_resolution_to_null(self, custom_providers_client: TestClient):
+        """PUT /{provider_id} 整表保存时省略 resolution 即清为 null。"""
         # 先创建带 resolution 的 provider
         resp = custom_providers_client.post(
             "/api/v1/custom-providers",
@@ -1485,8 +1405,10 @@ class TestResolutionField:
 
         # 替换模型列表，resolution 省略即为 null
         resp = custom_providers_client.put(
-            f"/api/v1/custom-providers/{pid}/models",
+            f"/api/v1/custom-providers/{pid}",
             json={
+                "display_name": "Z",
+                "base_url": "https://api.example.com",
                 "models": [
                     {
                         "model_id": "m1",
@@ -1605,6 +1527,136 @@ async def test_split_image_endpoints_may_both_be_default(custom_providers_client
     assert defaults == {"m1": True, "m2": True}
 
 
+def _builtin_specs(models) -> dict[str, EndpointSpec]:
+    """内置端点的 spec 表，形状与 `_resolve_model_endpoint_specs` 的产出一致。"""
+    return {m.endpoint: get_endpoint_spec(m.endpoint) for m in models}
+
+
+def _custom_endpoint_spec(key: str, media_type: str) -> EndpointSpec:
+    """一条 ce- 端点的 spec，媒体类型按需改写——键前缀推不出媒体类型，只能由 spec 带过来。"""
+    spec = declarative_endpoint_spec(key, custom_endpoint_definition(), source="custom")
+    return replace(spec, media_type=media_type)
+
+
+def test_to_db_dict_reads_the_media_type_from_the_resolved_spec():
+    """时长档位归一只对视频端点做；ce- 端点是不是视频，由解析好的 spec 说了算。"""
+    from server.routers.custom_providers import ModelInput
+
+    model = ModelInput(model_id="m1", display_name="m1", endpoint="ce-7", supported_durations=[])
+
+    # video：空列表下游视为非法，归一为缺省再由 preset 兜底
+    assert model.to_db_dict(_custom_endpoint_spec("ce-7", "video"))["supported_durations"] != "[]"
+    # 非 video：不归一，原样落库
+    assert model.to_db_dict(_custom_endpoint_spec("ce-7", "image"))["supported_durations"] == "[]"
+
+
+def test_check_unique_defaults_reads_the_media_type_from_the_resolved_spec():
+    """两条 ce- 默认模型冲不冲突，取决于 spec 的媒体类型，而不是键前缀。"""
+    from fastapi import HTTPException
+
+    from server.routers.custom_providers import ModelInput, _check_unique_defaults
+
+    models = [
+        ModelInput(model_id="m1", display_name="m1", endpoint="ce-7", is_default=True),
+        ModelInput(model_id="m2", display_name="m2", endpoint="ce-8", is_default=True),
+    ]
+
+    def t(key, **params):
+        return f"{key}:{params}"
+
+    same_lane = {"ce-7": _custom_endpoint_spec("ce-7", "audio"), "ce-8": _custom_endpoint_spec("ce-8", "audio")}
+    with pytest.raises(HTTPException) as excinfo:
+        _check_unique_defaults(models, same_lane, t)
+    assert excinfo.value.status_code == 422
+
+    split_lanes = {"ce-7": _custom_endpoint_spec("ce-7", "audio"), "ce-8": _custom_endpoint_spec("ce-8", "video")}
+    _check_unique_defaults(models, split_lanes, t)
+
+
+def test_check_unique_defaults_refuses_two_image_defaults_that_declare_no_capabilities():
+    """能力集为空的图像端点分不开彼此：两条这样的默认放过去，取默认模型时会一次查出两行。
+
+    ``ce-`` 端点的能力位内置查表查不到，此前整条被跳过，于是这类默认从不参与互斥校验。
+    """
+    from fastapi import HTTPException
+
+    from server.routers.custom_providers import ModelInput, _check_unique_defaults
+
+    models = [
+        ModelInput(model_id="m1", display_name="m1", endpoint="ce-7", is_default=True),
+        ModelInput(model_id="m2", display_name="m2", endpoint="ce-8", is_default=True),
+    ]
+    specs = {"ce-7": _custom_endpoint_spec("ce-7", "image"), "ce-8": _custom_endpoint_spec("ce-8", "image")}
+
+    def t(key, **params):
+        return f"{key}:{params}"
+
+    with pytest.raises(HTTPException) as excinfo:
+        _check_unique_defaults(models, specs, t)
+
+    assert excinfo.value.status_code == 422
+
+
+def _comfyui_image_spec(key: str, *, reference_slots: int) -> EndpointSpec:
+    """一条 ComfyUI 图像端点的 spec：参考图格子决定它落在 t2i 还是 i2i 那一格。"""
+    from lib.custom_provider.endpoints import comfyui_endpoint_spec
+    from tests.factories import comfyui_endpoint_definition
+
+    definition = comfyui_endpoint_definition(media_type="image")
+    if reference_slots:
+        definition["workflow"]["20"] = {"class_type": "LoadImage", "inputs": {"image": "draft.png"}}
+        definition["bindings"]["reference_images"] = [
+            {"node": "20", "input": "image", "class_type": "LoadImage"}
+        ] * reference_slots
+    return comfyui_endpoint_spec(key, definition)
+
+
+def test_check_unique_defaults_separates_two_comfyui_image_endpoints_by_capability():
+    """一份文生图 workflow 与一份图生图 workflow 各设默认：能力集不相交，互不冲突。"""
+    from server.routers.custom_providers import ModelInput, _check_unique_defaults
+
+    models = [
+        ModelInput(model_id="t2i", display_name="t2i", endpoint="ce-7", is_default=True),
+        ModelInput(model_id="i2i", display_name="i2i", endpoint="ce-8", is_default=True),
+    ]
+    specs = {
+        "ce-7": _comfyui_image_spec("ce-7", reference_slots=0),
+        "ce-8": _comfyui_image_spec("ce-8", reference_slots=1),
+    }
+
+    _check_unique_defaults(models, specs, lambda key, **params: key)
+
+
+def test_check_unique_defaults_rejects_two_comfyui_text_to_image_defaults():
+    """两份都只会文生图：同一格里两个默认，取默认模型时会一次查出两行。"""
+    from fastapi import HTTPException
+
+    from server.routers.custom_providers import ModelInput, _check_unique_defaults
+
+    models = [
+        ModelInput(model_id="m1", display_name="m1", endpoint="ce-7", is_default=True),
+        ModelInput(model_id="m2", display_name="m2", endpoint="ce-8", is_default=True),
+    ]
+    specs = {
+        "ce-7": _comfyui_image_spec("ce-7", reference_slots=0),
+        "ce-8": _comfyui_image_spec("ce-8", reference_slots=0),
+    }
+
+    with pytest.raises(HTTPException) as excinfo:
+        _check_unique_defaults(models, specs, lambda key, **params: f"{key}:{params}")
+
+    assert excinfo.value.status_code == 422
+
+
+def test_check_unique_defaults_allows_one_image_default_without_capabilities():
+    """一条这样的默认没有分不开的对象，照常放行。"""
+    from server.routers.custom_providers import ModelInput, _check_unique_defaults
+
+    models = [ModelInput(model_id="m1", display_name="m1", endpoint="ce-7", is_default=True)]
+
+    _check_unique_defaults(models, {"ce-7": _custom_endpoint_spec("ce-7", "image")}, lambda key, **params: key)
+
+
 def test_check_unique_defaults_rejects_two_generations_defaults():
     """同 provider 内两条 -generations 都设默认 → 422。"""
     from fastapi import HTTPException
@@ -1620,7 +1672,7 @@ def test_check_unique_defaults_rejects_two_generations_defaults():
         return f"{key}:{params}"
 
     with pytest.raises(HTTPException) as excinfo:
-        _check_unique_defaults(models, t)
+        _check_unique_defaults(models, _builtin_specs(models), t)
     assert excinfo.value.status_code == 422
 
 
@@ -1639,7 +1691,7 @@ def test_check_unique_defaults_rejects_wildcard_with_split():
         return f"{key}:{params}"
 
     with pytest.raises(HTTPException):
-        _check_unique_defaults(models, t)
+        _check_unique_defaults(models, _builtin_specs(models), t)
 
 
 def test_check_unique_defaults_text_still_media_type_exclusive():
@@ -1657,7 +1709,7 @@ def test_check_unique_defaults_text_still_media_type_exclusive():
         return f"{key}:{params}"
 
     with pytest.raises(HTTPException):
-        _check_unique_defaults(models, t)
+        _check_unique_defaults(models, _builtin_specs(models), t)
 
 
 # ---------------------------------------------------------------------------
@@ -1809,10 +1861,9 @@ class TestDiscoverAnthropic:
         assert mock_discover.call_args.kwargs["api_key"] == "sk-stored"
 
 
-class TestGetProviderCredentials:
-    def test_returns_plaintext(self, custom_providers_client: TestClient):
-        """正常路径返回明文 base_url + api_key。"""
-        # 先创建 provider
+class TestProviderSecretReadback:
+    def test_stored_api_key_has_no_readback_route(self, custom_providers_client: TestClient):
+        """供应商密钥只以掩码形式出现在响应中，不提供按 id 读回明文的路由。"""
         create_resp = custom_providers_client.post(
             "/api/v1/custom-providers",
             json={
@@ -1827,14 +1878,9 @@ class TestGetProviderCredentials:
         provider_id = create_resp.json()["id"]
 
         resp = custom_providers_client.get(f"/api/v1/custom-providers/{provider_id}/credentials")
-        assert resp.status_code == 200
-        body = resp.json()
-        assert body["base_url"] == "https://oneapi.example.com"
-        assert body["api_key"] == "sk-secret"
-
-    def test_returns_404_for_unknown_provider(self, custom_providers_client: TestClient):
-        resp = custom_providers_client.get("/api/v1/custom-providers/99999/credentials")
-        assert resp.status_code == 404
+        assert resp.status_code in (404, 405)
+        detail = custom_providers_client.get(f"/api/v1/custom-providers/{provider_id}")
+        assert "sk-secret" not in detail.text
 
 
 class TestSupportedDurationsAutoFill:
@@ -1919,3 +1965,57 @@ class TestSupportedDurationsAutoFill:
         resp = custom_providers_client.get(f"/api/v1/custom-providers/{provider_id}")
         model = resp.json()["models"][0]
         assert model["supported_durations"] is None
+
+
+class TestMaxOutputTokens:
+    @staticmethod
+    def _create(client: TestClient, models: list[dict[str, Any]]):
+        return client.post(
+            "/api/v1/custom-providers",
+            json={
+                "display_name": "Relay",
+                "discovery_format": "openai",
+                "base_url": "https://relay.test/v1",
+                "api_key": "sk-relay-12345678",
+                "models": models,
+            },
+        )
+
+    def test_text_model_keeps_its_registered_limit(self, custom_providers_client: TestClient):
+        resp = self._create(
+            custom_providers_client,
+            [
+                {"model_id": "my-llm", "display_name": "My LLM", "endpoint": "openai-chat", "max_output_tokens": 8192},
+                {"model_id": "bare-llm", "display_name": "Bare", "endpoint": "openai-chat"},
+            ],
+        )
+
+        assert resp.status_code == 201
+        detail = custom_providers_client.get(f"/api/v1/custom-providers/{resp.json()['id']}").json()
+        limits = {m["model_id"]: m["max_output_tokens"] for m in detail["models"]}
+        assert limits == {"my-llm": 8192, "bare-llm": None}
+
+    def test_non_text_model_drops_the_limit(self, custom_providers_client: TestClient):
+        resp = self._create(
+            custom_providers_client,
+            [
+                {
+                    "model_id": "dall-e-3",
+                    "display_name": "DALL-E 3",
+                    "endpoint": "openai-images",
+                    "max_output_tokens": 4096,
+                }
+            ],
+        )
+
+        assert resp.status_code == 201
+        assert resp.json()["models"][0]["max_output_tokens"] is None
+
+    @pytest.mark.parametrize("bad", [0, -1])
+    def test_non_positive_limit_is_rejected(self, custom_providers_client: TestClient, bad: int):
+        resp = self._create(
+            custom_providers_client,
+            [{"model_id": "my-llm", "display_name": "My LLM", "endpoint": "openai-chat", "max_output_tokens": bad}],
+        )
+
+        assert resp.status_code == 422

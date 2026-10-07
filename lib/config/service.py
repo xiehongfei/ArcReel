@@ -7,25 +7,25 @@ from typing import Literal
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from arcreel_market_core.video_backend_contract import DEFAULT_VIDEO_POLL_TIMEOUT_SECONDS
 from lib.config.env_keys import ANTHROPIC_ENV_KEYS
 from lib.config.registry import PROVIDER_REGISTRY
 from lib.config.repository import ProviderConfigRepository, SystemSettingRepository
 from lib.db.repositories.credential_repository import CredentialRepository
-from lib.schema_guards import is_int
+from lib.infra.schema_guards import is_int
 
 _DEFAULT_VIDEO_BACKEND = "gemini-aistudio/veo-3.1-lite-generate-preview"
 _DEFAULT_IMAGE_BACKEND = "gemini-aistudio/gemini-3.1-flash-image-preview"
 _DEFAULT_TEXT_BACKEND = "gemini-aistudio/gemini-3-flash-preview"
 _DEFAULT_AUDIO_BACKEND = "dashscope/qwen3-tts-flash"
-# 旁白默认音色（DashScope 预设）；可被 project.json 顶层 narration_voice 或全局 setting 覆盖
-# （与 video_backend 等同走顶层 key，非 settings 子字典）。
+# 旁白默认音色（DashScope 预设）；全局 setting 未配置时的兜底。全局音色与语速只作为新建 TTS 项目
+# 的预填值，项目创建后以 project.json 顶层的快照为准（docs/adr/0089）。
 _DEFAULT_NARRATION_VOICE = "Cherry"
-DEFAULT_VIDEO_POLL_TIMEOUT_SECONDS = 3600
 MIN_VIDEO_POLL_TIMEOUT_SECONDS = 60
 
 # 参考上传副本的保守通用请求体上限（ArcReel 侧安全策略常量，非任一供应商的真实字节限；
 # 被动 413 兜底负责自我纠正）。可经 per-provider 配置 key 覆盖。
-# 与 lib/reference_compression.DEFAULT_* 数值一致（单测断言对齐）。
+# 与 lib/references/reference_compression.DEFAULT_* 数值一致（单测断言对齐）。
 _DEFAULT_REFERENCE_TOTAL_MAX_BYTES = 8 * 1024 * 1024
 _DEFAULT_REFERENCE_SINGLE_MAX_BYTES = 4 * 1024 * 1024
 
@@ -109,8 +109,8 @@ class ProviderStatus:
     media_types: list[str]
     capabilities: list[str]
     required_keys: list[str]
-    configured_keys: list[str]
-    missing_keys: list[str]
+    # 凭证（界面称「密钥」）条数，供设置页二级栏显示「已配置 N 个密钥」。
+    credential_count: int
     models: dict[str, dict] | None = None  # model_id -> ModelInfo dict representation
 
 
@@ -152,19 +152,12 @@ class ConfigService:
         await self._provider_repo.delete(provider, key, flush=flush)
 
     async def get_all_providers_status(self) -> list[ProviderStatus]:
-        all_configured = await self._provider_repo.get_all_configured_keys_bulk()
         cred_repo = CredentialRepository(self._provider_repo.session)
         active_creds = await cred_repo.get_active_credentials_bulk()
+        credential_counts = await cred_repo.count_by_provider_bulk()
         statuses = []
         for name, meta in PROVIDER_REGISTRY.items():
-            has_active = name in active_creds
-            configured = all_configured.get(name, [])
-            if has_active:
-                status: Literal["ready", "unconfigured", "error"] = "ready"
-                missing: list[str] = []
-            else:
-                status = "unconfigured"
-                missing = list(meta.required_keys)
+            status: Literal["ready", "unconfigured", "error"] = "ready" if name in active_creds else "unconfigured"
             # 先按 __dict__ 排除 pricing（其费率含 tuple 键，非 JSON 可序列化且响应不消费；
             # 用 __dict__ 而非 asdict 以免递归转换 pricing 后又被丢弃），再 deepcopy 其余可变容器
             # 字段（list/dict），避免返回值与全局 PROVIDER_REGISTRY 共享引用被调用方意外改写。
@@ -181,8 +174,7 @@ class ConfigService:
                     media_types=list(meta.media_types),
                     capabilities=list(meta.capabilities),
                     required_keys=list(meta.required_keys),
-                    configured_keys=configured,
-                    missing_keys=missing,
+                    credential_count=credential_counts.get(name, 0),
                     models=models_dict,
                 )
             )

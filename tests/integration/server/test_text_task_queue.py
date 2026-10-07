@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import threading
 from collections.abc import Awaitable, Callable
@@ -10,53 +11,84 @@ from typing import Any, Literal
 import pytest
 from sqlalchemy import func, select
 
-from lib.api_errors import ConflictError
-from lib.artifact_activation import activate_artifact_target_state
-from lib.artifact_manifest import ArtifactKey, ProjectArtifactManifestAdapter
-from lib.async_thread import run_sync_transaction
+from lib.artifacts.artifact_activation import activate_artifact_target_state
+from lib.artifacts.artifact_manifest import ArtifactKey, ProjectArtifactManifestAdapter
+from lib.backends.text_backends.base import TextGenerationResult as BackendTextGenerationResult
+from lib.backends.text_backends.base import TextOutputTruncatedError
+from lib.backends.text_generator import TextGenerator
 from lib.config.resolver import ConfigResolver
 from lib.db import async_session_factory
 from lib.db.base import DEFAULT_USER_ID
 from lib.db.models.task import GenerationBatch
-from lib.draft_quarantine import (
+from lib.episode.episode_planner import (
+    EpisodePlanner,
+    EpisodePlanningError,
+    EpisodePlanSummary,
+    NoCutPointError,
+    PlanningOutputTruncatedError,
+    PlanResult,
+)
+from lib.generation.generation_batch import GenerationBatchRequestedItem, GenerationBatchRequestSnapshot
+from lib.generation.generation_queue import GenerationQueue
+from lib.generation.generation_queue_client import wait_for_task
+from lib.generation.generation_result import (
+    GenerationAction,
+    GenerationSelectionMode,
+    decode_generation_problem,
+    problem_from_task_failure,
+)
+from lib.generation.generation_worker import CapacityTable, GenerationWorker
+from lib.infra.api_errors import ConflictError
+from lib.infra.async_thread import run_sync_transaction
+from lib.infra.data_root_layout import DataRootLayout
+from lib.project.project_manager import ProjectManager
+from lib.project.project_migration_failure import ProjectMigrationError, record_migration_failure
+from lib.project.project_schema import CURRENT_PROJECT_SCHEMA_VERSION
+from lib.script.draft_quarantine import (
     QUARANTINE_KIND_NARRATION_SCRIPT_PLAN,
     QUARANTINE_KIND_SCRIPT_PLAN,
+    draft_revision,
     quarantine_path,
+    read_quarantine,
+    write_quarantine,
 )
-from lib.episode_planner import EpisodePlanner, EpisodePlanningError, EpisodePlanSummary, PlanResult
-from lib.generation_batch import GenerationBatchRequestedItem, GenerationBatchRequestSnapshot
-from lib.generation_queue import CompensableGenerationResult, GenerationQueue
-from lib.generation_queue_client import wait_for_task
-from lib.generation_result import GenerationAction, GenerationSelectionMode, problem_from_task_failure
-from lib.generation_worker import CapacityTable, GenerationWorker
-from lib.project_manager import ProjectManager
-from lib.project_migration_failure import ProjectMigrationError, record_migration_failure
-from lib.project_schema import CURRENT_PROJECT_SCHEMA_VERSION
-from lib.text_backends.base import TextGenerationResult as BackendTextGenerationResult
-from lib.workflow_state import WorkflowStateService
-from server import tool_runtime
-from server.text_generation import (
-    CompensableTextGenerationResult,
-    TextGenerationRequest,
-)
+from server import draft_repair as draft_repair_module
+from server.text_generation import TextGenerationRequest
 from server.tool_runtime import (
     CallerContext,
+    GenerateEpisodeScriptRequest,
+    GenerateScriptPlanRequest,
     PlanEpisodesRequest,
     ProjectScope,
+    RepairDraftRequest,
     Services,
     ToolRequest,
     execute_queued_text_task,
     generate_episode_script,
     generate_script_plan,
     plan_episodes,
+    repair_draft,
 )
+from tests.factories import register_project_sources
+from tests.fakes import FakeTextGenerator, refuse_resume_execution
+
+
+def _admit_text_operations(projects: ProjectManager, project_name: str) -> None:
+    """放上文本长调用的准入输入：整本源文与第 1 集集原文；广告/短片填创作灵感。"""
+    if projects.load_project(project_name).get("content_mode") == "ad":
+        projects.update_project(project_name, lambda project: project.update(brief="夏季新品"))
+        return
+    register_project_sources(
+        projects,
+        project_name,
+        whole_source={"novel.txt": "第一章\n张三走向村口。"},
+        own_episodes=("张三走向村口。",),
+    )
 
 
 async def _start_text_worker(
     queue: GenerationQueue,
     executor: Callable[..., Awaitable[dict[str, Any]]],
-    *,
-    dispatch_cancellation: bool = False,
 ) -> GenerationWorker:
     async def text_provider(_task: dict[str, Any]) -> str:
         return "text"
@@ -67,6 +99,7 @@ async def _start_text_worker(
         provider_projection=text_provider,
         executor=executor,
         lanes=("text",),
+        resume_executor=refuse_resume_execution,
     )
     worker.poll_interval = 0.01
     worker.heartbeat_interval = 0.01
@@ -75,28 +108,8 @@ async def _start_text_worker(
         owner_id=worker.owner_id,
         ttl_seconds=worker.lease_ttl,
     )
-    if dispatch_cancellation:
-        queue.set_worker_cancel_callback(worker.request_cancel)
     await worker.start()
     return worker
-
-
-def _cancel_batch_after_text_commit(
-    queue: GenerationQueue,
-    *,
-    project_name: str,
-    batch_ids: list[str],
-    ready: asyncio.Event,
-) -> Callable[..., Awaitable[dict[str, Any]]]:
-    async def execute(task: dict[str, Any], *, claimed_provider_id: str | None = None) -> dict[str, Any]:
-        del claimed_provider_id
-        result = await execute_queued_text_task(task)
-        await ready.wait()
-        cancelled = await queue.cancel_generation_batch(project_name=project_name, batch_id=batch_ids[0])
-        assert cancelled.cancelling == [task["task_id"]]
-        return result
-
-    return execute
 
 
 @pytest.mark.parametrize(
@@ -122,6 +135,7 @@ async def test_all_text_long_calls_submit_single_member_batches(
     projects.create_project(project_name, content_mode=content_mode)
     projects.create_project_metadata(project_name, project_name, "", content_mode)
     projects.update_project(project_name, lambda project: project.update(generation_mode=generation_mode))
+    _admit_text_operations(projects, project_name)
     queue = GenerationQueue(session_factory=file_db_factory, project_manager=projects)
     assert await queue.acquire_or_renew_worker_lease(name="default", owner_id="test-worker", ttl_seconds=60)
     services = Services(
@@ -130,12 +144,16 @@ async def test_all_text_long_calls_submit_single_member_batches(
         capabilities=ConfigResolver(async_session_factory),
         queue=queue,
     )
-    scope = ProjectScope(project_name=project_name, projects_root=projects.projects_root)
+    scope = ProjectScope(project_name=project_name, data_root=projects.data_root)
     caller = CallerContext(user_id=DEFAULT_USER_ID, source="mcp")
     if handler == "script":
-        outcome = await generate_episode_script(ToolRequest(TextGenerationRequest(episode=1)), scope, caller, services)
+        outcome = await generate_episode_script(
+            ToolRequest(GenerateEpisodeScriptRequest(episode_id=1)), scope, caller, services
+        )
     elif handler == "script_plan":
-        outcome = await generate_script_plan(ToolRequest(TextGenerationRequest(episode=1)), scope, caller, services)
+        outcome = await generate_script_plan(
+            ToolRequest(GenerateScriptPlanRequest(episode_id=1)), scope, caller, services
+        )
     else:
         outcome = await plan_episodes(ToolRequest(PlanEpisodesRequest()), scope, caller, services)
 
@@ -146,6 +164,227 @@ async def test_all_text_long_calls_submit_single_member_batches(
     assert len(batch.members) == 1
     assert batch.members[0].task_type == expected_task_type
     assert batch.poll_after_seconds is not None
+    task_id = batch.members[0].task_id
+    assert task_id is not None
+    task = await queue.get_task(task_id)
+    assert task is not None
+    assert str(projects.data_root) not in json.dumps(task["payload"], ensure_ascii=False)
+
+
+async def test_web_prompt_authoring_returns_the_batch_without_waiting(tmp_path: Path, file_db_factory) -> None:
+    """Web 入口与 Agent 同一个服务命令：提交即返批次句柄，任务按 Web 来源登记，载荷带范围与模式。"""
+    projects = ProjectManager(tmp_path / "projects")
+    projects.create_project("demo", content_mode="ad")
+    projects.create_project_metadata("demo", "demo", "", "ad")
+    projects.update_project("demo", lambda project: project.update(brief="夏季新品"))
+    queue = GenerationQueue(session_factory=file_db_factory, project_manager=projects)
+    assert await queue.acquire_or_renew_worker_lease(name="default", owner_id="test-worker", ttl_seconds=60)
+    services = Services(
+        projects=projects,
+        workflow_planner=object(),
+        capabilities=ConfigResolver(async_session_factory),
+        queue=queue,
+    )
+
+    outcome = await generate_episode_script(
+        ToolRequest(GenerateEpisodeScriptRequest(episode_id=1, instructions="冷色调")),
+        ProjectScope(project_name="demo", data_root=projects.data_root),
+        CallerContext(user_id=DEFAULT_USER_ID, source="webui"),
+        services,
+    )
+
+    assert outcome.problem is None
+    batch = outcome.value
+    assert batch is not None
+    assert batch.done is False
+    task_id = batch.members[0].task_id
+    assert task_id is not None
+    task = await queue.get_task(task_id)
+    assert task is not None
+    assert task["source"] == "webui"
+    assert task["payload"]["instructions"] == "冷色调"
+    assert task["payload"]["rewrite"] is False
+
+
+def _narration_segment(**overrides: Any) -> dict[str, Any]:
+    segment: dict[str, Any] = {
+        "segment_id": "E1S01",
+        "novel_text": "张三走向村口。",
+        "duration_seconds": 4,
+        "segment_break": False,
+        "characters_in_segment": ["张三"],
+        "scenes": [],
+        "props": [],
+    }
+    segment.update(overrides)
+    return segment
+
+
+def _narration_project_with_draft(segments: list[dict[str, Any]]) -> tuple[ProjectManager, str]:
+    """当前数据根下的旁白/解说项目，第 1 集留着一份待修复的脚本规划草稿；返回项目管理器与草稿 revision。
+
+    worker 执行未登记服务的任务时按当前配置解析数据根，项目须建在那里。
+    """
+    projects = ProjectManager(DataRootLayout.current().root)
+    projects.create_project("demo")
+    projects.create_project_metadata("demo", "Demo", "Anime", "narration")
+    projects.add_character("demo", "张三", "村民")
+    projects.add_episode("demo", 1, "第一集", "scripts/episode_1.json")
+    project_path = projects.get_project_path("demo")
+    (project_path / "source").mkdir(exist_ok=True)
+    (project_path / "source" / "episode_1.txt").write_text("张三走向村口。", encoding="utf-8")
+    write_quarantine(
+        project_path,
+        1,
+        QUARANTINE_KIND_NARRATION_SCRIPT_PLAN,
+        content={"segments": segments},
+        violations=[],
+        meta={"source": None},
+    )
+    draft = read_quarantine(project_path, 1, QUARANTINE_KIND_NARRATION_SCRIPT_PLAN)
+    assert draft is not None
+    return projects, draft_revision(draft)
+
+
+@pytest.mark.usefixtures("video_request_facts")
+async def test_web_draft_repair_queues_a_text_task_that_adopts_the_repaired_draft(
+    file_db_factory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """AI 修复以排队文本任务提交，占用本份草稿的槽；worker 修完照常重判，违约清零即采用。"""
+    projects, revision = _narration_project_with_draft([_narration_segment(characters_in_segment=["王五"])])
+    queue = GenerationQueue(session_factory=file_db_factory, project_manager=projects)
+    assert await queue.acquire_or_renew_worker_lease(name="default", owner_id="test-worker", ttl_seconds=60)
+    services = Services(
+        projects=projects,
+        workflow_planner=object(),
+        capabilities=ConfigResolver(async_session_factory),
+        queue=queue,
+    )
+    scope = ProjectScope(project_name="demo", data_root=projects.data_root)
+    caller = CallerContext(user_id=DEFAULT_USER_ID, source="webui")
+
+    stale = await repair_draft(
+        ToolRequest(RepairDraftRequest(episode_id=1, doc_type="narration_script_plan", base_revision="stale")),
+        scope,
+        caller,
+        services,
+    )
+    assert stale.problem is not None
+    assert stale.problem.code == "revision_conflict"
+
+    outcome = await repair_draft(
+        ToolRequest(
+            RepairDraftRequest(
+                episode_id=1, doc_type="narration_script_plan", base_revision=revision, instructions="只改出场角色"
+            )
+        ),
+        scope,
+        caller,
+        services,
+    )
+    assert outcome.problem is None
+    batch = outcome.value
+    assert batch is not None
+    assert batch.done is False
+    (member,) = batch.members
+    assert (member.task_type, member.unit_id) == ("text_draft_repair", "episode-1-narration_script_plan")
+    assert member.task_id is not None
+    task = await queue.get_task(member.task_id)
+    assert task is not None
+    assert task["payload"]["instructions"] == "只改出场角色"
+
+    repaired = _narration_segment()
+    model = FakeTextGenerator(json.dumps({"segments": [repaired]}, ensure_ascii=False))
+    monkeypatch.setattr(TextGenerator, "create", model.create)
+    result = await execute_queued_text_task(task)
+
+    assert (result["adopted"], result["violation_count"]) == (True, 0)
+    assert "只改出场角色" in model.requests[0].prompt
+    project_path = projects.get_project_path("demo")
+    assert read_quarantine(project_path, 1, QUARANTINE_KIND_NARRATION_SCRIPT_PLAN) is None
+    formal = json.loads((project_path / "drafts" / "episode_1" / "script_plan_segments.json").read_text("utf-8"))
+    assert formal["segments"] == [repaired]
+
+
+@pytest.mark.usefixtures("video_request_facts")
+async def test_failed_queued_draft_repair_fails_the_task_with_a_localizable_reason(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    projects, revision = _narration_project_with_draft([_narration_segment(characters_in_segment=["王五"])])
+    monkeypatch.setattr(TextGenerator, "create", FakeTextGenerator("not json").create)
+    payload = {"episode_id": 1, "doc_type": "narration_script_plan", "base_revision": revision, "instructions": None}
+    task = {"task_id": "task-repair", "project_name": "demo", "task_type": "text_draft_repair", "payload": payload}
+
+    with pytest.raises(RuntimeError) as raised:
+        await execute_queued_text_task(task)
+
+    problem = decode_generation_problem(str(raised.value))
+    assert problem is not None
+    assert problem.code == "draft_repair_failed"
+    draft = read_quarantine(projects.get_project_path("demo"), 1, QUARANTINE_KIND_NARRATION_SCRIPT_PLAN)
+    assert draft is not None
+    assert draft_revision(draft) == revision
+
+    stale_task = {**task, "payload": {**payload, "base_revision": "stale"}}
+    with pytest.raises(RuntimeError) as raised:
+        await execute_queued_text_task(stale_task)
+    problem = decode_generation_problem(str(raised.value))
+    assert problem is not None
+    assert problem.code == "draft_revision_conflict"
+
+
+@pytest.mark.usefixtures("video_request_facts")
+async def test_draft_repair_failing_before_the_write_back_does_not_claim_the_draft_was_saved(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    projects, revision = _narration_project_with_draft([_narration_segment(characters_in_segment=["王五"])])
+
+    def unreadable_source(*_args, **_kwargs):
+        raise PermissionError("source/novel.txt")
+
+    monkeypatch.setattr(draft_repair_module, "load_novel_source", unreadable_source)
+    payload = {"episode_id": 1, "doc_type": "narration_script_plan", "base_revision": revision, "instructions": None}
+    task = {"task_id": "task-repair", "project_name": "demo", "task_type": "text_draft_repair", "payload": payload}
+
+    with pytest.raises(RuntimeError) as raised:
+        await execute_queued_text_task(task)
+
+    problem = decode_generation_problem(str(raised.value))
+    assert problem is not None
+    assert problem.code == "draft_repair_failed"
+    draft = read_quarantine(projects.get_project_path("demo"), 1, QUARANTINE_KIND_NARRATION_SCRIPT_PLAN)
+    assert draft is not None
+    assert draft_revision(draft) == revision
+
+
+@pytest.mark.usefixtures("video_request_facts")
+async def test_truncated_draft_repair_fails_with_the_way_out_and_keeps_the_draft(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AI 修复的回复被截断：任务以分集规划同一个问题码失败，带出路参数，草稿不变。"""
+    projects, revision = _narration_project_with_draft([_narration_segment(characters_in_segment=["王五"])])
+    model = FakeTextGenerator(
+        TextOutputTruncatedError(
+            provider="openai", model="my-llm", output_tokens=8192, provider_id="custom-3", custom_model=True
+        )
+    )
+    monkeypatch.setattr(TextGenerator, "create", model.create)
+    payload = {"episode_id": 1, "doc_type": "narration_script_plan", "base_revision": revision, "instructions": None}
+    task = {"task_id": "task-repair", "project_name": "demo", "task_type": "text_draft_repair", "payload": payload}
+
+    with pytest.raises(RuntimeError) as raised:
+        await execute_queued_text_task(task)
+
+    problem = problem_from_task_failure(str(raised.value))
+    assert (problem.code, problem.action, problem.params) == (
+        "text_output_truncated",
+        GenerationAction.CONFIGURE_PROVIDER,
+        {"provider_id": "custom-3", "model": "my-llm", "custom_model": True},
+    )
+    assert model.require_complete == [True]
+    draft = read_quarantine(projects.get_project_path("demo"), 1, QUARANTINE_KIND_NARRATION_SCRIPT_PLAN)
+    assert draft is not None
+    assert draft_revision(draft) == revision
 
 
 async def test_text_mcp_rejects_lost_worker_lease_without_persisting_queue_state(
@@ -155,6 +394,7 @@ async def test_text_mcp_rejects_lost_worker_lease_without_persisting_queue_state
     projects = ProjectManager(tmp_path / "projects")
     projects.create_project("drama", content_mode="drama")
     projects.create_project_metadata("drama", "Drama", "", "drama")
+    _admit_text_operations(projects, "drama")
     queue = GenerationQueue(session_factory=file_db_factory, project_manager=projects)
     assert await queue.acquire_or_renew_worker_lease(name="default", owner_id="lost-worker", ttl_seconds=60)
     await queue.release_worker_lease(name="default", owner_id="lost-worker")
@@ -166,8 +406,8 @@ async def test_text_mcp_rejects_lost_worker_lease_without_persisting_queue_state
     )
 
     outcome = await generate_script_plan(
-        ToolRequest(TextGenerationRequest(episode=1)),
-        ProjectScope(project_name="drama", projects_root=projects.projects_root),
+        ToolRequest(GenerateScriptPlanRequest(episode_id=1)),
+        ProjectScope(project_name="drama", data_root=projects.data_root),
         CallerContext(user_id=DEFAULT_USER_ID, source="mcp"),
         services,
     )
@@ -187,6 +427,7 @@ async def test_text_mcp_migration_rejection_cleans_only_the_fresh_batch(
     projects = ProjectManager(tmp_path / "projects")
     projects.create_project("drama", content_mode="drama")
     projects.create_project_metadata("drama", "Drama", "", "drama")
+    _admit_text_operations(projects, "drama")
     queue = GenerationQueue(session_factory=file_db_factory, project_manager=projects)
     assert await queue.acquire_or_renew_worker_lease(name="default", owner_id="test-worker", ttl_seconds=60)
     services = Services(
@@ -195,8 +436,8 @@ async def test_text_mcp_migration_rejection_cleans_only_the_fresh_batch(
         capabilities=ConfigResolver(async_session_factory),
         queue=queue,
     )
-    request = ToolRequest(TextGenerationRequest(episode=1))
-    scope = ProjectScope(project_name="drama", projects_root=projects.projects_root)
+    request = ToolRequest(GenerateScriptPlanRequest(episode_id=1))
+    scope = ProjectScope(project_name="drama", data_root=projects.data_root)
     caller = CallerContext(user_id=DEFAULT_USER_ID, source="mcp")
     submitted = await generate_script_plan(request, scope, caller, services)
     assert submitted.value is not None
@@ -244,6 +485,7 @@ async def test_text_submission_cancellation_only_cleans_a_fresh_batch(
     projects = ProjectManager(tmp_path / "projects")
     projects.create_project("drama", content_mode="drama")
     projects.create_project_metadata("drama", "Drama", "", "drama")
+    _admit_text_operations(projects, "drama")
     queue = CancellationQueue(session_factory=concurrent_session_factory, project_manager=projects)
     assert await queue.acquire_or_renew_worker_lease(name="default", owner_id="test-worker", ttl_seconds=60)
     historical_batch_id = await queue.create_generation_batch(
@@ -264,7 +506,7 @@ async def test_text_submission_cancellation_only_cleans_a_fresh_batch(
         resource_id="episode-1" if cancel_state == "membership" else "old",
         # payload 取请求对象自己的投影：本用例的 membership 变体要让新提交与这条在跑任务
         # 判成同一件事，两边的事实必须逐字段相同，写死字面量会随请求字段增删而失效。
-        payload=TextGenerationRequest(episode=1).to_payload() | {"projects_root": str(projects.projects_root)},
+        payload=TextGenerationRequest(episode=1).to_payload() | {"projects_root": str(projects.data_root)},
         batch_id=historical_batch_id,
         batch_unit_id="episode-1" if cancel_state == "membership" else "old",
     )
@@ -277,8 +519,8 @@ async def test_text_submission_cancellation_only_cleans_a_fresh_batch(
 
     submission = asyncio.create_task(
         generate_script_plan(
-            ToolRequest(TextGenerationRequest(episode=1)),
-            ProjectScope(project_name="drama", projects_root=projects.projects_root),
+            ToolRequest(GenerateScriptPlanRequest(episode_id=1)),
+            ProjectScope(project_name="drama", data_root=projects.data_root),
             CallerContext(user_id=DEFAULT_USER_ID, source=source),
             services,
         )
@@ -311,15 +553,23 @@ async def test_text_submission_cancellation_only_cleans_a_fresh_batch(
     ]
 
 
-async def test_queued_plan_ignores_internal_payload_and_preserves_typed_failure(tmp_path: Path) -> None:
+@pytest.mark.parametrize("legacy_data_root", [False, True])
+async def test_queued_plan_resolves_data_root_from_current_config_and_preserves_typed_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, legacy_data_root: bool
+) -> None:
     projects = ProjectManager(tmp_path / "projects")
     projects.create_project("planning", content_mode="narration")
     projects.create_project_metadata("planning", "Planning", "", "narration")
+    monkeypatch.setenv("ARCREEL_DATA_DIR", str(projects.data_root))
+    payload: dict[str, Any] = {"instructions": "按章节"}
+    if legacy_data_root:
+        # 旧版本排入的任务在载荷里带着入队时的数据根；数据根此后已挪走。
+        payload["projects_root"] = str(tmp_path / "moved-away")
     task = {
         "task_id": "task-plan",
         "project_name": "planning",
         "task_type": "text_episode_plan",
-        "payload": {"instructions": "按章节", "projects_root": str(projects.projects_root)},
+        "payload": payload,
     }
 
     class Planner:
@@ -327,7 +577,7 @@ async def test_queued_plan_ignores_internal_payload_and_preserves_typed_failure(
         async def create(cls, _project_path):
             return cls()
 
-        async def plan(self, instructions=None):
+        async def plan(self, instructions=None, gap=None):
             assert instructions == "按章节"
             return PlanResult(
                 episodes=[
@@ -337,6 +587,8 @@ async def test_queued_plan_ignores_internal_payload_and_preserves_typed_failure(
                         hook="悬念",
                         reading_units=800,
                         ledger_status="planned",
+                        first_sentence="第一句。",
+                        last_sentence="最后一句。",
                     )
                 ],
                 cursor=None,
@@ -344,9 +596,11 @@ async def test_queued_plan_ignores_internal_payload_and_preserves_typed_failure(
 
     result = await execute_queued_text_task(task, planner_cls=Planner)
     assert result["episodes"][0]["title"] == "第一集"
+    assert result["episodes"][0]["first_sentence"] == "第一句。"
+    assert result["episodes"][0]["last_sentence"] == "最后一句。"
 
     class FailingPlanner(Planner):
-        async def plan(self, instructions=None):
+        async def plan(self, instructions=None, gap=None):
             raise EpisodePlanningError("invalid source window")
 
     with pytest.raises(RuntimeError) as raised:
@@ -354,132 +608,65 @@ async def test_queued_plan_ignores_internal_payload_and_preserves_typed_failure(
     problem = problem_from_task_failure(str(raised.value))
     assert problem.code == "episode_planning_failed"
     assert problem.action is GenerationAction.RETRY
+    assert problem.detail == "invalid source window"
 
 
-async def test_queued_script_plan_preserves_runtime_cancellation_receipt(tmp_path: Path, monkeypatch) -> None:
-    compensations: list[str] = []
-
-    async def handler(*_args, **_kwargs):
-        return CompensableTextGenerationResult("committed", lambda: compensations.append("restored"))
-
-    monkeypatch.setattr(tool_runtime, "generate_reference_script_plan", handler)
-    result = await execute_queued_text_task(
-        {
-            "task_id": "task-script_plan",
-            "project_name": "demo",
-            "task_type": "text_reference_script_plan",
-            "payload": {"episode": 1, "projects_root": str(tmp_path)},
-        }
-    )
-
-    assert isinstance(result, CompensableGenerationResult)
-    assert result == {"message": "committed"}
-    result.compensate_cancelled()
-    assert compensations == ["restored"]
-
-
-@pytest.mark.parametrize("later_write", [False, True])
-async def test_episode_script_terminal_update_race_cancels_batch_and_compensates_files(
-    tmp_path: Path,
-    file_db_factory,
-    monkeypatch,
-    later_write: bool,
+@pytest.mark.parametrize(
+    ("failure", "code", "action", "params"),
+    [
+        (
+            PlanningOutputTruncatedError(
+                TextOutputTruncatedError(
+                    provider="openai", model="my-llm", output_tokens=8192, provider_id="custom-3", custom_model=True
+                )
+            ),
+            "text_output_truncated",
+            GenerationAction.CONFIGURE_PROVIDER,
+            {"provider_id": "custom-3", "model": "my-llm", "custom_model": True},
+        ),
+        (
+            NoCutPointError(source_file="source/novel.txt", offset=120),
+            "episode_planning_no_cut_point",
+            GenerationAction.FIX_INPUT,
+            {"source_file": "source/novel.txt", "offset": 120},
+        ),
+    ],
+)
+async def test_queued_plan_failure_carries_the_way_out(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: Exception, code: str, action, params: dict
 ) -> None:
     projects = ProjectManager(tmp_path / "projects")
-    project_path = projects.create_project("script", content_mode="ad")
-    projects.create_project_metadata("script", "Script", "", "ad")
-    projects.update_project(
-        "script",
-        lambda project: project.update(
-            episodes=[{"episode": 1, "title": "第一集", "script_file": "scripts/episode_1.json"}]
-        ),
-    )
-    script_path = projects.save_script(
-        "script",
-        {"episode": 1, "title": "旧剧本", "shots": []},
-        "episode_1.json",
-        validate=False,
-    )
-    activate_artifact_target_state(project_path, bump_schema=False)
-    before_script = script_path.read_bytes()
-    before_project = (project_path / "project.json").read_bytes()
-    before_manifest = ProjectArtifactManifestAdapter(project_path).snapshot_entries()
+    projects.create_project("planning", content_mode="narration")
+    projects.create_project_metadata("planning", "Planning", "", "narration")
+    monkeypatch.setenv("ARCREEL_DATA_DIR", str(projects.data_root))
 
-    class Generator:
+    class Planner:
         @classmethod
-        async def create(cls, *_args, **_kwargs):
+        async def create(cls, _project_path):
             return cls()
 
-        async def generate(self, *, cancellation_file_receipts, cancellation_manifest_receipts, **_kwargs):
-            return projects.save_script(
-                "script",
-                {"episode": 1, "title": "新剧本", "shots": []},
-                "episode_1.json",
-                validate=False,
-                cancellation_file_receipts=cancellation_file_receipts,
-                cancellation_manifest_receipts=cancellation_manifest_receipts,
-            )
+        async def plan(self, instructions=None, gap=None):
+            raise failure
 
-    monkeypatch.setattr("server.text_generation.ScriptGenerator", Generator)
-    queue = GenerationQueue(session_factory=file_db_factory, project_manager=projects)
-    batch_ids: list[str] = []
-    ready = asyncio.Event()
+    task = {"task_id": "task-plan", "project_name": "planning", "task_type": "text_episode_plan", "payload": {}}
+    with pytest.raises(RuntimeError) as raised:
+        await execute_queued_text_task(task, planner_cls=Planner)
 
-    async def execute(task: dict[str, Any], *, claimed_provider_id: str | None = None) -> dict[str, Any]:
-        del claimed_provider_id
-        result = await execute_queued_text_task(task)
-        if later_write:
-            projects.update_project("script", lambda project: project.update(title="后续写入"))
-        await ready.wait()
-        cancelled = await queue.cancel_generation_batch(project_name="script", batch_id=batch_ids[0])
-        assert cancelled.cancelling == [task["task_id"]]
-        return result
-
-    worker = await _start_text_worker(queue, execute)
-    services = Services(
-        projects=projects,
-        workflow_planner=object(),
-        capabilities=ConfigResolver(async_session_factory),
-        queue=queue,
-    )
-    try:
-        submitted = await generate_episode_script(
-            ToolRequest(TextGenerationRequest(episode=1)),
-            ProjectScope(project_name="script", projects_root=projects.projects_root),
-            CallerContext(user_id=DEFAULT_USER_ID, source="mcp"),
-            services,
-        )
-        assert submitted.value is not None
-        batch_id = submitted.value.batch_id
-        task_id = submitted.value.members[0].task_id
-        assert task_id is not None
-        batch_ids.append(batch_id)
-        ready.set()
-        task = await wait_for_task(task_id, 0.01, queue=queue)
-        assert task["status"] == "cancelled"
-    finally:
-        ready.set()
-        await worker.stop()
-
-    batch = await queue.get_generation_batch(project_name="script", batch_id=batch_id)
-    assert batch.done is True
-    assert batch.members[0].status == "cancelled"
-    if later_write:
-        assert script_path.read_bytes() != before_script
-        assert projects.load_project_readonly("script")["title"] == "后续写入"
-        assert ProjectArtifactManifestAdapter(project_path).get_entry(ArtifactKey.episode_script(1)) is not None
-    else:
-        assert script_path.read_bytes() == before_script
-        assert (project_path / "project.json").read_bytes() == before_project
-        assert ProjectArtifactManifestAdapter(project_path).snapshot_entries() == before_manifest
+    problem = problem_from_task_failure(str(raised.value))
+    assert (problem.code, problem.action, problem.params) == (code, action, params)
+    if code == "text_output_truncated":
+        assert problem.detail == str(failure)
 
 
-async def test_cancel_during_started_episode_script_commit_restores_formal_state(
+async def test_cancel_during_started_episode_script_commit_leaves_member_running_to_success(
     tmp_path: Path, file_db_factory, monkeypatch
 ) -> None:
     projects = ProjectManager(tmp_path / "projects")
+    # worker 按当前配置解析数据根。
+    monkeypatch.setenv("ARCREEL_DATA_DIR", str(projects.data_root))
     project_path = projects.create_project("script", content_mode="ad")
     projects.create_project_metadata("script", "Script", "", "ad")
+    _admit_text_operations(projects, "script")
     projects.update_project(
         "script",
         lambda project: project.update(
@@ -487,25 +674,26 @@ async def test_cancel_during_started_episode_script_commit_restores_formal_state
         ),
     )
     activate_artifact_target_state(project_path, bump_schema=False)
-    before_project = (project_path / "project.json").read_bytes()
-    before_manifest = ProjectArtifactManifestAdapter(project_path).snapshot_entries()
     started = threading.Event()
     release = threading.Event()
 
     class Generator:
+        content_mode = "ad"
+
+        def __init__(self) -> None:
+            self.project_json = projects.load_project("script")
+
         @classmethod
         async def create(cls, *_args, **_kwargs):
             return cls()
 
-        async def generate(self, *, cancellation_file_receipts, cancellation_manifest_receipts, **_kwargs):
+        async def generate(self, *_args, **_kwargs):
             def commit():
                 path = projects.save_script(
                     "script",
                     {"episode": 1, "title": "新剧本", "shots": []},
                     "episode_1.json",
                     validate=False,
-                    cancellation_file_receipts=cancellation_file_receipts,
-                    cancellation_manifest_receipts=cancellation_manifest_receipts,
                 )
                 started.set()
                 release.wait()
@@ -520,7 +708,7 @@ async def test_cancel_during_started_episode_script_commit_restores_formal_state
         del claimed_provider_id
         return await execute_queued_text_task(task)
 
-    worker = await _start_text_worker(queue, execute, dispatch_cancellation=True)
+    worker = await _start_text_worker(queue, execute)
     services = Services(
         projects=projects,
         workflow_planner=object(),
@@ -529,8 +717,8 @@ async def test_cancel_during_started_episode_script_commit_restores_formal_state
     )
     try:
         submitted = await generate_episode_script(
-            ToolRequest(TextGenerationRequest(episode=1)),
-            ProjectScope(project_name="script", projects_root=projects.projects_root),
+            ToolRequest(GenerateEpisodeScriptRequest(episode_id=1)),
+            ProjectScope(project_name="script", data_root=projects.data_root),
             CallerContext(user_id=DEFAULT_USER_ID, source="mcp"),
             services,
         )
@@ -540,125 +728,39 @@ async def test_cancel_during_started_episode_script_commit_restores_formal_state
         assert task_id is not None
         assert await asyncio.to_thread(started.wait, 1)
         cancelled = await queue.cancel_generation_batch(project_name="script", batch_id=batch_id)
-        assert cancelled.cancelling == [task_id]
+        assert cancelled.model_dump() == {"cancelled": [], "skipped_running": [task_id], "skipped_terminal": []}
     finally:
         release.set()
     try:
         task = await wait_for_task(task_id, 0.01, queue=queue)
-        assert task["status"] == "cancelled"
+        assert task["status"] == "succeeded"
     finally:
         await worker.stop()
-        queue.set_worker_cancel_callback(None)
     batch = await queue.get_generation_batch(project_name="script", batch_id=batch_id)
     assert batch.done is True
-    assert batch.members[0].status == "cancelled"
-    assert not (project_path / "scripts" / "episode_1.json").exists()
-    assert (project_path / "project.json").read_bytes() == before_project
-    assert ProjectArtifactManifestAdapter(project_path).snapshot_entries() == before_manifest
+    assert batch.members[0].status == "succeeded"
+    assert projects.load_script("script", "episode_1.json")["title"] == "新剧本"
+    assert ProjectArtifactManifestAdapter(project_path).get_entry(ArtifactKey.episode_script(1)) is not None
 
 
-async def test_episode_plan_terminal_update_race_cancels_batch_and_compensates_ledger(
+async def test_cancel_during_started_episode_plan_commit_leaves_member_running_to_success(
     tmp_path: Path,
     file_db_factory,
     monkeypatch,
 ) -> None:
     projects = ProjectManager(tmp_path / "projects")
+    # worker 按当前配置解析数据根。
+    monkeypatch.setenv("ARCREEL_DATA_DIR", str(projects.data_root))
     project_path = projects.create_project("planning", content_mode="narration")
     projects.create_project_metadata("planning", "Planning", "", "narration")
-    source = "第一章。少年得到古玉。第二章。玉中藏着剑诀。"
-    (project_path / "source" / "novel.txt").write_text(source, encoding="utf-8")
-    first_end = source.index("少年得到古玉。") + len("少年得到古玉。")
-    projects.update_project(
-        "planning",
-        lambda project: project.update(
-            episodes=[
-                {
-                    "episode": 1,
-                    "title": "少年得玉",
-                    "hook": "悬念",
-                    "ledger_status": "planned",
-                    "source_range": {"source_file": "source/novel.txt", "start": 0, "end": first_end},
-                }
-            ],
-            planning_cursor={"source_file": "source/novel.txt", "offset": first_end},
-        ),
-    )
-    before_project = (project_path / "project.json").read_bytes()
-    before_manifest = ProjectArtifactManifestAdapter(project_path).snapshot_entries()
-
-    class Generator:
-        model = "fake-model"
-
-        async def generate(self, _request, project_name=None):
-            return BackendTextGenerationResult(
-                text='{"episodes":[{"title":"玉中剑诀","hook":"悬念","end_anchor":"玉中藏着剑诀。"}]}',
-                provider="fake",
-                model="fake-model",
-            )
-
-    async def create_planner(_cls, path):
-        return EpisodePlanner(path, generator=Generator())
-
-    monkeypatch.setattr(EpisodePlanner, "create", classmethod(create_planner))
-    queue = GenerationQueue(session_factory=file_db_factory, project_manager=projects)
-    batch_ids: list[str] = []
-    ready = asyncio.Event()
-    worker = await _start_text_worker(
-        queue,
-        _cancel_batch_after_text_commit(queue, project_name="planning", batch_ids=batch_ids, ready=ready),
-    )
-    services = Services(
-        projects=projects,
-        workflow_planner=object(),
-        capabilities=ConfigResolver(async_session_factory),
-        queue=queue,
-    )
-    try:
-        submitted = await plan_episodes(
-            ToolRequest(PlanEpisodesRequest()),
-            ProjectScope(project_name="planning", projects_root=projects.projects_root),
-            CallerContext(user_id=DEFAULT_USER_ID, source="mcp"),
-            services,
-        )
-        assert submitted.value is not None
-        batch_id = submitted.value.batch_id
-        task_id = submitted.value.members[0].task_id
-        assert task_id is not None
-        batch_ids.append(batch_id)
-        ready.set()
-        task = await wait_for_task(task_id, 0.01, queue=queue)
-        assert task["status"] == "cancelled"
-    finally:
-        ready.set()
-        await worker.stop()
-
-    batch = await queue.get_generation_batch(project_name="planning", batch_id=batch_id)
-    assert batch.done is True
-    assert batch.members[0].status == "cancelled"
-    assert (project_path / "project.json").read_bytes() == before_project
-    assert not (project_path / "source" / "episode_1.txt").exists()
-    assert not (project_path / "source" / "episode_2.txt").exists()
-    assert ProjectArtifactManifestAdapter(project_path).snapshot_entries() == before_manifest
-
-
-async def test_cancel_during_started_episode_plan_commit_restores_batch_and_ledger(
-    tmp_path: Path,
-    file_db_factory,
-    monkeypatch,
-) -> None:
-    projects = ProjectManager(tmp_path / "projects")
-    project_path = projects.create_project("planning", content_mode="narration")
-    projects.create_project_metadata("planning", "Planning", "", "narration")
-    (project_path / "source" / "novel.txt").write_text(
-        "第一章。少年得到古玉，玉中藏着剑诀。",
-        encoding="utf-8",
-    )
+    register_project_sources(projects, "planning", whole_source={"novel.txt": "第一章。少年得到古玉，玉中藏着剑诀。"})
     before_project = (project_path / "project.json").read_bytes()
     started = threading.Event()
     release = threading.Event()
 
     class Generator:
         model = "fake-model"
+        max_output_tokens = 64000
 
         async def generate(self, _request, project_name=None):
             return BackendTextGenerationResult(
@@ -676,7 +778,7 @@ async def test_cancel_during_started_episode_plan_commit_restores_batch_and_ledg
 
     async def create_planner(_cls, path):
         planner = EpisodePlanner(path, generator=Generator())
-        planner.pm = BlockingProjectManager(projects.projects_root)
+        planner.pm = BlockingProjectManager(projects.data_root)
         return planner
 
     monkeypatch.setattr(EpisodePlanner, "create", classmethod(create_planner))
@@ -686,7 +788,7 @@ async def test_cancel_during_started_episode_plan_commit_restores_batch_and_ledg
         del claimed_provider_id
         return await execute_queued_text_task(task)
 
-    worker = await _start_text_worker(queue, execute, dispatch_cancellation=True)
+    worker = await _start_text_worker(queue, execute)
     services = Services(
         projects=projects,
         workflow_planner=object(),
@@ -696,7 +798,7 @@ async def test_cancel_during_started_episode_plan_commit_restores_batch_and_ledg
     try:
         submitted = await plan_episodes(
             ToolRequest(PlanEpisodesRequest()),
-            ProjectScope(project_name="planning", projects_root=projects.projects_root),
+            ProjectScope(project_name="planning", data_root=projects.data_root),
             CallerContext(user_id=DEFAULT_USER_ID, source="mcp"),
             services,
         )
@@ -706,21 +808,21 @@ async def test_cancel_during_started_episode_plan_commit_restores_batch_and_ledg
         assert task_id is not None
         assert await asyncio.to_thread(started.wait, 1)
         cancelled = await queue.cancel_generation_batch(project_name="planning", batch_id=batch_id)
-        assert cancelled.cancelling == [task_id]
+        assert cancelled.model_dump() == {"cancelled": [], "skipped_running": [task_id], "skipped_terminal": []}
     finally:
         release.set()
     try:
         task = await wait_for_task(task_id, 0.01, queue=queue)
-        assert task["status"] == "cancelled"
+        assert task["status"] == "succeeded"
     finally:
         await worker.stop()
-        queue.set_worker_cancel_callback(None)
 
     batch = await queue.get_generation_batch(project_name="planning", batch_id=batch_id)
     assert batch.done is True
-    assert batch.members[0].status == "cancelled"
-    assert (project_path / "project.json").read_bytes() == before_project
-    assert not (project_path / "source" / "episode_1.txt").exists()
+    assert batch.members[0].status == "succeeded"
+    assert (project_path / "project.json").read_bytes() != before_project
+    assert [episode["title"] for episode in projects.load_project("planning")["episodes"]] == ["古玉藏诀"]
+    assert (project_path / "source" / "episode_1.txt").exists()
 
 
 @pytest.mark.parametrize(
@@ -742,20 +844,23 @@ async def test_cancel_during_started_episode_plan_commit_restores_batch_and_ledg
         ),
     ],
 )
-async def test_cancel_during_invalid_script_plan_quarantine_leaves_no_workflow_blocker(
+async def test_cancel_during_invalid_script_plan_quarantine_leaves_member_running_to_its_refusal(
     tmp_path: Path,
     file_db_factory,
     monkeypatch,
+    video_request_facts,
     project_name: str,
     generation_mode: str,
     quarantine_kind: str,
     generated_text: str,
 ) -> None:
     projects = ProjectManager(tmp_path / "projects")
+    # worker 按当前配置解析数据根。
+    monkeypatch.setenv("ARCREEL_DATA_DIR", str(projects.data_root))
     project_path = projects.create_project(project_name, content_mode="narration")
     projects.create_project_metadata(project_name, project_name, "", "narration")
     projects.update_project(project_name, lambda project: project.update(generation_mode=generation_mode))
-    (project_path / "source" / "episode_1.txt").write_text("张三走向村口。", encoding="utf-8")
+    register_project_sources(projects, project_name, own_episodes=("张三走向村口。",))
 
     class Generator:
         async def generate(self, _request, project_name=None):
@@ -776,14 +881,14 @@ async def test_cancel_during_invalid_script_plan_quarantine_leaves_no_workflow_b
             started.set()
             release.wait()
 
-    monkeypatch.setattr("lib.json_io.os.replace", blocking_replace)
+    monkeypatch.setattr("lib.infra.json_io.os.replace", blocking_replace)
     queue = GenerationQueue(session_factory=file_db_factory, project_manager=projects)
 
     async def execute(task: dict[str, Any], *, claimed_provider_id: str | None = None) -> dict[str, Any]:
         del claimed_provider_id
         return await execute_queued_text_task(task)
 
-    worker = await _start_text_worker(queue, execute, dispatch_cancellation=True)
+    worker = await _start_text_worker(queue, execute)
     services = Services(
         projects=projects,
         workflow_planner=object(),
@@ -792,8 +897,8 @@ async def test_cancel_during_invalid_script_plan_quarantine_leaves_no_workflow_b
     )
     try:
         submitted = await generate_script_plan(
-            ToolRequest(TextGenerationRequest(episode=1)),
-            ProjectScope(project_name=project_name, projects_root=projects.projects_root),
+            ToolRequest(GenerateScriptPlanRequest(episode_id=1)),
+            ProjectScope(project_name=project_name, data_root=projects.data_root),
             CallerContext(user_id=DEFAULT_USER_ID, source="mcp"),
             services,
         )
@@ -803,19 +908,17 @@ async def test_cancel_during_invalid_script_plan_quarantine_leaves_no_workflow_b
         assert task_id is not None
         assert await asyncio.to_thread(started.wait, 1)
         cancelled = await queue.cancel_generation_batch(project_name=project_name, batch_id=batch_id)
-        assert cancelled.cancelling == [task_id]
+        assert cancelled.model_dump() == {"cancelled": [], "skipped_running": [task_id], "skipped_terminal": []}
     finally:
         release.set()
     try:
         task = await wait_for_task(task_id, 0.01, queue=queue)
-        assert task["status"] == "cancelled"
     finally:
         await worker.stop()
-        queue.set_worker_cancel_callback(None)
 
+    assert task["status"] == "failed"
+    assert problem_from_task_failure(task["error_message"]).code == "generation_refused"
     batch = await queue.get_generation_batch(project_name=project_name, batch_id=batch_id)
     assert batch.done is True
-    assert batch.members[0].status == "cancelled"
-    assert not draft_path.exists()
-    status = WorkflowStateService(projects).get_status(project_name)
-    assert all(blocker.code != "script_plan_quarantined" for blocker in status.blockers)
+    assert batch.members[0].status == "failed"
+    assert draft_path.exists()

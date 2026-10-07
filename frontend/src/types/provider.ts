@@ -5,7 +5,7 @@
 export type VoiceConsistencyTier = "native" | "soft" | "none";
 
 /**
- * 成片音轨形态，与 `lib/video_backends/base.py::VideoAudioMode` 一一对应：
+ * 成片音轨形态，与 `packages/arcreel-market-core/src/arcreel_market_core/video_backend_contract.py::VideoAudioMode` 一一对应：
  * `controllable` = 请求带音轨开关，用户的开/关意图能抵达供应商；`always_on` = 恒有声、无开关；
  * `always_off` = 该路径不产音轨、也无开关。三态由服务端从 backend 声明派生，前端不合成。
  */
@@ -44,8 +44,8 @@ export interface ProviderInfo {
   status: "ready" | "unconfigured" | "error";
   media_types: string[];
   capabilities: string[];
-  configured_keys: string[];
-  missing_keys: string[];
+  /** 凭证（界面称「密钥」）条数；没有凭证时为 0。 */
+  credential_count: number;
   models: Record<string, ModelInfoResponse>;
 }
 

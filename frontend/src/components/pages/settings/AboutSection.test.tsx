@@ -31,8 +31,8 @@ describe("AboutSection diagnostics download", () => {
 
     // 先用真实定时器渲染完成，避免 findByRole/waitFor 的内部轮询与 fake timers 相互卡死
     render(<AboutSection />);
-    await waitFor(() => expect(API.getSystemVersion).toHaveBeenCalled());
-    const button = screen.getByRole("button", { name: "下载诊断日志" });
+    // 接口被调用时版本信息还在加载，按钮要等加载结束才渲染
+    const button = await screen.findByRole("button", { name: "下载诊断日志" });
 
     // 切换到 fake timers 后再点击：click() 是同步调度，异步延续只在微任务
     // 中运行，可精确区分「微任务已跑完」与「宏任务（setTimeout）已触发」两个时间点
@@ -83,5 +83,37 @@ describe("AboutSection diagnostics download", () => {
       const target = createdAnchors.find((a) => a.download === "custom-diagnostics.zip");
       expect(target).toBeDefined();
     });
+  });
+});
+
+describe("AboutSection release notes", () => {
+  it("收起最新一条发布说明，展开后显示正文与 Release 链接", async () => {
+    vi.spyOn(API, "getSystemVersion").mockResolvedValue({
+      ...VERSION_RESPONSE,
+      latest: {
+        version: "1.1.0",
+        tag_name: "v1.1.0",
+        name: "1.1.0",
+        body: "## What's Changed\n- faster exports",
+        html_url: "https://github.com/example/ArcReel/releases/tag/v1.1.0",
+        published_at: "2026-07-12T08:00:00Z",
+      },
+      has_update: true,
+    });
+    const user = userEvent.setup();
+    render(<AboutSection />);
+
+    const toggle = await screen.findByRole("button", { name: /发布说明/ });
+    expect(toggle).toHaveAttribute("aria-expanded", "false");
+    expect(screen.queryByText(/faster exports/)).not.toBeInTheDocument();
+
+    await user.click(toggle);
+
+    // 正文由按需加载的 Streamdown 渲染：加载前的纯文本回退节点可能随后被替换，等渲染后的列表项。
+    expect(await screen.findByRole("listitem")).toHaveTextContent("faster exports");
+    expect(await screen.findByRole("link", { name: /打开 GitHub Release/ })).toHaveAttribute(
+      "href",
+      "https://github.com/example/ArcReel/releases/tag/v1.1.0",
+    );
   });
 });

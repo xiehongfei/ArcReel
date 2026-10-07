@@ -1,4 +1,5 @@
 import type {
+  AnyEndpointDefinition,
   EndpointDefinition,
   EndpointExtractSpec,
   EndpointInputEncoding,
@@ -11,12 +12,58 @@ import type {
 // 这里只提供「读出 UI 需要的形状」与「写回时保留未知字段」的转换，不做校验——
 // 校验是服务端 POST /custom-endpoints/validate 的唯一职责。
 
-export const INPUT_SOURCES: EndpointInputSource[] = [
-  "start_image",
-  "end_image",
-  "reference_images",
-  "reference_audio_files",
-];
+/** 声明式定义的媒体类型；定义不写 `media_type` 即视频。 */
+export type EndpointMediaType = "image" | "video";
+
+export function definitionMediaType(definition: EndpointDefinition): EndpointMediaType {
+  return definition.media_type ?? "video";
+}
+
+/** 产物取值键：轮询或二次取件节里读出产物（地址或内联 base64）的那一项。 */
+export type EndpointArtifactKey = "video_url" | "image_url" | "image_b64";
+
+/**
+ * 一种媒体类型在表单上的差异，与后端校验器的 MEDIA_TYPE_RULES 对应：
+ * 可选的素材来源、产物取值键（按运行时取用的先后排列）、可插入请求体的生成参数变量。
+ */
+export interface MediaTypeFormProfile {
+  inputSources: EndpointInputSource[];
+  artifactKeys: EndpointArtifactKey[];
+  /** 变量名与说明文案的 i18n key。 */
+  generationVariables: { name: string; descKey: string }[];
+}
+
+const variable = (name: string, descKey = `ce_var_${name}`) => ({ name, descKey });
+
+export const MEDIA_TYPE_FORM_PROFILES: Record<EndpointMediaType, MediaTypeFormProfile> = {
+  video: {
+    inputSources: ["start_image", "end_image", "reference_images", "reference_audio_files"],
+    artifactKeys: ["video_url"],
+    generationVariables: [
+      variable("prompt"),
+      variable("model"),
+      variable("duration"),
+      variable("resolution"),
+      variable("aspect_ratio"),
+      variable("width"),
+      variable("height"),
+      variable("generate_audio"),
+    ],
+  },
+  image: {
+    inputSources: ["reference_images"],
+    artifactKeys: ["image_url", "image_b64"],
+    generationVariables: [
+      variable("prompt"),
+      variable("model"),
+      variable("resolution", "ce_var_resolution_image"),
+      variable("aspect_ratio"),
+      variable("width"),
+      variable("height"),
+      variable("seed"),
+    ],
+  },
+};
 
 export const INPUT_ENCODINGS: EndpointInputEncoding[] = ["data_uri", "base64"];
 
@@ -44,7 +91,7 @@ export type EndpointFormSection =
 export function newEndpointDefinition(author: string): EndpointDefinition {
   return {
     kind: "declarative",
-    schema_version: "1.0.0",
+    schema_version: "1.2.0",
     meta: { name: "", author, version: "1.0.0" },
     auth: { headers: { Authorization: "Bearer {{ api_key }}" } },
     inputs: { first_frame: { source: "start_image", encoding: "data_uri" } },
@@ -150,6 +197,14 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 /**
+ * 这份定义是不是声明式的。ComfyUI 定义只有 `workflow` 与 `bindings`，详情表单与头部直接解引用的
+ * `submit` / `poll` 在它上面根本不存在，两者只能在同一个判据上分道。
+ */
+export function isDeclarativeDefinition(value: AnyEndpointDefinition): value is EndpointDefinition {
+  return value.kind === "declarative";
+}
+
+/**
  * JSON 视图写回草稿前的结构闸：表单与头部不做防御性访问（草稿即定义），
  * 直接解引用 meta、submit.extract、poll.extract 这几个容器，缺任一即不可渲染。
  * 字段级缺失（如 meta.name）只影响单个控件的取值，交给服务端校验诊断。
@@ -165,9 +220,23 @@ export function isRenderableDefinition(value: unknown): value is EndpointDefinit
   );
 }
 
-/** 导出为不含凭证的定义 JSON；文件名取 meta.name，落到 ASCII 安全的形态。 */
-export function definitionFileName(definition: EndpointDefinition): string {
-  const raw = definition.meta?.name?.trim() || "endpoint";
-  const slug = raw.replace(/[^\w.-]+/g, "-").replace(/^-+|-+$/g, "");
-  return `${slug || "endpoint"}.json`;
+/**
+ * 由端点名称派生市场条目 slug，规则 `^[a-z0-9][a-z0-9-]{0,63}$`：去重音、转小写，其余字符折成连字符；
+ * 名称里没有可用 ASCII 字符时为空串。
+ */
+export function slugFromName(name: string): string {
+  return name
+    .normalize("NFKD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+/, "")
+    .slice(0, 64)
+    .replace(/-+$/, "");
+}
+
+/** 导出文件名：有安装记录的端点直接用记录里的 slug，否则由 meta.name 派生，派生为空时退化为 `endpoint`。 */
+export function definitionFileName(definition: AnyEndpointDefinition, installationSlug?: string | null): string {
+  if (installationSlug) return `${installationSlug}.json`;
+  return `${slugFromName(definition.meta?.name ?? "") || "endpoint"}.json`;
 }

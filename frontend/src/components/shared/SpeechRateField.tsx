@@ -1,5 +1,5 @@
 import { useTranslation } from "react-i18next";
-import { OptionalNumberField } from "@/components/ui/OptionalNumberField";
+import { OptionalNumberField } from "@/components/shared/OptionalNumberField";
 
 /**
  * 口播语速估算（阅读单位 / 秒）的项目级可选输入。
@@ -15,7 +15,7 @@ import { OptionalNumberField } from "@/components/ui/OptionalNumberField";
  */
 
 /**
- * 硬区间（闭区间）：与后端 lib.speech_rate 的 is_valid_speech_rate 同一把尺。
+ * 硬区间（闭区间）：与后端 lib.speech.speech_rate 的 is_valid_speech_rate 同一把尺。
  * 下界取值依据（下游时长换算的余量）见后端 MIN_SPEECH_RATE_UPS 的注释。
  */
 const SPEECH_RATE_MIN = 0.001;

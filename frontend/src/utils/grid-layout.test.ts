@@ -17,7 +17,7 @@ function grid(
   return { id, episode, scene_ids, created_at };
 }
 
-// 阶梯必须与后端 lib/grid/layout.py 一致,否则批次预览数与实际入队张数会漂移
+// 阶梯必须与后端 lib/script/grid/layout.py 一致,否则批次预览数与实际入队张数会漂移
 describe("computeGridSize", () => {
   it.each([
     [1, "grid_4", 2],
@@ -89,14 +89,14 @@ describe("matchGridsForGroup", () => {
     expect(result.map((g) => g.id)).toEqual(["g1"]);
   });
 
-  it("matches multiple chunk grids when group exceeds cell_count (regression: 14-scene group → grid_9 + grid_4)", () => {
+  it("matches one grid per chunk when the group exceeds the cell cap (14 scenes → 9 + 5)", () => {
     const big = Array.from({ length: 14 }, (_, i) => `s${i + 1}`);
     const grids = [
-      grid("g9", big.slice(0, 9), "2026-05-01T00:00:00Z"),
-      grid("g4", big.slice(9), "2026-05-01T00:00:01Z"),
+      grid("tail", big.slice(9), "2026-05-01T00:00:00Z"),
+      grid("head", big.slice(0, 9), "2026-05-01T00:00:01Z"),
     ];
-    const result = matchGridsForGroup(grids, big, 1);
-    expect(result.map((g) => g.id)).toEqual(["g9", "g4"]);
+    const result = matchGridsForGroup(grids, big, 1, 9);
+    expect(result.map((g) => g.id)).toEqual(["head", "tail"]);
   });
 
   it("ignores grids belonging to a different episode", () => {
@@ -108,16 +108,7 @@ describe("matchGridsForGroup", () => {
     expect(result.map((g) => g.id)).toEqual(["g1"]);
   });
 
-  it("ignores grids whose scene_ids contain ids outside the group", () => {
-    const grids = [
-      grid("g1", ["s1", "s2"], "2026-05-01T00:00:00Z"),
-      grid("g_other", ["s1", "s99"], "2026-05-01T00:00:01Z"),
-    ];
-    const result = matchGridsForGroup(grids, ["s1", "s2"], 1);
-    expect(result.map((g) => g.id)).toEqual(["g1"]);
-  });
-
-  it("dedupes regenerations by scene_ids set, keeping latest created_at", () => {
+  it("keeps the latest regeneration of the same chunk", () => {
     const grids = [
       grid("old", ["s1", "s2"], "2026-05-01T00:00:00Z"),
       grid("new", ["s1", "s2"], "2026-05-02T00:00:00Z"),
@@ -126,32 +117,45 @@ describe("matchGridsForGroup", () => {
     expect(result.map((g) => g.id)).toEqual(["new"]);
   });
 
-  it("returns chunks ordered by created_at ascending", () => {
-    const big = Array.from({ length: 14 }, (_, i) => `s${i + 1}`);
-    const grids = [
-      grid("late", big.slice(9), "2026-05-01T00:00:05Z"),
-      grid("early", big.slice(0, 9), "2026-05-01T00:00:00Z"),
-    ];
-    const result = matchGridsForGroup(grids, big, 1);
-    expect(result.map((g) => g.id)).toEqual(["early", "late"]);
+  it("treats a group split by a new chapter break as not generated", () => {
+    const grids = [grid("before_split", ["s1", "s2", "s3"], "2026-05-01T00:00:00Z")];
+    expect(matchGridsForGroup(grids, ["s1", "s2"], 1)).toEqual([]);
+    expect(matchGridsForGroup(grids, ["s3"], 1)).toEqual([]);
   });
 
-  it("returns empty for unrelated grids", () => {
-    const grids = [grid("g1", ["x1"], "2026-05-01T00:00:00Z")];
-    const result = matchGridsForGroup(grids, ["s1", "s2"], 1);
-    expect(result).toEqual([]);
+  it("treats groups merged by a removed chapter break as not generated", () => {
+    const grids = [
+      grid("first_half", ["s1", "s2"], "2026-05-01T00:00:00Z"),
+      grid("second_half", ["s3", "s4"], "2026-05-01T00:00:01Z"),
+    ];
+    expect(matchGridsForGroup(grids, ["s1", "s2", "s3", "s4"], 1, 9)).toEqual([]);
   });
 
-  it("filters out obsolete overlapping grids covered by newer generations", () => {
-    // 用户调整 segment_break 后,旧 chunk 仍在表里但不再属于当前布局。
-    // 贪心覆盖按 created_at 降序,只保留贡献新 scene_id 的 grid。
+  it("treats a reordered group as not generated", () => {
+    const grids = [grid("g1", ["s1", "s2", "s3"], "2026-05-01T00:00:00Z")];
+    expect(matchGridsForGroup(grids, ["s2", "s1", "s3"], 1)).toEqual([]);
+  });
+
+  it("matches only the chunks that still line up", () => {
+    const big = Array.from({ length: 11 }, (_, i) => `s${i + 1}`);
     const grids = [
-      grid("obsolete_subset", ["s1", "s2"], "2026-05-01T00:00:00Z"),
-      grid("obsolete_superset", ["s1", "s2", "s3", "s4", "s5"], "2026-05-01T00:00:01Z"),
-      grid("new_chunk_1", ["s1", "s2", "s3"], "2026-05-02T00:00:00Z"),
-      grid("new_chunk_2", ["s4", "s5"], "2026-05-02T00:00:01Z"),
+      grid("head", big.slice(0, 9), "2026-05-01T00:00:00Z"),
+      grid("stale_tail", ["s10", "s12"], "2026-05-01T00:00:01Z"),
     ];
-    const result = matchGridsForGroup(grids, ["s1", "s2", "s3", "s4", "s5"], 1);
-    expect(result.map((g) => g.id)).toEqual(["new_chunk_1", "new_chunk_2"]);
+    const result = matchGridsForGroup(grids, big, 1, 9);
+    expect(result.map((g) => g.id)).toEqual(["head"]);
+  });
+
+  it("chunks a character group at four cells when hasCharacters is set", () => {
+    const big = Array.from({ length: 12 }, (_, i) => `s${i + 1}`);
+    const grids = [
+      grid("head", big.slice(0, 4), "2026-05-01T00:00:00Z"),
+      grid("middle", big.slice(4, 8), "2026-05-01T00:00:01Z"),
+      grid("tail", big.slice(8), "2026-05-01T00:00:02Z"),
+      grid("stale_nine", big.slice(0, 9), "2026-05-01T00:00:03Z"),
+    ];
+
+    expect(matchGridsForGroup(grids, big, 1, 9, false).map((g) => g.id)).toEqual(["stale_nine"]);
+    expect(matchGridsForGroup(grids, big, 1, 9, true).map((g) => g.id)).toEqual(["head", "middle", "tail"]);
   });
 });

@@ -2,7 +2,7 @@
 
 只断言外部行为——给定 ready 供应商与自定义供应商模型，断言各桶候选列表的成员关系。
 桶归属的真相源判定（registry 图片能力声明 / backend 视频能力 / endpoint 系统判定 ⊕ 覆盖）
-在 lib.generation_type_buckets 层单独覆盖。
+在 lib.backends.generation_type_buckets 层单独覆盖。
 
 dashscope 被选作内置侧的样本供应商：它同时提供 i2v-only、t2v-only、r2v 三类视频模型与
 t2i+i2i、i2i-only 两类图片模型，一个 ready 供应商就能把四个桶的过滤差异全部区分出来。
@@ -18,12 +18,12 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
+from lib.backends.generation_type_buckets import builtin_model_buckets, custom_model_buckets
 from lib.config.registry import PROVIDER_REGISTRY
 from lib.config.service import ConfigService, ProviderStatus
 from lib.db import get_async_session
 from lib.db.base import Base
 from lib.db.repositories.custom_provider_repo import CustomProviderRepository
-from lib.generation_type_buckets import builtin_model_buckets, custom_model_buckets
 from server.auth import CurrentUserInfo, get_current_user
 from server.dependencies import get_config_service
 from server.routers import system_config as system_config_router
@@ -70,8 +70,7 @@ def _make_mock_svc(ready_providers: list[str]) -> ConfigService:
                 media_types=list(meta.media_types),
                 capabilities=list(meta.capabilities),
                 required_keys=list(meta.required_keys),
-                configured_keys=list(meta.required_keys) if name in ready else [],
-                missing_keys=[] if name in ready else list(meta.required_keys),
+                credential_count=1 if name in ready else 0,
             )
             for name, meta in PROVIDER_REGISTRY.items()
         ]
@@ -188,6 +187,22 @@ class TestBuiltinBucketFiltering:
         assert DS_R2V not in body["video"]["default"]
         assert DS_R2V not in body["video"]["buckets"]["r2v"]
         assert DS_R2V not in body["video"]["buckets"]["i2v"]
+
+    def test_agnes_25_candidates_are_visible_and_legacy_models_are_hidden(self, make_client):
+        with make_client(["agnes"]) as client:
+            body = client.get(CANDIDATES_URL).json()
+
+        for option in ("agnes/agnes-3.0-flash", "agnes/agnes-2.5-flash", "agnes/agnes-2.5-pro"):
+            assert option in body["model_names"]
+        assert "agnes/agnes-image-2.5-flash" in body["image"]["default"]
+        assert "agnes/agnes-video-2.5" in body["video"]["default"]
+        assert "agnes/agnes-video-2.5-flash" in body["video"]["default"]
+
+        all_candidates = {option for media in ("image", "video") for option in body[media]["default"]}
+        all_candidates.update(body["model_names"])
+        assert "agnes/agnes-2.0-flash" not in all_candidates
+        assert "agnes/agnes-image-2.1-flash" not in all_candidates
+        assert "agnes/agnes-video-v2.0" not in all_candidates
 
 
 # ---------------------------------------------------------------------------
@@ -354,3 +369,63 @@ class TestBucketJudgement:
 
     def test_text_endpoint_yields_no_buckets(self):
         assert custom_model_buckets(endpoint="openai-chat", model_id="gpt-4o") == frozenset()
+
+    def test_a_comfyui_model_row_takes_its_buckets_from_the_node_bindings(self):
+        """ComfyUI 模型行的桶归属只看绑定表：首帧格子进 i2v，参考图格子进 r2v。"""
+        from lib.custom_provider.endpoints import comfyui_endpoint_spec
+        from tests.factories import comfyui_endpoint_definition
+
+        t2v = comfyui_endpoint_definition()
+        i2v = comfyui_endpoint_definition()
+        i2v["bindings"]["start_image"] = [{"node": "11", "input": "image", "class_type": "LoadImage"}]
+        flf = comfyui_endpoint_definition()
+        flf["bindings"]["start_image"] = [{"node": "11", "input": "image", "class_type": "LoadImage"}]
+        flf["bindings"]["end_image"] = [{"node": "12", "input": "image", "class_type": "LoadImage"}]
+        r2v = comfyui_endpoint_definition()
+        r2v["bindings"]["reference_images"] = [{"node": "11", "input": "image", "class_type": "LoadImage"}]
+
+        def buckets(definition: dict) -> frozenset[str]:
+            return custom_model_buckets(
+                endpoint="ce-7", model_id="my-wan-workflow", endpoint_spec=comfyui_endpoint_spec("ce-7", definition)
+            )
+
+        # 纯文生：i2v 桶按 has_image=True 判首帧，没有首帧格子就进不去。
+        assert buckets(t2v) == frozenset()
+        assert buckets(i2v) == frozenset({"i2v"})
+        # 尾帧是「支持」而非另一个桶：首尾帧 workflow 仍在 i2v，尾帧作为能力位单独透出。
+        assert buckets(flf) == frozenset({"i2v"})
+        assert comfyui_endpoint_spec("ce-7", flf).end_image_capable is True
+        assert buckets(r2v) == frozenset({"r2v"})
+
+    def test_a_stored_capability_override_does_not_move_a_comfyui_row(self):
+        """该协议关闭能力覆盖：存量脏值在合成侧被丢弃，桶归属仍只由绑定决定。"""
+        from lib.custom_provider.endpoints import comfyui_endpoint_spec
+        from tests.factories import comfyui_endpoint_definition
+
+        spec = comfyui_endpoint_spec("ce-7", comfyui_endpoint_definition())
+
+        assert (
+            custom_model_buckets(
+                endpoint="ce-7",
+                model_id="m",
+                capability_overrides={"last_frame": True, "max_reference_audio_count": 4},
+                endpoint_spec=spec,
+            )
+            == frozenset()
+        )
+
+    def test_a_comfyui_image_row_takes_its_bucket_from_the_reference_image_binding(self):
+        from lib.custom_provider.endpoints import comfyui_endpoint_spec
+        from tests.factories import comfyui_endpoint_definition
+
+        t2i = comfyui_endpoint_definition(media_type="image")
+        i2i = comfyui_endpoint_definition(media_type="image")
+        i2i["bindings"]["reference_images"] = [{"node": "11", "input": "image", "class_type": "LoadImage"}]
+
+        def buckets(definition: dict) -> frozenset[str]:
+            return custom_model_buckets(
+                endpoint="ce-7", model_id="m", endpoint_spec=comfyui_endpoint_spec("ce-7", definition)
+            )
+
+        assert buckets(t2i) == frozenset({"t2i"})
+        assert buckets(i2i) == frozenset({"i2i"})

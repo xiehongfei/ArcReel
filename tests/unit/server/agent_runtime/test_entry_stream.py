@@ -10,11 +10,12 @@ from fastapi import FastAPI
 from fastapi.sse import ServerSentEvent
 from fastapi.testclient import TestClient
 
-from lib.i18n import DEFAULT_LOCALE, get_translator
+from lib.i18n import DEFAULT_LOCALE
 from server.agent_runtime.event_log import EventLogService, EventLogStore
 from server.agent_runtime.models import LiveMessage, SubscriptionReady
 from server.agent_runtime.service import AssistantService
 from server.auth import CurrentUserInfo, get_current_user
+from server.i18n import get_translator
 from server.routers import assistant
 from tests.auth_deps import AUTH_DEPENDENCIES
 from tests.factories import make_session_meta, make_translator
@@ -42,6 +43,9 @@ class _FakeAdapter:
         return list(self._messages)
 
     async def read_subagent_timelines(self, sdk_session_id=None, project_cwd=None):
+        return {}
+
+    async def read_subagent_descriptions(self, sdk_session_id=None, project_cwd=None, tool_use_ids=()):
         return {}
 
 

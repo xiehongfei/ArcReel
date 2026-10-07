@@ -5,8 +5,8 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 
-from lib.asset_types import DERIVATIVES_FIELD, asset_name_comparison_key, resolve_asset_key
-from lib.reference_catalog import split_derivative_reference
+from lib.project.asset_types import DERIVATIVES_FIELD, asset_name_comparison_key, resolve_asset_key
+from lib.references.reference_catalog import split_derivative_reference
 
 
 @dataclass(frozen=True, slots=True)

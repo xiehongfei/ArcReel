@@ -9,7 +9,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from lib.config.registry import PROVIDER_REGISTRY
 from lib.config.repository import ProviderConfigRepository, SystemSettingRepository
-from lib.system_config import resolve_vertex_credentials_path
+from lib.config.retired_model_ids import (
+    TEXT_BACKEND_SETTING_KEYS,
+    migrate_retired_text_model_reference,
+)
+from lib.config.system_config import resolve_vertex_credentials_path
+from lib.infra.data_root_layout import DataRootLayout
 
 logger = logging.getLogger(__name__)
 
@@ -61,8 +66,11 @@ _HANDLED_KEYS = {
 } | set(_SYSTEM_SETTING_KEYS)
 
 
-async def migrate_json_to_db(session: AsyncSession, json_path: Path) -> None:
-    if not json_path.exists():  # noqa: ASYNC240 -- 启动期迁移入口的一次性存在性检查，本地元数据
+async def migrate_json_to_db(session: AsyncSession, data_root: Path) -> None:
+    """把数据根下的旧版系统配置文件一次性导入数据库；文件不存在时什么都不做。"""
+    layout = DataRootLayout(data_root)
+    json_path = layout.system_config_json_path
+    if not json_path.exists():
         return
 
     logger.info("Migrating %s to database...", json_path)
@@ -80,8 +88,7 @@ async def migrate_json_to_db(session: AsyncSession, json_path: Path) -> None:
             await provider_repo.set(provider, config_key, str(value), is_secret=is_secret)
 
     # 1b. Vertex credentials — detect existing file
-    project_root = json_path.parent.parent  # projects/.system_config.json → project root
-    vertex_cred_path = resolve_vertex_credentials_path(project_root)
+    vertex_cred_path = resolve_vertex_credentials_path(layout.root)
     if vertex_cred_path and vertex_cred_path.exists():
         await provider_repo.set("gemini-vertex", "credentials_path", str(vertex_cred_path), is_secret=False)
 
@@ -142,7 +149,7 @@ async def migrate_json_to_db(session: AsyncSession, json_path: Path) -> None:
 
     # 7. Rename to .bak
     bak_path = json_path.with_suffix(".json.bak")
-    json_path.rename(bak_path)  # noqa: ASYNC240 -- 同目录 rename，纯元数据操作
+    json_path.rename(bak_path)
     logger.info("Migration complete. Renamed to %s", bak_path)
 
 
@@ -151,25 +158,35 @@ _LEGACY_TEXT_TASK_KEYS = ("text_backend_script", "text_backend_overview", "text_
 
 
 async def migrate_text_tier_settings(session: AsyncSession) -> None:
-    """全局 system_settings 旧任务级文本键 → 档位键的一次性启动迁移。
+    """全局 system_settings 的文本配置启动迁移。
 
-    映射：script → complex；overview / style → simple，两者都有值时取 style 的值
-    （style 任务需要 vision，反向会让风格分析换到可能不支持图像输入的模型）。
-    迁移后删除旧键即幂等标记；档位键已有值时不覆盖（用户后配的新值优先）。
+    第一步映射旧任务级键：script → complex；overview / style → simple，两者都有值时取
+    style 的值（style 任务需要 vision，反向会让风格分析换到可能不支持图像输入的模型）。
+    迁移后删除旧键即幂等标记；档位键已有值时不覆盖（用户后配的新值优先）。第二步把已退役的
+    精确文本模型引用替换为现行 registry 键，覆盖默认层与两个档位层。
     """
     repo = SystemSettingRepository(session)
     script = await repo.get("text_backend_script")
     overview = await repo.get("text_backend_overview")
     style = await repo.get("text_backend_style")
-    if not (script or overview or style):
-        return
+    if script or overview or style:
+        logger.info("Migrating legacy text task setting keys to tier keys...")
+        if script and not await repo.get("text_backend_complex"):
+            await repo.set("text_backend_complex", script)
+        simple = style or overview
+        if simple and not await repo.get("text_backend_simple"):
+            await repo.set("text_backend_simple", simple)
+        for key in _LEGACY_TEXT_TASK_KEYS:
+            await repo.delete(key)
+        await session.commit()
 
-    logger.info("Migrating legacy text task setting keys to tier keys...")
-    if script and not await repo.get("text_backend_complex"):
-        await repo.set("text_backend_complex", script)
-    simple = style or overview
-    if simple and not await repo.get("text_backend_simple"):
-        await repo.set("text_backend_simple", simple)
-    for key in _LEGACY_TEXT_TASK_KEYS:
-        await repo.delete(key)
-    await session.commit()
+    migrated_retired_model = False
+    for key in TEXT_BACKEND_SETTING_KEYS:
+        value = await repo.get(key)
+        migrated = migrate_retired_text_model_reference(value)
+        if migrated != value:
+            await repo.set(key, migrated)
+            migrated_retired_model = True
+    if migrated_retired_model:
+        logger.info("Migrating retired text model references...")
+        await session.commit()

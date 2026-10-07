@@ -1,12 +1,15 @@
 """Tests for projects_crud_and_batch_edit."""
 
+import os
+from datetime import UTC, datetime
+
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from lib.i18n.zh import errors as zh_errors
-from lib.project_change_hints import get_project_change_source
-from lib.project_manager import ProjectManager
-from lib.script_batch_edit import (
+from lib.project.project_change_hints import get_project_change_source
+from lib.project.project_manager import ProjectManager
+from lib.script.script_batch_edit import (
     ScriptBatchEditResult,
 )
 from server.auth import CurrentUserInfo, get_current_user
@@ -27,7 +30,8 @@ class TestProjectsRouter:
             listed = client.get("/api/v1/projects")
             assert listed.status_code == 200
             names = [p["name"] for p in listed.json()["projects"]]
-            assert names == ["ready", "empty", "broken"]
+            # 没有 project.json 的 "empty" 不是项目，不列出
+            assert names == ["ready", "broken"]
             broken = next(p for p in listed.json()["projects"] if p["name"] == "broken")
             assert broken["status"] == {}
             assert "error" not in broken
@@ -86,11 +90,38 @@ class TestProjectsRouter:
             delete_ok = client.delete("/api/v1/projects/remove-me")
             assert delete_ok.status_code == 200
 
-    def test_create_persists_source_kind_and_defaults_novel(self, tmp_path, monkeypatch):
-        client = build_projects_client(monkeypatch, _FakePM(tmp_path))
+    def test_list_puts_most_recently_active_projects_first(self, tmp_path, monkeypatch):
+        old, mid, new = (datetime(2026, month, 1, tzinfo=UTC) for month in (3, 6, 9))
+
+        class _ActivityPM(_FakePM):
+            def list_projects(self):
+                return ["broken", "ready", "ad-ready"]
+
+            def project_exists(self, name):
+                return name in {"broken", "ready", "ad-ready"}
+
+        pm = _ActivityPM(tmp_path)
+        pm.project_data["ready"]["metadata"] = {"updated_at": old.isoformat()}
+        pm.scripts[("ready", "episode_1.json")]["metadata"] = {"updated_at": mid.isoformat()}
+        storyboard = tmp_path / "ready" / "storyboards" / "scene_E1S01.png"
+        os.utime(storyboard, (old.timestamp(), old.timestamp()))
+        pm.project_data["ad-ready"]["metadata"] = {"updated_at": new.isoformat()}
+
+        with build_projects_client(monkeypatch, pm) as client:
+            listed = client.get("/api/v1/projects").json()["projects"]
+
+        assert [(p["name"], p["last_activity_at"]) for p in listed] == [
+            ("ad-ready", new.isoformat()),
+            ("ready", mid.isoformat()),
+            ("broken", None),
+        ]
+
+    def test_create_does_not_record_a_project_level_source_kind(self, tmp_path, monkeypatch):
+        """源文件类型随源文件记录：创建项目不接受、也不写入项目级类型。"""
+        fake_pm = _FakePM(tmp_path)
+        client = build_projects_client(monkeypatch, fake_pm)
         with client:
-            # 显式 screenplay 持久化于 project.json 顶层
-            screenplay = client.post(
+            created = client.post(
                 "/api/v1/projects",
                 json={
                     "generation_mode": "storyboard",
@@ -100,29 +131,8 @@ class TestProjectsRouter:
                     "source_kind": "screenplay",
                 },
             )
-            assert screenplay.status_code == 200
-            assert screenplay.json()["project"]["source_kind"] == "screenplay"
-
-            # 缺省 source_kind 落 novel
-            default_novel = client.post(
-                "/api/v1/projects",
-                json={"generation_mode": "storyboard", "name": "nov", "title": "默认项目", "content_mode": "drama"},
-            )
-            assert default_novel.status_code == 200
-            assert default_novel.json()["project"]["source_kind"] == "novel"
-
-            # 非法值被 Pydantic 拒（422，不是 500）
-            invalid = client.post(
-                "/api/v1/projects",
-                json={
-                    "generation_mode": "storyboard",
-                    "name": "bad",
-                    "title": "X",
-                    "content_mode": "drama",
-                    "source_kind": "screen_play",
-                },
-            )
-            assert invalid.status_code == 422
+            assert created.status_code == 200
+            assert "source_kind" not in created.json()["project"]
 
     def test_source_kind_silently_ignored_on_patch(self, tmp_path, monkeypatch):
         fake_pm = _FakePM(tmp_path)

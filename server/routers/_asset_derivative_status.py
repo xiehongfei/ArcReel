@@ -14,13 +14,13 @@ from typing import Any
 
 from fastapi import APIRouter, HTTPException
 
-from lib.api_errors import NotFoundError
-from lib.artifact_activation import active_artifact_currency_resolver
-from lib.artifact_manifest import ArtifactStatus
-from lib.asset_derivatives import derivative_artifact_key, derivative_table
-from lib.asset_types import DERIVATIVES_FIELD, AssetSpec, asset_name_comparison_key, resolve_asset_key
-from lib.i18n import Translator
-from lib.project_manager import ProjectManager
+from lib.artifacts.artifact_activation import active_artifact_currency_resolver
+from lib.artifacts.artifact_manifest import ArtifactStatus
+from lib.infra.api_errors import NotFoundError
+from lib.project.asset_derivatives import derivative_artifact_key, derivative_table
+from lib.project.asset_types import DERIVATIVES_FIELD, AssetSpec, asset_name_comparison_key, resolve_asset_key
+from lib.project.project_manager import ProjectManager
+from server.i18n import Translator
 
 logger = logging.getLogger(__name__)
 
@@ -36,10 +36,8 @@ def register_derivative_status_routes(
 
     base = f"/projects/{{project_name}}/{spec.subdir}/{{entry_name}}/{DERIVATIVES_FIELD}"
 
-    # 处理器由 @router.get 就地注册，模块内无其它引用；basedpyright 把函数作用域内的符号
-    # 一律判为私有，reportUnusedFunction 在此是工具误报。
     @router.get(base)
-    async def list_derivatives(  # pyright: ignore[reportUnusedFunction]
+    async def list_derivatives(
         project_name: str,
         entry_name: str,
         _t: Translator,
@@ -61,6 +59,7 @@ def register_derivative_status_routes(
                 sheet = derivative.get(spec.sheet_field)
                 sheet_path = sheet if isinstance(sheet, str) and sheet else ""
                 stale = False
+                artifact_status = ArtifactStatus.MISSING
                 if sheet_path:
                     comparison = resolver.compare(
                         derivative_artifact_key(asset_name_comparison_key(owner_key), asset_name_comparison_key(name)),
@@ -69,10 +68,12 @@ def register_derivative_status_routes(
                     # 只有「登记在案但已不等于规范状态」才是过期；缺失或被阻断另有其表现
                     # （图根本渲染不出来），不折进同一个标记。
                     stale = comparison.status is ArtifactStatus.STALE
+                    artifact_status = comparison.status
                 derivatives[name] = {
                     "description": derivative.get("description", ""),
                     spec.sheet_field: sheet_path,
                     "stale": stale,
+                    "artifact_status": artifact_status.value,
                 }
             return {"success": True, DERIVATIVES_FIELD: derivatives}
 

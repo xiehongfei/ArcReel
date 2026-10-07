@@ -1,6 +1,6 @@
 import { useMemo } from "react";
 import { useTranslation } from "react-i18next";
-import { INPUT_CLS } from "@/components/ui/darkroom-tokens";
+import { Input } from "@/components/ui/input";
 import { useAppStore } from "@/stores/app-store";
 import type {
   EndpointCapabilities,
@@ -11,10 +11,12 @@ import type {
   EndpointStandardStatus,
 } from "@/types";
 import {
+  type EndpointArtifactKey,
   HTTP_METHODS,
   INPUT_ENCODINGS,
-  INPUT_SOURCES,
+  MEDIA_TYPE_FORM_PROFILES,
   STANDARD_STATUSES,
+  definitionMediaType,
   readPaths,
   renameKey,
   writePaths,
@@ -25,9 +27,9 @@ import {
   FormSection,
   HINT_CLS,
   LABEL_CLS,
-  MONO_INPUT_CLS,
   PathsEditor,
   RowDeleteButton,
+  SelectField,
   TextField,
   VariableChips,
 } from "./endpoint-form-primitives";
@@ -39,24 +41,17 @@ interface EndpointFormProps {
   readOnly: boolean;
 }
 
-/** 生成参数变量。素材变量按 inputs 声明动态派生，声明前不出现。 */
-const GENERATION_VARIABLES = [
-  "prompt",
-  "model",
-  "duration",
-  "duration_seconds",
-  "resolution",
-  "aspect_ratio",
-  "width",
-  "height",
-  "generate_audio",
-] as const;
-
 export function EndpointForm({ definition, onChange, readOnly }: EndpointFormProps) {
   const { t } = useTranslation("dashboard");
   const pushToast = useAppStore((s) => s.pushToast);
 
   const patch = (partial: Partial<EndpointDefinition>) => onChange({ ...definition, ...partial });
+
+  // 媒体类型决定可选素材、产物取值键、可插入的变量与能力字段；视频专属的说明文案在图片定义下换成 `_image` 版本。
+  const mediaType = definitionMediaType(definition);
+  const isImage = mediaType === "image";
+  const profile = MEDIA_TYPE_FORM_PROFILES[mediaType];
+  const mediaCopy = (key: string) => t(isImage ? `${key}_image` : key);
 
   const inputs = useMemo(() => definition.inputs ?? {}, [definition.inputs]);
   const statusMap = definition.status_map ?? {};
@@ -66,16 +61,16 @@ export function EndpointForm({ definition, onChange, readOnly }: EndpointFormPro
   const noAuth = Object.keys(authHeaders).length === 0 && Object.keys(authQuery).length === 0;
 
   const submitVariables = useMemo(() => {
-    const generation = GENERATION_VARIABLES.map((name) => ({
+    const generation = profile.generationVariables.map(({ name, descKey }) => ({
       token: `{{ ${name} }}`,
-      desc: t(`ce_var_${name}`),
+      desc: t(descKey),
     }));
     const assets = Object.entries(inputs).map(([name, spec]) => ({
       token: `{{ inputs.${name} }}`,
       desc: t(`ce_input_source_${spec.source}`),
     }));
     return [...generation, ...assets];
-  }, [inputs, t]);
+  }, [inputs, profile, t]);
 
   const patchCapabilities = (partial: EndpointCapabilities) =>
     patch({ capabilities: { ...capabilities, ...partial } });
@@ -92,7 +87,7 @@ export function EndpointForm({ definition, onChange, readOnly }: EndpointFormPro
     });
 
   const setPollPaths = (
-    field: "status" | "video_url" | "error" | "failure" | "result_id",
+    field: "status" | EndpointArtifactKey | "error" | "failure" | "result_id",
     paths: EndpointPathItem[],
   ) =>
     patch({
@@ -117,24 +112,31 @@ export function EndpointForm({ definition, onChange, readOnly }: EndpointFormPro
       },
     });
 
-  const selectCls = `${INPUT_CLS} disabled:cursor-not-allowed`;
+  const methodOptions = HTTP_METHODS.map((m) => ({ value: m, label: m }));
   const rename = <T,>(record: Record<string, T>, from: string, to: string, value: T) => {
     const renamed = renameKey(record, from, to, value);
     if (renamed === record && from !== to) pushToast(t("ce_duplicate_key"), "error");
     return renamed;
   };
 
+  const maxReferenceImagesField = (
+    <label className="block">
+      <span className={LABEL_CLS}>{t("ce_cap_max_reference_images")}</span>
+      <Input
+        type="number"
+        min={0}
+        value={capabilities.max_reference_images ?? 0}
+        readOnly={readOnly}
+        onChange={(e) => patchCapabilities({ max_reference_images: Number(e.target.value) || 0 })}
+      />
+    </label>
+  );
+
   return (
-    <div
-      className={
-        readOnly
-          ? "[&_input:read-only]:border-accent/25 [&_input:read-only]:bg-bg-grad-b/65 [&_input:read-only]:text-text-2 [&_select:disabled]:border-accent/20 [&_select:disabled]:bg-bg-grad-b/55 [&_select:disabled]:text-text-2 [&_textarea:read-only]:border-accent/25 [&_textarea:read-only]:bg-bg-grad-b/65 [&_textarea:read-only]:text-text-2"
-          : undefined
-      }
-    >
+    <div>
       {/* 1 基本信息 */}
       <FormSection id="meta" step={1} title={t("ce_section_meta")} desc={t("ce_section_meta_desc")}>
-        <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
+        <div className="grid grid-cols-1 gap-3 @md/page:grid-cols-3">
           <TextField
             label={t("ce_meta_name")}
             value={definition.meta.name}
@@ -152,7 +154,6 @@ export function EndpointForm({ definition, onChange, readOnly }: EndpointFormPro
             label={t("ce_meta_version")}
             value={definition.meta.version}
             readOnly={readOnly}
-            mono
             onChange={(version) => patch({ meta: { ...definition.meta, version } })}
           />
         </div>
@@ -161,7 +162,7 @@ export function EndpointForm({ definition, onChange, readOnly }: EndpointFormPro
             label={t("ce_meta_base_url")}
             value={definition.meta.hints?.base_url ?? ""}
             readOnly={readOnly}
-            mono
+            spellCheck={false}
             placeholder="https://api.example.com"
             hint={t("ce_meta_base_url_hint")}
             onChange={(base_url) =>
@@ -196,21 +197,25 @@ export function EndpointForm({ definition, onChange, readOnly }: EndpointFormPro
                 // 键即行名，正在被编辑；用它做 key 会让每敲一个字符就重建输入框、丢掉焦点。
                 // renameKey 保序，行的位置在重命名中不变，因此下标是这里稳定的行标识。
                 <div key={index} className="grid grid-cols-[180px_1fr_32px] items-center gap-3">
-                  <input
-                    type="text"
-                    value={name}
-                    readOnly={readOnly}
-                    aria-label={t("ce_auth_header_name")}
-                    onChange={(e) =>
-                      patch({
-                        auth: {
-                          ...definition.auth,
-                          headers: rename(authHeaders, name, e.target.value, value),
-                        },
-                      })
-                    }
-                    className={`${INPUT_CLS} ${MONO_INPUT_CLS}`}
-                  />
+                  <div className="min-w-0">
+                    <Input
+                      type="text"
+                      mono
+                      value={name}
+                      readOnly={readOnly}
+                      aria-label={t("ce_auth_header_name")}
+                      onChange={(e) =>
+                        patch({
+                          auth: {
+                            ...definition.auth,
+                            headers: rename(authHeaders, name, e.target.value, value),
+                          },
+                        })
+                      }
+                      autoComplete="off"
+                      spellCheck={false}
+                    />
+                  </div>
                   <TextField
                     ariaLabel={t("ce_auth_header_value")}
                     value={value}
@@ -257,7 +262,7 @@ export function EndpointForm({ definition, onChange, readOnly }: EndpointFormPro
       {/* 3 输入素材 */}
       <FormSection id="inputs" step={3} title={t("ce_section_inputs")} desc={t("ce_section_inputs_desc")}>
         <div className="space-y-2">
-          <div className="grid grid-cols-[1fr_180px_150px_110px_32px] gap-3 text-[11.5px] text-text-3">
+          <div className="grid grid-cols-[1fr_180px_150px_110px_32px] gap-3 text-xs text-muted-foreground">
             <span className="px-1">{t("ce_input_variable")}</span>
             <span className="px-1">{t("ce_input_source")}</span>
             <span className="px-1">{t("ce_input_encoding")}</span>
@@ -266,51 +271,32 @@ export function EndpointForm({ definition, onChange, readOnly }: EndpointFormPro
           </div>
           {Object.entries(inputs).map(([name, spec], index) => (
             <div key={index} className="grid grid-cols-[1fr_180px_150px_110px_32px] items-center gap-3">
-              <input
-                type="text"
-                value={name}
-                readOnly={readOnly}
-                aria-label={t("ce_input_variable")}
-                onChange={(e) => patch({ inputs: rename(inputs, name, e.target.value, spec) })}
-                className={`${INPUT_CLS} ${MONO_INPUT_CLS}`}
-              />
-              <select
+              <div className="min-w-0">
+                <Input
+                  type="text"
+                  mono
+                  value={name}
+                  readOnly={readOnly}
+                  aria-label={t("ce_input_variable")}
+                  onChange={(e) => patch({ inputs: rename(inputs, name, e.target.value, spec) })}
+                  autoComplete="off"
+                  spellCheck={false}
+                />
+              </div>
+              <SelectField<EndpointInputSource>
                 value={spec.source}
                 disabled={readOnly}
-                aria-label={t("ce_input_source")}
-                onChange={(e) =>
-                  patch({
-                    inputs: { ...inputs, [name]: { ...spec, source: e.target.value as EndpointInputSource } },
-                  })
-                }
-                className={selectCls}
-              >
-                {INPUT_SOURCES.map((s) => (
-                  <option key={s} value={s}>
-                    {t(`ce_input_source_${s}`)}
-                  </option>
-                ))}
-              </select>
-              <select
+                ariaLabel={t("ce_input_source")}
+                options={profile.inputSources.map((s) => ({ value: s, label: t(`ce_input_source_${s}`) }))}
+                onChange={(source) => patch({ inputs: { ...inputs, [name]: { ...spec, source } } })}
+              />
+              <SelectField<EndpointInputEncoding>
                 value={spec.encoding}
                 disabled={readOnly}
-                aria-label={t("ce_input_encoding")}
-                onChange={(e) =>
-                  patch({
-                    inputs: {
-                      ...inputs,
-                      [name]: { ...spec, encoding: e.target.value as EndpointInputEncoding },
-                    },
-                  })
-                }
-                className={selectCls}
-              >
-                {INPUT_ENCODINGS.map((enc) => (
-                  <option key={enc} value={enc}>
-                    {t(`ce_input_encoding_${enc}`)}
-                  </option>
-                ))}
-              </select>
+                ariaLabel={t("ce_input_encoding")}
+                options={INPUT_ENCODINGS.map((enc) => ({ value: enc, label: t(`ce_input_encoding_${enc}`) }))}
+                onChange={(encoding) => patch({ inputs: { ...inputs, [name]: { ...spec, encoding } } })}
+              />
               <CheckboxField
                 label={t("ce_input_required")}
                 checked={spec.required ?? false}
@@ -332,14 +318,14 @@ export function EndpointForm({ definition, onChange, readOnly }: EndpointFormPro
             </div>
           ))}
         </div>
-        {!readOnly && (
+        {!readOnly && profile.inputSources.length > 0 && (
           <AddRowButton
             label={t("ce_input_add")}
             disabled={"" in inputs}
             disabledHint={t("ce_row_name_first")}
             onClick={() =>
               patch({
-                inputs: { ...inputs, "": { source: "start_image", encoding: "data_uri" } },
+                inputs: { ...inputs, "": { source: profile.inputSources[0], encoding: "data_uri" } },
               })
             }
           />
@@ -350,21 +336,16 @@ export function EndpointForm({ definition, onChange, readOnly }: EndpointFormPro
       {/* 4 提交生成任务 */}
       <FormSection id="submit" step={4} title={t("ce_section_submit")} desc={t("ce_section_submit_desc")}>
         <div className="grid grid-cols-[120px_1fr] gap-3">
-          <label className="block">
+          <div>
             <span className={LABEL_CLS}>{t("ce_request_method")}</span>
-            <select
+            <SelectField
               value={definition.submit.method}
               disabled={readOnly}
-              onChange={(e) => patch({ submit: { ...definition.submit, method: e.target.value } })}
-              className={selectCls}
-            >
-              {HTTP_METHODS.map((m) => (
-                <option key={m} value={m}>
-                  {m}
-                </option>
-              ))}
-            </select>
-          </label>
+              ariaLabel={t("ce_request_method")}
+              options={methodOptions}
+              onChange={(method) => patch({ submit: { ...definition.submit, method } })}
+            />
+          </div>
           <TextField
             label={t("ce_submit_url")}
             value={definition.submit.url}
@@ -403,23 +384,18 @@ export function EndpointForm({ definition, onChange, readOnly }: EndpointFormPro
       </FormSection>
 
       {/* 5 查询进度与结果 */}
-      <FormSection id="poll" step={5} title={t("ce_section_poll")} desc={t("ce_section_poll_desc")}>
+      <FormSection id="poll" step={5} title={t("ce_section_poll")} desc={mediaCopy("ce_section_poll_desc")}>
         <div className="grid grid-cols-[120px_1fr] gap-3">
-          <label className="block">
+          <div>
             <span className={LABEL_CLS}>{t("ce_request_method")}</span>
-            <select
+            <SelectField
               value={definition.poll.method}
               disabled={readOnly}
-              onChange={(e) => patch({ poll: { ...definition.poll, method: e.target.value } })}
-              className={selectCls}
-            >
-              {HTTP_METHODS.map((m) => (
-                <option key={m} value={m}>
-                  {m}
-                </option>
-              ))}
-            </select>
-          </label>
+              ariaLabel={t("ce_request_method")}
+              options={methodOptions}
+              onChange={(method) => patch({ poll: { ...definition.poll, method } })}
+            />
+          </div>
           <TextField
             label={t("ce_poll_url")}
             value={definition.poll.url}
@@ -437,27 +413,32 @@ export function EndpointForm({ definition, onChange, readOnly }: EndpointFormPro
             readOnly={readOnly}
             onChange={(paths) => setPollPaths("status", paths)}
           />
-          <PathsEditor
-            label={t("ce_poll_video_url")}
-            paths={readPaths(definition.poll.extract.video_url)}
-            readOnly={readOnly}
-            onChange={(paths) => setPollPaths("video_url", paths)}
-          />
+          {profile.artifactKeys.map((key) => (
+            <PathsEditor
+              key={key}
+              label={t(`ce_poll_${key}`)}
+              paths={readPaths(definition.poll.extract[key])}
+              readOnly={readOnly}
+              onChange={(paths) => setPollPaths(key, paths)}
+            />
+          ))}
           <PathsEditor
             label={t("ce_poll_error")}
             paths={readPaths(definition.poll.extract.error)}
             readOnly={readOnly}
             onChange={(paths) => setPollPaths("error", paths)}
           />
-          <PathsEditor
-            label={t("ce_poll_usage")}
-            paths={readPaths(usageSpec)}
-            readOnly={readOnly}
-            hint={t("ce_poll_usage_hint")}
-            onChange={setUsagePaths}
-          />
+          {!isImage && (
+            <PathsEditor
+              label={t("ce_poll_usage")}
+              paths={readPaths(usageSpec)}
+              readOnly={readOnly}
+              hint={t("ce_poll_usage_hint")}
+              onChange={setUsagePaths}
+            />
+          )}
         </div>
-        <div className="mt-4 border-t border-hairline-soft pt-3.5">
+        <div className="mt-4 border-t border-border pt-3.5">
           <CheckboxField
             label={t("ce_result_enabled")}
             checked={definition.result !== undefined}
@@ -465,14 +446,14 @@ export function EndpointForm({ definition, onChange, readOnly }: EndpointFormPro
             onChange={(checked) =>
               patch({
                 result: checked
-                  ? { method: "GET", url: "{{ base_url }}/", extract: { video_url: [] } }
+                  ? { method: "GET", url: "{{ base_url }}/", extract: { [profile.artifactKeys[0]]: [] } }
                   : undefined,
               })
             }
           />
-          <span className={HINT_CLS}>{t("ce_result_hint")}</span>
+          <span className={HINT_CLS}>{mediaCopy("ce_result_hint")}</span>
           {definition.result && (
-            <div className="mt-3 space-y-3 rounded-[8px] border border-hairline-soft bg-bg-grad-a/30 p-3.5">
+            <div className="mt-3 flex flex-col gap-3 rounded-lg border border-border p-3.5">
               <TextField
                 label={t("ce_result_url")}
                 value={definition.result.url}
@@ -483,23 +464,26 @@ export function EndpointForm({ definition, onChange, readOnly }: EndpointFormPro
                   definition.result && patch({ result: { ...definition.result, url } })
                 }
               />
-              <PathsEditor
-                label={t("ce_result_video_url")}
-                paths={readPaths(definition.result.extract.video_url)}
-                readOnly={readOnly}
-                onChange={(paths) =>
-                  definition.result &&
-                  patch({
-                    result: {
-                      ...definition.result,
-                      extract: {
-                        ...definition.result.extract,
-                        video_url: writePaths(definition.result.extract.video_url, paths),
+              {profile.artifactKeys.map((key) => (
+                <PathsEditor
+                  key={key}
+                  label={t(`ce_result_${key}`)}
+                  paths={readPaths(definition.result?.extract[key])}
+                  readOnly={readOnly}
+                  onChange={(paths) =>
+                    definition.result &&
+                    patch({
+                      result: {
+                        ...definition.result,
+                        extract: {
+                          ...definition.result.extract,
+                          [key]: writePaths(definition.result.extract[key], paths),
+                        },
                       },
-                    },
-                  })
-                }
-              />
+                    })
+                  }
+                />
+              ))}
               <PathsEditor
                 label={t("ce_poll_result_id")}
                 paths={readPaths(definition.poll.extract.result_id)}
@@ -509,14 +493,14 @@ export function EndpointForm({ definition, onChange, readOnly }: EndpointFormPro
               />
             </div>
           )}
-          <span className={HINT_CLS}>{t("ce_download_policy")}</span>
+          <span className={HINT_CLS}>{mediaCopy("ce_download_policy")}</span>
         </div>
       </FormSection>
 
       {/* 6 状态对照 */}
       <FormSection id="status" step={6} title={t("ce_section_status")} desc={t("ce_section_status_desc")}>
         <div className="space-y-2">
-          <div className="grid grid-cols-[1fr_16px_180px_32px] gap-3 text-[11.5px] text-text-3">
+          <div className="grid grid-cols-[1fr_16px_180px_32px] gap-3 text-xs text-muted-foreground">
             <span className="px-1">{t("ce_status_provider_value")}</span>
             <span />
             <span className="px-1">{t("ce_status_standard")}</span>
@@ -524,34 +508,28 @@ export function EndpointForm({ definition, onChange, readOnly }: EndpointFormPro
           </div>
           {Object.entries(statusMap).map(([from, to], index) => (
             <div key={index} className="grid grid-cols-[1fr_16px_180px_32px] items-center gap-3">
-              <input
-                type="text"
-                value={from}
-                readOnly={readOnly}
-                aria-label={t("ce_status_provider_value")}
-                onChange={(e) => patch({ status_map: rename(statusMap, from, e.target.value, to) })}
-                className={`${INPUT_CLS} ${MONO_INPUT_CLS}`}
-              />
-              <span aria-hidden className="text-center text-text-3">
+              <div className="min-w-0">
+                <Input
+                  type="text"
+                  mono
+                  value={from}
+                  readOnly={readOnly}
+                  aria-label={t("ce_status_provider_value")}
+                  onChange={(e) => patch({ status_map: rename(statusMap, from, e.target.value, to) })}
+                  autoComplete="off"
+                  spellCheck={false}
+                />
+              </div>
+              <span aria-hidden className="text-center text-muted-foreground">
                 →
               </span>
-              <select
+              <SelectField<EndpointStandardStatus>
                 value={to}
                 disabled={readOnly}
-                aria-label={t("ce_status_standard")}
-                onChange={(e) =>
-                  patch({
-                    status_map: { ...statusMap, [from]: e.target.value as EndpointStandardStatus },
-                  })
-                }
-                className={selectCls}
-              >
-                {STANDARD_STATUSES.map((s) => (
-                  <option key={s} value={s}>
-                    {t(`ce_status_${s}`)}
-                  </option>
-                ))}
-              </select>
+                ariaLabel={t("ce_status_standard")}
+                options={STANDARD_STATUSES.map((s) => ({ value: s, label: t(`ce_status_${s}`) }))}
+                onChange={(next) => patch({ status_map: { ...statusMap, [from]: next } })}
+              />
               {!readOnly && (
                 <RowDeleteButton
                   label={t("ce_status_remove")}
@@ -582,69 +560,77 @@ export function EndpointForm({ definition, onChange, readOnly }: EndpointFormPro
         title={t("ce_section_capabilities")}
         desc={t("ce_section_capabilities_desc")}
       >
-        <div className="flex flex-wrap gap-x-6 gap-y-2.5">
-          <CheckboxField
-            label={t("ce_cap_text_to_video")}
-            checked={capabilities.text_to_video ?? true}
-            disabled={readOnly}
-            onChange={(text_to_video) => patchCapabilities({ text_to_video })}
-          />
-          <CheckboxField
-            label={t("ce_cap_first_frame")}
-            checked={capabilities.first_frame ?? false}
-            disabled={readOnly}
-            onChange={(first_frame) => patchCapabilities({ first_frame })}
-          />
-          <CheckboxField
-            label={t("ce_cap_last_frame")}
-            checked={capabilities.last_frame ?? false}
-            disabled={readOnly}
-            onChange={(last_frame) => patchCapabilities({ last_frame })}
-          />
-        </div>
-        <div className="mt-3 grid grid-cols-1 gap-3 sm:grid-cols-3">
-          <label className="block">
-            <span className={LABEL_CLS}>{t("ce_cap_max_reference_images")}</span>
-            <input
-              type="number"
-              min={0}
-              value={capabilities.max_reference_images ?? 0}
-              readOnly={readOnly}
-              onChange={(e) =>
-                patchCapabilities({ max_reference_images: Number(e.target.value) || 0 })
-              }
-              className={INPUT_CLS}
-            />
-          </label>
-          <label className="block">
-            <span className={LABEL_CLS}>{t("ce_cap_reference_audio_mode")}</span>
-            <select
-              value={capabilities.reference_audio_mode ?? "none"}
+        {isImage ? (
+          <>
+            <div className="flex flex-wrap gap-x-6 gap-y-2.5">
+              <CheckboxField
+                label={t("ce_cap_text_to_image")}
+                checked={capabilities.text_to_image ?? false}
+                disabled={readOnly}
+                onChange={(text_to_image) => patchCapabilities({ text_to_image })}
+              />
+              <CheckboxField
+                label={t("ce_cap_image_to_image")}
+                checked={capabilities.image_to_image ?? false}
+                disabled={readOnly}
+                onChange={(image_to_image) => patchCapabilities({ image_to_image })}
+              />
+            </div>
+            <div className="mt-3 grid grid-cols-1 gap-3 @md/page:grid-cols-3">{maxReferenceImagesField}</div>
+          </>
+        ) : (
+          <>
+          <div className="flex flex-wrap gap-x-6 gap-y-2.5">
+            <CheckboxField
+              label={t("ce_cap_text_to_video")}
+              checked={capabilities.text_to_video ?? true}
               disabled={readOnly}
-              onChange={(e) =>
-                patchCapabilities({ reference_audio_mode: e.target.value as "none" | "direct" })
-              }
-              className={selectCls}
-            >
-              <option value="none">{t("ce_cap_audio_mode_none")}</option>
-              <option value="direct">{t("ce_cap_audio_mode_direct")}</option>
-            </select>
-          </label>
-          <label className="block">
-            <span className={LABEL_CLS}>{t("ce_cap_max_reference_audio_count")}</span>
-            <input
-              type="number"
-              min={0}
-              value={capabilities.max_reference_audio_count ?? 0}
-              readOnly={readOnly}
-              onChange={(e) =>
-                patchCapabilities({ max_reference_audio_count: Number(e.target.value) || 0 })
-              }
-              className={INPUT_CLS}
+              onChange={(text_to_video) => patchCapabilities({ text_to_video })}
             />
-          </label>
-        </div>
-        <span className={HINT_CLS}>{t("ce_capabilities_hint")}</span>
+            <CheckboxField
+              label={t("ce_cap_first_frame")}
+              checked={capabilities.first_frame ?? false}
+              disabled={readOnly}
+              onChange={(first_frame) => patchCapabilities({ first_frame })}
+            />
+            <CheckboxField
+              label={t("ce_cap_last_frame")}
+              checked={capabilities.last_frame ?? false}
+              disabled={readOnly}
+              onChange={(last_frame) => patchCapabilities({ last_frame })}
+            />
+          </div>
+          <div className="mt-3 grid grid-cols-1 gap-3 @md/page:grid-cols-3">
+            {maxReferenceImagesField}
+            <div>
+              <span className={LABEL_CLS}>{t("ce_cap_reference_audio_mode")}</span>
+              <SelectField<"none" | "direct">
+                value={capabilities.reference_audio_mode ?? "none"}
+                disabled={readOnly}
+                ariaLabel={t("ce_cap_reference_audio_mode")}
+                options={[
+                  { value: "none", label: t("ce_cap_audio_mode_none") },
+                  { value: "direct", label: t("ce_cap_audio_mode_direct") },
+                ]}
+                onChange={(reference_audio_mode) => patchCapabilities({ reference_audio_mode })}
+              />
+            </div>
+            <label className="block">
+              <span className={LABEL_CLS}>{t("ce_cap_max_reference_audio_count")}</span>
+              <Input
+                type="number"
+                min={0}
+                value={capabilities.max_reference_audio_count ?? 0}
+                readOnly={readOnly}
+                onChange={(e) =>
+                  patchCapabilities({ max_reference_audio_count: Number(e.target.value) || 0 })
+                }
+              />
+            </label>
+          </div>
+          </>
+        )}
+        <span className={HINT_CLS}>{mediaCopy("ce_capabilities_hint")}</span>
       </FormSection>
     </div>
   );

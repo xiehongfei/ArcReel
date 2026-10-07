@@ -2,6 +2,7 @@
 
 import re
 from pathlib import Path
+from typing import get_args
 
 from lib.config.registry import PROVIDER_REGISTRY
 from lib.i18n import MESSAGES, SUPPORTED_LOCALES
@@ -20,7 +21,9 @@ from lib.i18n.zh import errors as zh_errors
 from lib.i18n.zh import events as zh_events
 from lib.i18n.zh import system as zh_system
 from lib.i18n.zh import templates as zh_templates
-from lib.style_templates import list_template_ids
+from lib.prompts.prompt_templates.builtin import builtin_templates
+from lib.prompts.prompt_templates.engine import TemplateAxis
+from lib.prompts.style_templates import list_template_ids
 
 
 def test_all_locales_have_same_keys():
@@ -153,9 +156,9 @@ def test_batch_admission_problem_codes_are_translated():
     failure envelope, not from admission.
     """
 
-    from lib.generation_result import GenerationProblemCode
-    from lib.reference_video.request_projection import _PROBLEM_PRESENTATION
-    from lib.speech_composition import SpeechProblemCode
+    from lib.generation.generation_result import GenerationProblemCode
+    from lib.script.reference_video.request_projection import _PROBLEM_PRESENTATION
+    from lib.speech.speech_composition import SpeechProblemCode
 
     execution_only = {
         GenerationProblemCode.ENQUEUE_FAILED,
@@ -163,6 +166,7 @@ def test_batch_admission_problem_codes_are_translated():
         GenerationProblemCode.TASK_CANCELLED,
         GenerationProblemCode.TASK_INTERRUPTED,
         GenerationProblemCode.POST_PROCESSING_FAILED,
+        GenerationProblemCode.DEPENDENCY_FAILED,
     }
     codes = (
         set(_PROBLEM_PRESENTATION)
@@ -172,6 +176,20 @@ def test_batch_admission_problem_codes_are_translated():
     for code in sorted(codes):
         for locale in SUPPORTED_LOCALES:
             assert code in MESSAGES[locale], f"problem code '{code}' has no {locale} message"
+
+
+def test_market_core_message_keys_are_translated():
+    """Every message key arcreel-market-core can emit must read as prose.
+
+    The subpackage ships no translation catalog: its diagnostics carry only a key
+    and params, and the application renders them. A key missing here reaches the
+    user as a bare identifier.
+    """
+    from arcreel_market_core.message_keys import MESSAGE_KEYS
+
+    for key in sorted(MESSAGE_KEYS):
+        for locale in SUPPORTED_LOCALES:
+            assert key in MESSAGES[locale], f"market core message key '{key}' has no {locale} message"
 
 
 def _event_label_keys(messages: dict[str, str]) -> set[str]:
@@ -191,23 +209,26 @@ def test_events_module_keys_match():
 
 def test_every_event_label_key_is_translated():
     """事件载荷可能携带的 label_key 全部有翻译，且没有无人使用的残留 key。"""
-    from lib.script_skeleton import SKELETON_ITEM_LABEL_KEYS
-    from server.services.generation_tasks import _SKELETON_TASK_LABEL_KEYS, _TASK_CHANGE_SPECS
+    from lib.project.asset_types import ASSET_SPECS
+    from lib.script.script_skeleton import SKELETON_ITEM_LABEL_KEYS
+    from server.services.tasks.generation_tasks import _SKELETON_TASK_LABEL_KEYS, _TASK_CHANGE_SPECS
 
     emitted = {spec[2] for spec in _TASK_CHANGE_SPECS.values()}
     emitted |= set(_SKELETON_TASK_LABEL_KEYS.values())
     emitted |= set(SKELETON_ITEM_LABEL_KEYS.values())
+    # 快照差分按资产类型表派生的资产与衍生 key。
+    emitted |= {f"named_entity_{asset_type}" for asset_type in ASSET_SPECS}
+    emitted |= {f"named_entity_{t}_derivative" for t, spec in ASSET_SPECS.items() if spec.supports_derivatives}
     # 快照差分与路由直接发布的固定 key（无表可枚举，在此登记）。
     emitted |= {
-        "named_entity_character",
-        "named_entity_scene",
-        "named_entity_prop",
         "character_reference_audio",
         "project_settings",
         "overview",
         "episode",
         "draft_normalized_script",
         "draft_segment_splitting",
+        "draft_script_plan",
+        "draft_prompt_authoring",
     }
     assert _event_label_keys(zh_events.MESSAGES) == emitted
 
@@ -219,6 +240,21 @@ def test_frontend_event_label_keys_match_backend():
     )
     frontend_keys = set(re.findall(r"""["']label\.([a-z0-9_]+)["']""", source))
     assert frontend_keys == _event_label_keys(en_events.MESSAGES)
+
+
+def test_frontend_dashboard_covers_prompt_template_axes_and_categories():
+    """设置页按模版轴名与类别 id 取显示文案，缺 key 时会直接显示英文键名，三种语言都必须齐全。"""
+    axes = set(get_args(TemplateAxis))
+    categories = {meta.category for meta in builtin_templates.list_templates()}
+    required = {f"prompt_templates_axis_{axis}" for axis in axes} | {
+        f"prompt_templates_category_{category}" for category in categories
+    }
+    i18n_dir = Path(__file__).resolve().parents[4] / "frontend" / "src" / "i18n"
+    for locale in ("zh", "en", "vi"):
+        source = (i18n_dir / locale / "dashboard.ts").read_text(encoding="utf-8")
+        defined = set(re.findall(r"""['"]([a-z0-9_]+)['"]\s*:""", source))
+        missing = required - defined
+        assert not missing, f"{locale} dashboard missing prompt template keys: {sorted(missing)}"
 
 
 #: 目录名里出现即需要译名的书写系统区段：拉丁字母以外的写法在 en/vi 界面上无法直接阅读。

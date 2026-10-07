@@ -2,25 +2,26 @@
 id: workflows
 title: Workflows and Modes
 sidebar_position: 2
+update_docs: full
 ---
 
 # Workflows and Modes {#workflows}
 
-ArcReel supports multiple content sources and video generation modes. This page helps you choose the right mode before starting a project and define the review criteria for each stage.
+ArcReel supports multiple content sources and video generation methods. This page helps you choose the right path before starting a project and define the review criteria for each stage.
 
 ## 1. Two Dimensions to Choose Separately {#two-dimensions}
 
 When creating a project, distinguish between:
 
 1. **Content Mode**: determines how the script is organized;
-2. **Video generation mode**: determines whether video production is organized around storyboard images or asset reference images. Multi-grid storyboards are an optional image-generation method within Storyboard mode.
+2. **Generation mode**: determines whether video production is organized around storyboard images or reference images such as asset images. Storyboard to video can optionally generate images as multi-grid storyboards.
 
 They can be combined. For example:
 
-- Drama + Storyboard mode;
-- Drama + Reference-to-video;
-- Narration/Commentary + Storyboard mode;
-- Ad / Short Video + Reference-to-video.
+- Drama + Storyboard to video;
+- Drama + Reference to video;
+- Narration/Commentary + Storyboard to video;
+- Ad / Short Video + Reference to video.
 
 ## 2. Content Sources {#content-sources}
 
@@ -80,7 +81,7 @@ Prepare:
 - Brand visual requirements;
 - Target duration and publishing platform.
 
-Ad / Short Video projects should establish stable merchandise reference assets before generating shots in context.
+Ad / Short Video projects should establish stable merchandise asset images before generating shots in context.
 
 ## 3. Content Modes {#content-modes}
 
@@ -133,9 +134,9 @@ flowchart LR
 
 ```mermaid
 flowchart LR
-    A["Novel / Screenplay"] --> B["Character, Scene & Prop Extraction"]
-    B --> C["Episode Planning"]
-    C --> D["Structured Script"]
+    A["Novel / Screenplay"] --> B["Episode Planning"]
+    B --> C["Structured Script & New Assets"]
+    C --> D["Content Review & Asset Registration"]
     D --> E["Character / Scene Assets"]
     E --> F["Storyboards"]
     F --> G["Video"]
@@ -166,6 +167,15 @@ flowchart LR
 - Merchandise fidelity and reference consistency take priority;
 - Can generate voice-over copy, subtitles, and a Jianying draft, with dubbing completed after export.
 
+#### First Input and Story Setting {#ad-first-input}
+
+Ad/short video projects have no separate setup page. After you create the project, fill in the project overview:
+
+- **Creative brief**: the video you want, the target audience, tone and key selling points, plus the target duration.
+- **Merchandise**: click **Add product**, enter the name and description in the side panel, then upload product photos after the product is created. Without a product, you can still generate the script from the creative brief alone.
+
+Ad/short video projects have no source text. Edit the synopsis, genre, theme and world setting in the **Story setting** tab on the video page; AI script generation draws on them. After you save changes, a script that was already generated is marked outdated.
+
 #### Recommended Workflow {#ad-flow}
 
 ```mermaid
@@ -189,9 +199,9 @@ flowchart LR
 - Whether the ending has a clear call to action;
 - Whether voice-over copy and subtitles comply with platform rules.
 
-## 4. Video Generation Modes {#video-production-routes}
+## 4. Generation Modes {#video-production-routes}
 
-### 4.1 Storyboard Image-to-Video {#storyboard-image-route}
+### 4.1 Storyboard to Video {#storyboard-image-route}
 
 Uses a single storyboard image as the video input.
 
@@ -215,13 +225,24 @@ Uses a single storyboard image as the video input.
 - Projects where each shot is relatively independent;
 - Projects that need to switch providers quickly.
 
-### 4.2 Multi-grid Storyboards Within Storyboard Mode {#grid-storyboard-route}
+### 4.2 Multi-grid Storyboard Images in Storyboard to Video {#grid-storyboard-route}
 
-Multi-grid storyboards are not a separate generation mode but an image-generation method within Storyboard mode. It generates multiple shots from the same passage together on one or more multi-grid storyboards, then automatically splits each grid into an individual storyboard image for each shot and generates each video separately. The video model still receives the individual storyboard image after splitting.
+Multi-grid storyboards are not a separate generation mode but an image-generation method within storyboard to video. It generates multiple shots from the same passage together on one or more multi-grid storyboards; after review, each grid is split into an individual storyboard image for each shot, and each video is then generated separately. The video model still receives the individual storyboard image after splitting.
+
+Image generation takes two steps:
+
+1. **Generate**: produces only the multi-grid storyboard itself and leaves each shot's existing storyboard image unchanged. Review it in the episode page's **Storyboard grids** view; if you are not satisfied, regenerate it or upload your own composite image to replace it.
+2. **Split into cells**: once you are satisfied, click **Split into cells** in the **Storyboard grids** view, or agree in the conversation to let the Agent split it. Splitting overwrites every storyboard image the multi-grid storyboard covers for shots still in the script (shots since removed from the script are skipped); the previous storyboard images stay in the version history and can be rolled back.
 
 Groups containing characters use at most a 2×2 grid per image to preserve facial detail and reduce identity confusion. Groups without characters use 2×2 / 3×3 grids, with 4×4 / 5×5 available at a configured image resolution of 4K. Each cell uses the project's video aspect ratio. Shots exceeding the grid capacity are split across multiple images, and previews and cost estimates reflect that count. Using four-cell grids for character groups may increase image counts and costs.
 
 Each cell depicts only its shot's static first frame, without carrying the previous shot's full action into the next cell. Bound character assets govern face shape, facial proportions, apparent age, body proportions, and clothing; costume changes require the corresponding derivative asset. Existing grids retain their layout. Regenerating by group applies the new four-cell planning rule.
+
+Groups are set by chapter breaks: turn on **Set as chapter break** in the shot details, and a new group starts at that shot. Adding, removing, and reordering shots on the timeline, as well as chapter breaks, work the same way in grid projects.
+
+After the grouping or the order within a group changes, the old multi-grid storyboard no longer matches the new group, so the group shows as not generated and needs to be regenerated. Storyboard images already split from a multi-grid storyboard are not affected and remain usable.
+
+When a few shots in a group are missing storyboard images, you can generate them one by one from the shot details instead of regenerating the whole group.
 
 #### Advantages {#grid-storyboard-pros}
 
@@ -233,7 +254,7 @@ Each cell depicts only its shot's static first frame, without carrying the previ
 
 - Multi-grid storyboard layouts and splitting rules add complexity;
 - Each cell may be less sharp;
-- Not available for the Reference-to-video workflow or Ad / Short Video projects.
+- Not available for reference to video or Ad / Short Video projects.
 
 #### Recommended For {#grid-storyboard-fit}
 
@@ -242,9 +263,9 @@ Each cell depicts only its shot's static first frame, without carrying the previ
 - Reviewing composition, costumes, and overall visual style in groups;
 - Long-form projects that need to reduce visual drift between batches.
 
-### 4.3 Reference-to-Video {#reference-video-route}
+### 4.3 Reference to Video {#reference-video-route}
 
-Instead of using an ordinary storyboard as the sole input, the workflow directly provides character, scene, prop, or merchandise reference assets.
+Instead of using an ordinary storyboard as the sole input, the workflow directly provides reference images such as asset images of characters, scenes, props, or merchandise.
 
 #### Advantages {#reference-video-pros}
 
@@ -262,23 +283,23 @@ Instead of using an ordinary storyboard as the sole input, the workflow directly
 
 #### Recommended For {#reference-video-fit}
 
-- Models with mature Reference-to-video capabilities;
+- Models with mature reference-to-video capabilities;
 - High-quality character and merchandise assets;
 - Projects where identity consistency is the priority;
 - Projects that want fewer intermediate storyboard steps.
 
 ## 5. Mode Selection Table {#mode-selection-table}
 
-| Requirement | Recommended Content Mode | Recommended video generation mode |
+| Requirement | Recommended Content Mode | Recommended Generation Mode |
 |---|---|---|
-| Novel recaps and narration-led content | Narration/Commentary | Storyboard mode |
-| Continuous narratives and character dialogue | Drama | Storyboard mode (with multi-grid storyboards) or Reference-to-video mode |
-| A complete existing screenplay | Drama | Storyboard mode |
-| Merchandise structure must remain stable | Ad / Short Video | Prefer Reference-to-video |
-| Strong cross-shot consistency requirements | Narration/Commentary or Drama | Storyboard mode (with multi-grid storyboards) |
-| First ArcReel trial | Any | Storyboard mode |
-| Limited provider support | Any | Storyboard mode |
-| An established library of high-quality character assets | Drama | Reference-to-video |
+| Novel recaps and narration-led content | Narration/Commentary | Storyboard to video |
+| Continuous narratives and character dialogue | Drama | Storyboard to video (with multi-grid storyboards) or Reference to video |
+| A complete existing screenplay | Drama | Storyboard to video |
+| Merchandise structure must remain stable | Ad / Short Video | Prefer Reference to video |
+| Strong cross-shot consistency requirements | Narration/Commentary or Drama | Storyboard to video (with multi-grid storyboards) |
+| First ArcReel trial | Any | Storyboard to video |
+| Limited provider support | Any | Storyboard to video |
+| An established library of high-quality character assets | Drama | Reference to video |
 
 ## 6. Standard Production Stages {#production-stages}
 
@@ -304,10 +325,20 @@ Confirm:
 - The sequence of plot points or selling points;
 - Episode boundaries;
 - The purpose of each shot;
-- The scope of characters, scenes, and props;
+- Characters, scenes, and props that first appear in each episode, and how the AI proposes to handle them;
 - Content that must not be rewritten.
 
-### Stage 3: Reference Assets {#stage-reference-assets}
+When the AI plans the script for each episode, it compares the characters, scenes, and props in the episode with the names, aliases, and descriptions of registered assets. Unregistered assets are listed in the **New assets in this episode** section of the content review page, each with the AI's proposed handling and reason: register as new asset, merge into existing asset, register as derivative, or do not register. You can change any item before confirming. When you confirm, these assets are registered together with the final script. Aliases on asset cards help the AI recognize other names for the same asset.
+
+Before confirming, you can edit every field of each shot on the content review page, including duration, character / scene / prop references, the chapter break point, source text, lines, and speakers. Reference-to-video shots have no reference lists or chapter break points; asset references are written as `@[name]` in the shot text.
+
+- Pick the duration from the tiers of the current video model. A duration outside the tiers is marked in red with the reason, and you must pick another one before confirming.
+- References can use registered assets, and new assets in this episode whose handling is not **do not register**.
+- Pick a speaker from registered characters and new characters in this episode, or type another name, such as an extra who has no bound voice.
+
+If the references still contain a name that is neither registered nor a new asset registered in this episode, the confirmation is rejected and the affected shots and names are listed. Add, remove, and reorder shots on the timeline after confirming.
+
+### Stage 3: Asset Images {#stage-reference-assets}
 
 Confirm:
 
@@ -317,6 +348,25 @@ Confirm:
 - Key props;
 - Merchandise;
 - Style references.
+
+#### Merge assets registered twice {#merge-assets}
+
+When the same person, place, or object is registered as two assets (for example, "Old Wang" and "Wang Jianguo"), open the menu on one of the asset cards, choose **Merge into…**, and pick the asset of the same type to keep. Only characters, scenes, and props can be merged.
+
+After the merge, references in every episode's script plan, final script, drafts, and prompt text point to the kept asset, and the merged asset's name and aliases become aliases of the kept asset. Derivatives of a merged character move to the kept character; a derivative with the same name as one the kept character already has merges into the existing one. The kept asset's description, sheet, and other settings do not change.
+
+For characters, you can also choose **Derivative**: the merged character becomes a derivative of the kept character, keeping its description, and the derivative sheet needs generating. Visual references point to that derivative, dialogue speakers change to the kept character, and the merged character's name is not recorded as an alias.
+
+The merged asset's description, sheet and version history, voice settings, reference image, and reference audio are not kept, and a merge can't be undone. Before you confirm, the dialog lists, per episode, how many references will be rewritten and how many storyboard images and videos will become stale. It also shows the merged asset's description so you can copy what you need into the kept asset.
+
+#### Delete assets {#delete-assets}
+
+Open the menu on an asset card and choose **Delete**. Before you confirm, the dialog checks references in every episode's script plan, final script, drafts, and prompt text:
+
+- If the asset is referenced, the dialog says which episodes reference it and how many times. Deleting doesn't rewrite those references, so shots that reference the asset will be blocked at generation. To keep the references, choose **Merge instead…** to [merge it into another asset of the same type](#merge-assets). Products can't be merged, so they don't have this button.
+- If nothing references the asset, the dialog only warns that deletion can't be undone.
+
+Deleting a character also deletes its derivatives. Deletion can't be undone.
 
 ### Stage 4: Small Sample {#stage-sample-clips}
 
@@ -339,7 +389,7 @@ Before starting, confirm:
 - Failure retry strategy;
 - Disk space.
 
-#### Current, Stale, Missing, and Blocked Artifacts {#artifact-currency}
+#### Current, Stale, and Missing Artifacts {#artifact-currency}
 
 ArcReel determines an artifact's state from the direct inputs used to generate it:
 
@@ -370,7 +420,7 @@ ArcReel's advantage is not “skipping review,” but placing review where the c
 
 | Review Point | What to Do When It Fails | What Not to Do |
 |---|---|---|
-| Content analysis | Correct the characters, scenes, props, and episode plan | Continue generating all character images |
+| Content review | Correct the episode plan, shot content, and handling of new assets | Continue generating all character images |
 | Character assets | Redo the character design or description | Batch-generate storyboards with an incorrect character |
 | Small storyboard sample | Correct composition and style | Generate the entire episode's videos immediately |
 | Small video sample | Adjust the model, parameters, and action descriptions | Repeatedly test expensive models without a plan |
@@ -388,7 +438,7 @@ ArcReel's advantage is not “skipping review,” but placing review where the c
 
 ### Scenes {#consistency-scenes}
 
-- Establish reference assets for important scenes;
+- Establish asset images for important scenes;
 - Fix the spatial orientation and main decor;
 - Avoid unnecessary changes in lighting and time of day within the same passage;
 - Track where characters are positioned in the space.

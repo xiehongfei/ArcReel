@@ -1,7 +1,7 @@
 """script_plan→prompt_authoring web 内容确认路由。
 
-暴露结构化中间态的审阅 / 编辑 / 确认：script_plan 产出后中间态在 web 可见可改，用户显式确认后才放行
-prompt_authoring 视觉生成（prompt_authoring 由 Agent 的 generate_episode_script 执行，读时经内容确认校验阻塞到确认）。
+暴露脚本规划的审阅 / 编辑 / 确认：script_plan 产出后在 web 可见可改，用户显式确认时整份转为
+正式脚本（条目带待编写标记），之后由 Agent 的 generate_episode_script 按正式脚本补写视觉层。
 drama（utterances + source_text）与 narration（结构化 novel_text）共用本机制。
 """
 
@@ -10,60 +10,69 @@ import logging
 from fastapi import APIRouter, Body, Depends
 from pydantic import BaseModel, ConfigDict, Field
 
-from lib.api_errors import ConflictError, NotFoundError, UnprocessableError
-from lib.i18n import Translator
-from lib.project_manager import ScriptWriteConflict, get_project_manager
-from lib.script_plan_entries import ScriptPlanEntryError
+from lib.infra.api_errors import NotFoundError
+from lib.project.project_manager import get_project_manager
+from lib.script.script_review import overwrite_with_text
 from server.dependencies import require_project_migration_ok
+from server.i18n import Translator
 from server.routers._script_review_errors import raise_review_error
-from server.services.script_plan_conversion import (
-    ScriptPlanNotFoundError,
-    convert_script_plan,
-    preview_script_plan_conversion,
-)
-from server.services.script_review import ScriptReviewError, ScriptReviewService
-from server.text_generation import TextGenerationError
+from server.services.project.script_review import ScriptReviewError, ScriptReviewService
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
 
-async def _attach_duration_tiers(service: ScriptReviewService, project_name: str, episode: int, state: dict) -> dict:
-    """把收窄后的逐 unit 时长档位挂到 state 上；三个改动 script_plan 内容的端点（GET/PUT/POST）
+async def _attach_duration_tiers(
+    service: ScriptReviewService, project_name: str, episode: int, state: dict, _t: Translator
+) -> dict:
+    """把逐 unit 时长档位与本地化降级提示挂到 state 上；三个端点（GET/PUT/POST）
     都要走这一步——否则保存 / 确认后 ``adopt()`` 用不带 ``duration_tiers`` 的响应覆盖 GET
-    读到的收窄结果，面板退回未收窄的 ``supported_durations``，与 GET 首次加载时的呈现不一致。
+    读到的收窄结果，面板无法区分生效档位与 i2v 失败。
 
     是否调用交给 ``get_reference_duration_tiers`` 自己按 script_plan_kind 判断，不靠
     ``state["supported_durations"] is not None`` 短路——那是另一个方法的返回值，型号解析
     不到时同样为 None，靠它短路会让这类项目连未收窄的档位都拿不到。
     """
-    state["duration_tiers"] = await service.get_reference_duration_tiers(project_name, episode)
+    content = state.get("content")
+    units = content.get("units") if isinstance(content, dict) else None
+    state["duration_tiers"] = await service.get_reference_duration_tiers(
+        project_name, episode, units if isinstance(units, list) else ()
+    )
+    for soft in state.get("soft_violations") or []:
+        soft["message"] = _t(soft["code"], **soft["params"])
     return state
 
 
-def _localize_quarantine_violations(quarantine: dict | None, _t: Translator) -> dict | None:
-    """把 ``quarantine_unreadable`` 违约的固定中文文案换成按 ``_t`` 渲染的本地化文本。
+def _attach_overwrite_text(state: dict, _t: Translator) -> dict:
+    """给覆盖清单附上服务端渲染的丢失清单文本；Web 确认框只呈现这份文本，与 Agent 回执同源。"""
+    state["script_overwrite"] = overwrite_with_text(state.get("script_overwrite"), _t)
+    return state
 
-    该 code 只由两处产出（草稿信封本身损坏 / 重算所需的 meta 缺失损坏），两处都是不带
-    插值的固定字符串，不涉及 ``lib.reference_video.draft_validation`` 里其余违约类型那种
-    产出时已渲染好插值的模板——本地化改造范围限定在这两条，不牵动其余违约消息的展示形态。
+
+def localize_draft_view(view: dict | None, _t: Translator) -> dict | None:
+    """把草稿视图里的固定文案违约与降级提示换成按 ``_t`` 渲染的本地化文本。
+
+    ``quarantine_unreadable`` 只由两处产出（草稿信封本身损坏 / 重算所需的 meta 缺失损坏），都是不带
+    插值的固定字符串；带 ``params`` 的条目是视频请求事实的失败，问题码即文案 key，与内容确认的 422
+    同一呈现。二者都不涉及 ``lib.script.reference_video.draft_validation`` 里其余违约类型那种产出时已
+    渲染好插值的模板——违约的本地化范围限定在这两类。降级提示一律以 ``code`` 为文案 key 成文。
     """
-    if quarantine is None:
+    if view is None:
         return None
-    for violation in quarantine["violations"]:
+    for violation in view["violations"]:
         if violation["code"] == "quarantine_unreadable":
             violation["message"] = _t("script_review_quarantine_unreadable")
-    return quarantine
+        elif isinstance(violation.get("params"), dict):
+            violation["message"] = _t(violation["code"], **violation["params"])
+    for soft in view.get("soft_violations") or []:
+        soft["message"] = _t(soft["code"], **soft["params"])
+    return view
 
 
 @router.get("/projects/{project_name}/episodes/{episode}/script-review")
 async def get_script_review(project_name: str, episode: int, _t: Translator):
     """读取该集 script_plan 结构化中间态 + 内容确认状态（供 web 渲染与编辑）。
-
-    ``script_entry_currency`` 随 state 回传：正式剧本相对这份 script_plan 的条目时效，时间线的
-    「剧本内容已更新」提示读它。它不带准入判定，草稿在场时照样给出失效条目——与 ``conversion-preview``
-    的「能否转换」是两套口径。
 
     ``quarantine`` 字段单独合并（reference_video 变体、草稿在场时才非 None）：它按产出时
     那套校验器做读时重算，与 ``get_state`` 的落盘读写彼此独立。
@@ -77,8 +86,9 @@ async def get_script_review(project_name: str, episode: int, _t: Translator):
         service = ScriptReviewService(get_project_manager())
         quarantine = await service.get_quarantine_info(project_name, episode)
         state = await service.get_state(project_name, episode)
-        await _attach_duration_tiers(service, project_name, episode, state)
-        state["quarantine"] = _localize_quarantine_violations(quarantine, _t)
+        await _attach_duration_tiers(service, project_name, episode, state, _t)
+        _attach_overwrite_text(state, _t)
+        state["quarantine"] = localize_draft_view(quarantine, _t)
         return state
     except ScriptReviewError as exc:
         raise_review_error(exc, episode, _t)
@@ -113,8 +123,9 @@ async def update_script_review_content(
         service = ScriptReviewService(get_project_manager())
         state = await service.save_content(project_name, episode, content, base_fingerprint)
         quarantine = await service.get_quarantine_info(project_name, episode)
-        await _attach_duration_tiers(service, project_name, episode, state)
-        state["quarantine"] = _localize_quarantine_violations(quarantine, _t)
+        await _attach_duration_tiers(service, project_name, episode, state, _t)
+        _attach_overwrite_text(state, _t)
+        state["quarantine"] = localize_draft_view(quarantine, _t)
         return state
     except ScriptReviewError as exc:
         raise_review_error(exc, episode, _t)
@@ -122,9 +133,28 @@ async def update_script_review_content(
         raise NotFoundError("project_not_found", name=project_name) from exc
 
 
-@router.post("/projects/{project_name}/episodes/{episode}/script-review/confirm")
-async def confirm_script_review(project_name: str, episode: int, _t: Translator):
-    """用户显式确认 script_plan 内容，放行 prompt_authoring 视觉生成。
+class ConfirmScriptReviewRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    overwrite_revision: str | None = Field(
+        default=None, description="认可覆盖的正式脚本版本，取自 script_overwrite.revision；该集尚无正式脚本时不必给"
+    )
+
+
+@router.post(
+    "/projects/{project_name}/episodes/{episode}/script-review/confirm",
+    dependencies=[Depends(require_project_migration_ok)],
+)
+async def confirm_script_review(
+    project_name: str,
+    episode: int,
+    _t: Translator,
+    req: ConfirmScriptReviewRequest | None = None,
+):
+    """用户显式确认 script_plan 内容：整份转为正式脚本（全部分镜待编写），放行 prompt_authoring 视觉生成。
+
+    该集已有正式脚本时须带 ``overwrite_revision``（覆盖清单的 ``revision``），缺失或与当前正式脚本不符
+    时 409，诊断里的 ``script_overwrite`` 列出当前将被移除的分镜与产物摘要，不写正式脚本与确认记录。
 
     ``quarantine`` 同 GET / PUT 一并合并，保持三个端点响应形状一致——``confirm()`` 内部虽已
     按待处置草稿文件存在性拒绝确认，但响应仍应如实反映确认完成那一刻的草稿状态，而不是让这个字段在
@@ -132,84 +162,14 @@ async def confirm_script_review(project_name: str, episode: int, _t: Translator)
     """
     try:
         service = ScriptReviewService(get_project_manager())
-        state = await service.confirm(project_name, episode)
-        await _attach_duration_tiers(service, project_name, episode, state)
-        state["quarantine"] = _localize_quarantine_violations(
-            await service.get_quarantine_info(project_name, episode), _t
+        state = await service.confirm(
+            project_name, episode, overwrite_revision=req.overwrite_revision if req is not None else None
         )
+        await _attach_duration_tiers(service, project_name, episode, state, _t)
+        _attach_overwrite_text(state, _t)
+        state["quarantine"] = localize_draft_view(await service.get_quarantine_info(project_name, episode), _t)
         return state
     except ScriptReviewError as exc:
         raise_review_error(exc, episode, _t)
     except FileNotFoundError as exc:
         raise NotFoundError("project_not_found", name=project_name) from exc
-
-
-class ConvertScriptPlanRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    entry_ids: list[str] = Field(default_factory=list, description="要「采用新内容」的失效分镜 id")
-
-
-@router.post(
-    "/projects/{project_name}/episodes/{episode}/script-review/convert",
-    dependencies=[Depends(require_project_migration_ok)],
-)
-async def convert_script_plan_to_script(
-    project_name: str,
-    episode: int,
-    _t: Translator,
-    req: ConvertScriptPlanRequest | None = None,
-):
-    """按脚本规划机械转为正式脚本，不调用文本模型。
-
-    与 MCP 工具 ``convert_script_plan`` 同一入口：内容确认门禁与 ``generate_episode_script`` 共用同一道
-    预检；无 ``entry_ids`` 为集合同步（新增以待生成落盘、移出、改序，失效分镜不碰），有 ``entry_ids``
-    让点名的失效分镜采用新内容。回执列出 ``added`` / ``refreshed`` / ``removed`` 三组条目 id。
-    """
-    entry_ids = req.entry_ids if req is not None else []
-    try:
-        receipt = await convert_script_plan(project_name, episode, entry_ids=entry_ids)
-    except TextGenerationError as exc:
-        raise ConflictError("script_conversion_refused").with_diagnostic(str(exc)) from exc
-    except ScriptWriteConflict as exc:
-        raise ConflictError("script_conversion_conflict") from exc
-    except ScriptPlanEntryError as exc:
-        raise UnprocessableError("script_conversion_invalid_entries").with_diagnostic(str(exc)) from exc
-    except FileNotFoundError as exc:
-        raise NotFoundError("project_not_found", name=project_name) from exc
-    except ValueError as exc:
-        raise UnprocessableError("script_validation_failed").with_diagnostic(str(exc)) from exc
-    return {
-        "episode": receipt.episode,
-        "script_filename": receipt.script_filename,
-        "added": list(receipt.added),
-        "refreshed": list(receipt.refreshed),
-        "removed": list(receipt.removed),
-    }
-
-
-@router.get("/projects/{project_name}/episodes/{episode}/script-review/conversion-preview")
-async def preview_script_plan_conversion_to_script(project_name: str, episode: int, _t: Translator):
-    """只读预演机械转换：列出 ``added`` / ``stale`` / ``removed`` 三组条目 id，以及顺序、标题是否有变。
-
-    不落盘、不经内容确认门禁，但过与生成同一组准入断言（待修复草稿、时长档位、发声准入），
-    任一不满足即 422——它回答的是「现在能否转换」，只供「转为正式脚本」对话框使用；时间线的
-    失效提示读 ``GET script-review`` 的 ``script_entry_currency``，那是不带准入的「内容是否变了」。
-    """
-    try:
-        preview = await preview_script_plan_conversion(project_name, episode)
-    except ScriptPlanNotFoundError as exc:
-        raise UnprocessableError("script_review_no_script_plan") from exc
-    except FileNotFoundError as exc:
-        raise NotFoundError("project_not_found", name=project_name) from exc
-    except ValueError as exc:
-        raise UnprocessableError("script_validation_failed").with_diagnostic(str(exc)) from exc
-    return {
-        "episode": preview.episode,
-        "has_script": preview.has_script,
-        "added": list(preview.added),
-        "stale": list(preview.stale),
-        "removed": list(preview.removed),
-        "order_changed": preview.order_changed,
-        "title_changed": preview.title_changed,
-    }

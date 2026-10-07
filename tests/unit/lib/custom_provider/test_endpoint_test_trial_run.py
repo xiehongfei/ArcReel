@@ -7,9 +7,11 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import os
 import time
+from dataclasses import replace
 from pathlib import Path
 
 import httpx
@@ -17,6 +19,9 @@ import pytest
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
+from arcreel_market_core.video_backend_contract import VideoCapabilities
+from lib.billing.ledger import Ledger
+from lib.custom_provider.declarative_backend import DeclarativeVideoBackend
 from lib.custom_provider.endpoint_test import (
     TRIAL_RUN_TTL_SECONDS,
     EndpointTestCredentials,
@@ -29,9 +34,8 @@ from lib.custom_provider.endpoint_test import (
     provider_from_base_url,
 )
 from lib.db.models.api_call import ApiCall
-from lib.ledger import Ledger
-from tests.factories import custom_endpoint_definition
-from tests.fakes import bounded_poll_clock
+from tests.factories import custom_endpoint_definition, image_endpoint_definition
+from tests.fakes import PNG_BYTES, bounded_poll_clock
 from tests.http_capture import capture_http
 
 PARAMETERS = EndpointTestParameters(model="video-x", prompt="纸船顺流而下", duration_seconds=5)
@@ -91,6 +95,128 @@ def _mock_pending_run(router) -> asyncio.Event:
         return_value=httpx.Response(200, json={"status": "processing"})
     )
     return submitted
+
+
+class _TierAwareBackend(DeclarativeVideoBackend):
+    """1080p 档收窄能力的声明式端点：尾帧不可用、带首帧只收 adaptive，其余档位照定义声明。
+
+    出站仍走声明式端点的真实路径，只多一个 ``video_capabilities_for_tier``——这正是生产侧
+    ``resolve_video_capabilities`` 探测的那个可选成员。
+    """
+
+    def video_capabilities_for_tier(self, service_tier: str, resolution: str | None = None) -> VideoCapabilities:
+        caps = self.video_capabilities
+        if resolution == "1080p":
+            return replace(caps, last_frame=False, first_frame_ratio_adaptive_only=True)
+        return caps
+
+
+def _tier_aware_target(parameters: EndpointTestParameters) -> TrialRunTarget:
+    definition = custom_endpoint_definition(
+        inputs={
+            "first_frame": {"source": "start_image", "encoding": "data_uri"},
+            "last_frame": {"source": "end_image", "encoding": "data_uri"},
+        },
+        capabilities={"first_frame": True, "last_frame": True},
+    )
+    definition["submit"]["body"]["last_image"] = "{{ inputs.last_frame }}"
+    definition["submit"]["body"]["ratio"] = "{{ aspect_ratio }}"
+    target = declarative_target(definition, CREDENTIALS, parameters)
+
+    async def build() -> _TierAwareBackend:
+        return _TierAwareBackend(
+            api_key=CREDENTIALS.api_key,
+            base_url=CREDENTIALS.base_url,
+            model=parameters.model,
+            definition=definition,
+            provider=target.provider,
+        )
+
+    return replace(target, build_backend=build)
+
+
+IMAGE_PARAMETERS = EndpointTestParameters(model="gpt-image-2", prompt="黄昏的灯塔")
+
+
+def _image_target():
+    return declarative_target(image_endpoint_definition(), CREDENTIALS, IMAGE_PARAMETERS)
+
+
+def _image_task(status: str, **data: object) -> httpx.Response:
+    return httpx.Response(200, json={"code": 200, "data": {"status": status, **data}})
+
+
+def _mock_image_submit(router) -> None:
+    router.post("https://relay.test/v1/images/generations").mock(
+        return_value=httpx.Response(200, json={"code": 200, "data": [{"status": "submitted", "task_id": "task_9"}]})
+    )
+
+
+class TestImageDefinitionTrialRun:
+    async def test_an_image_definition_runs_to_an_image_artifact(
+        self, trial_runs: TrialRunManager, db_factory: async_sessionmaker
+    ):
+        with capture_http() as router, bounded_poll_clock():
+            _mock_image_submit(router)
+            router.get("https://relay.test/v1/tasks/task_9").mock(
+                side_effect=[
+                    _image_task("processing"),
+                    _image_task("completed", result={"images": [{"url": ["https://cdn.test/img/a.png"]}]}),
+                ]
+            )
+            router.get("https://cdn.test/img/a.png").mock(return_value=httpx.Response(200, content=PNG_BYTES))
+            started = await trial_runs.start(_image_target(), IMAGE_PARAMETERS)
+            run = await _await_terminal(trial_runs, started.id)
+
+        assert run.status is TrialRunStatus.SUCCEEDED
+        assert run.media_type == "image"
+        assert run.has_artifact
+        assert trial_runs.artifact_path(run.id).read_bytes() == PNG_BYTES
+        assert run.extractions["poll"]["image_url"] == "https://cdn.test/img/a.png"
+        async with db_factory() as session:
+            rows = (await session.execute(select(ApiCall))).scalars().all()
+        assert [row.call_type for row in rows] == ["image"]
+
+    async def test_a_base64_image_lands_as_the_artifact_and_is_reported_by_size(self, trial_runs: TrialRunManager):
+        definition = image_endpoint_definition()
+        definition["poll"]["extract"]["image_b64"] = ["$.data.result.images[0].b64_json"]
+        encoded = base64.b64encode(PNG_BYTES * 64).decode("ascii")
+        with capture_http() as router, bounded_poll_clock():
+            _mock_image_submit(router)
+            router.get("https://relay.test/v1/tasks/task_9").mock(
+                return_value=_image_task("completed", result={"images": [{"b64_json": encoded}]})
+            )
+            started = await trial_runs.start(
+                declarative_target(definition, CREDENTIALS, IMAGE_PARAMETERS), IMAGE_PARAMETERS
+            )
+            run = await _await_terminal(trial_runs, started.id)
+
+        assert run.status is TrialRunStatus.SUCCEEDED
+        assert trial_runs.artifact_path(run.id).read_bytes() == PNG_BYTES * 64
+        assert run.extractions["poll"]["image_bytes"] == len(PNG_BYTES * 64)
+        assert run.video_url is None
+        assert encoded not in json.dumps(run.extractions)
+
+    @pytest.mark.parametrize(
+        ("poll_body", "reason"),
+        [
+            (_image_task("failed", error={"message": "content policy violation"}), "content policy violation"),
+            (_image_task("cancelled"), "cancelled"),
+        ],
+    )
+    async def test_a_provider_side_failure_lands_as_a_failed_image_run(
+        self, trial_runs: TrialRunManager, poll_body: httpx.Response, reason: str
+    ):
+        with capture_http() as router, bounded_poll_clock():
+            _mock_image_submit(router)
+            router.get("https://relay.test/v1/tasks/task_9").mock(return_value=poll_body)
+            started = await trial_runs.start(_image_target(), IMAGE_PARAMETERS)
+            run = await _await_terminal(trial_runs, started.id)
+
+        assert run.status is TrialRunStatus.FAILED
+        assert run.media_type == "image"
+        assert not run.has_artifact
+        assert reason in (run.error or "")
 
 
 class TestTrialRun:
@@ -281,6 +407,59 @@ class TestTrialRun:
         async with db_factory() as session:
             rows = (await session.execute(select(ApiCall))).scalars().all()
         assert rows[0].aspect_ratio == PARAMETERS.aspect_ratio
+
+    @pytest.mark.parametrize(
+        ("resolution", "expected", "error_code"),
+        [("1080p", "failed", "video_last_frame_unsupported"), ("720p", "succeeded", None)],
+    )
+    async def test_the_gate_reads_the_capabilities_narrowed_to_the_requested_resolution(
+        self,
+        tmp_path: Path,
+        trial_runs: TrialRunManager,
+        db_factory: async_sessionmaker,
+        resolution: str,
+        expected: str,
+        error_code: str | None,
+    ):
+        """档位感知的端点按请求分辨率收窄能力：生产在收窄后的能力上拒绝的请求，测试连接同样拒绝。"""
+        parameters = replace(PARAMETERS, resolution=resolution)
+        frame = tmp_path / "frame.png"
+        frame.write_bytes(b"png")
+        last = tmp_path / "last.png"
+        last.write_bytes(b"png")
+
+        with capture_http() as router, bounded_poll_clock():
+            _mock_successful_run(router)
+            started = await trial_runs.start(
+                _tier_aware_target(parameters), parameters, assets={"start_image": frame, "end_image": last}
+            )
+            run = await _await_terminal(trial_runs, started.id)
+
+        assert run.status is TrialRunStatus(expected), run.error
+        if error_code is not None:
+            assert (run.error or "").startswith(f"[{error_code}]")
+        async with db_factory() as session:
+            rows = (await session.execute(select(ApiCall))).scalars().all()
+        assert len(rows) == (1 if expected == "succeeded" else 0)
+
+    async def test_the_adaptive_ratio_follows_the_capabilities_narrowed_to_the_requested_resolution(
+        self, tmp_path: Path, trial_runs: TrialRunManager
+    ):
+        """比例覆盖与能力闸读同一份收窄结果：只在该分辨率声明 adaptive 的端点也要下发 adaptive。"""
+        parameters = replace(PARAMETERS, resolution="1080p")
+        frame = tmp_path / "frame.png"
+        frame.write_bytes(b"png")
+
+        with capture_http() as router, bounded_poll_clock():
+            _mock_successful_run(router)
+            submit = router.post("https://relay.test/v1/video/create").mock(
+                return_value=httpx.Response(200, json={"task_id": "job-42"})
+            )
+            started = await trial_runs.start(_tier_aware_target(parameters), parameters, assets={"start_image": frame})
+            run = await _await_terminal(trial_runs, started.id)
+
+        assert run.status is TrialRunStatus.SUCCEEDED, run.error
+        assert json.loads(submit.calls.last.request.content)["ratio"] == "adaptive"
 
     async def test_a_provider_failure_lands_as_a_failed_run(self, trial_runs: TrialRunManager):
         with capture_http() as router, bounded_poll_clock():

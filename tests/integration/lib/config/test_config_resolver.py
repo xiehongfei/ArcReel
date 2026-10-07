@@ -1,4 +1,4 @@
-from typing import ClassVar, cast
+from typing import cast
 from unittest.mock import patch
 
 import pytest
@@ -6,9 +6,8 @@ import pytest
 from lib.config.resolver import (
     ConfigResolver,
     VideoBucketCapabilityError,
+    VideoGenerationType,
     caps_generation_mode,
-    constrain_durations_for_project,
-    resolve_raw_supported_durations,
     video_bucket_for_generation_mode,
 )
 from lib.config.service import ProviderStatus
@@ -23,8 +22,7 @@ def _make_ready_provider(name: str, media_types: list[str]) -> ProviderStatus:
         media_types=media_types,
         capabilities=[],
         required_keys=[],
-        configured_keys=[],
-        missing_keys=[],
+        credential_count=0,
     )
 
 
@@ -61,10 +59,10 @@ class _FakeConfigService:
         return [_make_ready_provider("gemini-aistudio", ["text", "image", "video"])]
 
 
-async def _video_caps(db_factory, project: dict) -> dict:
+async def _video_caps(db_factory, project: dict, *, generation_type: VideoGenerationType | None = None) -> dict:
     """按项目字典解析视频能力；项目落盘不参与本组判据，故 project_manager 只做占位。"""
     with patch("lib.config.resolver.get_project_manager"):
-        return await ConfigResolver(db_factory).video_capabilities_for_project(project)
+        return await ConfigResolver(db_factory).video_capabilities_for_project(project, generation_type=generation_type)
 
 
 class TestVideoGenerateAudio:
@@ -193,6 +191,48 @@ class TestDefaultBackends:
         async with db_factory() as session:
             with pytest.raises(ValueError, match="未找到可用的 image 供应商"):
                 await resolver._resolve_default_image_backend(fake_svc, session)
+
+    @pytest.mark.parametrize(("generation_type", "expected_model"), [("t2i", "t2i-m"), ("i2i", "i2i-m")])
+    async def test_image_backend_auto_resolve_picks_the_custom_default_of_the_bucket(
+        self, db_factory, generation_type, expected_model
+    ):
+        """无 ready 内置供应商时的自定义兜底按桶挑默认：t2i 与 i2i 各设一个默认时不能取错桶。"""
+        from lib.custom_provider import make_provider_id
+        from lib.db.models.custom_provider import CustomProvider, CustomProviderModel
+
+        resolver = ConfigResolver.__new__(ConfigResolver)
+        fake_svc = _FakeConfigService(settings={}, ready_providers=[])
+        async with db_factory() as session:
+            provider = CustomProvider(
+                display_name="Prov", discovery_format="openai", base_url="https://api.example.com", api_key="k"
+            )
+            session.add(provider)
+            await session.flush()
+            session.add_all(
+                [
+                    # openai-images-generations 只声明 t2i，openai-images-edits 只声明 i2i
+                    CustomProviderModel(
+                        provider_id=provider.id,
+                        model_id="t2i-m",
+                        display_name="T2I",
+                        endpoint="openai-images-generations",
+                        is_default=True,
+                        is_enabled=True,
+                    ),
+                    CustomProviderModel(
+                        provider_id=provider.id,
+                        model_id="i2i-m",
+                        display_name="I2I",
+                        endpoint="openai-images-edits",
+                        is_default=True,
+                        is_enabled=True,
+                    ),
+                ]
+            )
+            await session.flush()
+
+            result = await resolver._resolve_default_image_backend(fake_svc, session, generation_type)
+        assert result == (make_provider_id(provider.id), expected_model)
 
     async def test_default_image_backend_t2i_bucket_overrides_default_layer(self):
         """全局桶 default_image_backend_t2i 覆盖全局默认层 default_image_backend。"""
@@ -431,8 +471,8 @@ class TestVideoCapabilitiesBucketing:
             await _video_caps(db_factory, {"video_backend": "minimax/S2V-01", "generation_mode": "storyboard"})
         assert excinfo.value.code == "video_capability_missing_i2v"
 
-    async def test_duration_constraints_evaluate_on_bucket_model(self, db_factory):
-        """时长收窄按桶生效模型求值：参考生视频项目落 r2v 桶模型声明的「参考图↔时长」约束。"""
+    async def test_reference_project_reads_the_r2v_bucket_model(self, db_factory):
+        """参考生视频项目的能力取 r2v 桶生效模型的声明。"""
         project = {
             "video_provider_i2v": "kling/kling-v3",
             "video_provider_r2v": "gemini-aistudio/veo-3.1-generate-preview",
@@ -441,14 +481,6 @@ class TestVideoCapabilitiesBucketing:
         caps = await _video_caps(db_factory, project)
         assert caps["model"] == "veo-3.1-generate-preview"
         assert caps["supported_durations"] == [4, 6, 8]
-        constrained = constrain_durations_for_project(
-            project,
-            list(caps["supported_durations"]),
-            provider_id=caps["provider_id"],
-            model_id=caps["model"],
-            generation_mode="reference_video",
-        )
-        assert constrained == [8]
 
     async def test_max_reference_images_follows_backend_declaration(self, db_factory):
         """viduq3-pro 不在 /reference2video 白名单：能力查询报 0，不报 registry 的并行声明。"""
@@ -457,152 +489,25 @@ class TestVideoCapabilitiesBucketing:
 
 
 class TestVideoCapabilities:
-    """验证 video_capabilities：第一步模型选择 + 第二步 model 能力查询。"""
-
-    async def test_registry_grok(self, db_factory):
-        resolver = ConfigResolver.__new__(ConfigResolver)
-        fake_svc = _FakeConfigService(
-            settings={"default_video_backend": "grok/grok-imagine-video"},
-        )
-        async with db_factory() as session:
-            with patch("lib.config.resolver.get_project_manager") as mock_pm:
-                mock_pm.return_value.load_project.return_value = {}
-                caps = await resolver._resolve_video_capabilities(fake_svc, session, "demo")
-        assert caps["provider_id"] == "grok"
-        assert caps["model"] == "grok-imagine-video"
-        assert caps["source"] == "registry"
-        assert caps["supported_durations"] == list(range(1, 16))
-        assert caps["max_duration"] == 15
-        assert caps["max_reference_images"] == 7
-
-    async def test_registry_veo(self, db_factory):
-        resolver = ConfigResolver.__new__(ConfigResolver)
-        fake_svc = _FakeConfigService(settings={})
-        async with db_factory() as session:
-            with patch("lib.config.resolver.get_project_manager") as mock_pm:
-                mock_pm.return_value.load_project.return_value = {
-                    "video_backend": "gemini-aistudio/veo-3.1-generate-preview",
-                }
-                caps = await resolver._resolve_video_capabilities(fake_svc, session, "demo")
-        assert caps["provider_id"] == "gemini-aistudio"
-        assert caps["model"] == "veo-3.1-generate-preview"
-        assert caps["source"] == "registry"
-        assert caps["supported_durations"] == [4, 6, 8]
-        assert caps["max_duration"] == 8
-        # max_reference_images 来源：backend 的 VideoCapabilities 声明（与执行层同源）
-        assert caps["max_reference_images"] == 3
-
-    async def test_duration_constraints_follow_saved_resolution(self, db_factory):
-        """缺省上下文按项目已保存档位收窄；supported_durations 仍是全集。"""
-        resolver = ConfigResolver.__new__(ConfigResolver)
-        fake_svc = _FakeConfigService(settings={})
-        async with db_factory() as session:
-            with patch("lib.config.resolver.get_project_manager") as mock_pm:
-                mock_pm.return_value.load_project.return_value = {
-                    "video_backend": "gemini-aistudio/veo-3.1-generate-preview",
-                    "model_settings": {"gemini-aistudio/veo-3.1-generate-preview": {"resolution": "1080p"}},
-                }
-                caps = await resolver._resolve_video_capabilities(fake_svc, session, "demo")
-        assert caps["supported_durations"] == [4, 6, 8]
-        assert caps["duration_constraints"] == {
-            "resolution": "1080p",
-            "uses_reference_images": False,
-            "allowed": [8],
-            "allowed_without_reference_images": [8],
-            "excluded": {4: "resolution", 6: "resolution"},
-        }
-
-    async def test_duration_constraints_reference_mode_uses_provider_fallback(self, db_factory):
-        """参考生视频项目未选档位：按执行期真正下发的供应商兜底档位求值，与 constrain_durations_for_project 同口径。"""
-        resolver = ConfigResolver.__new__(ConfigResolver)
-        fake_svc = _FakeConfigService(settings={})
-        async with db_factory() as session:
-            with patch("lib.config.resolver.get_project_manager") as mock_pm:
-                mock_pm.return_value.load_project.return_value = {
-                    "video_backend": "gemini-aistudio/veo-3.1-generate-preview",
-                    "generation_mode": "reference_video",
-                }
-                caps = await resolver._resolve_video_capabilities(fake_svc, session, "demo")
-        constraints = caps["duration_constraints"]
-        assert constraints["resolution"] == "1080p"
-        assert constraints["uses_reference_images"] is True
-        assert constraints["allowed"] == [8]
-        assert constraints["excluded"] == {4: "reference", 6: "reference"}
-
-    async def test_duration_constraints_explicit_context_overrides_project(self, db_factory):
-        """显式上下文（表单里未保存的值）覆盖项目已保存档位；空串分辨率表示「自动」而非回退。"""
-        resolver = ConfigResolver(db_factory)
-        project = {
-            "video_backend": "gemini-aistudio/veo-3.1-generate-preview",
-            "model_settings": {"gemini-aistudio/veo-3.1-generate-preview": {"resolution": "1080p"}},
-        }
-        caps = await resolver.video_capabilities_for_model(
-            "gemini-aistudio", "veo-3.1-generate-preview", project, resolution="720p", uses_reference_images=False
-        )
-        assert caps["duration_constraints"]["allowed"] == [4, 6, 8]
-        caps = await resolver.video_capabilities_for_model(
-            "gemini-aistudio", "veo-3.1-generate-preview", project, resolution="", uses_reference_images=False
-        )
-        assert caps["duration_constraints"]["resolution"] is None
-        assert caps["duration_constraints"]["allowed"] == [4, 6, 8]
-        # 无项目（创建向导）：参考图路径同样补供应商兜底档位
-        caps = await resolver.video_capabilities_for_model(
-            "gemini-aistudio", "veo-3.1-generate-preview", None, uses_reference_images=True
-        )
-        assert caps["duration_constraints"]["resolution"] == "1080p"
-        assert caps["duration_constraints"]["allowed_without_reference_images"] == [8]
+    """验证 video_capabilities_for_project：第一步模型选择 + 第二步 model 能力查询。"""
 
     async def test_reads_project_default_duration_and_modes(self, db_factory):
-        resolver = ConfigResolver.__new__(ConfigResolver)
-        fake_svc = _FakeConfigService(settings={})
-        async with db_factory() as session:
-            with patch("lib.config.resolver.get_project_manager") as mock_pm:
-                mock_pm.return_value.load_project.return_value = {
-                    "video_backend": "grok/grok-imagine-video",
-                    "default_duration": 6,
-                    "content_mode": "narration",
-                    "generation_mode": "reference_video",
-                }
-                caps = await resolver._resolve_video_capabilities(fake_svc, session, "demo")
+        caps = await _video_caps(
+            db_factory,
+            {
+                "video_backend": "grok/grok-imagine-video",
+                "default_duration": 6,
+                "content_mode": "narration",
+                "generation_mode": "reference_video",
+            },
+        )
         assert caps["default_duration"] == 6
         assert caps["content_mode"] == "narration"
         assert caps["generation_mode"] == "reference_video"
 
     async def test_missing_default_duration_is_null(self, db_factory):
-        resolver = ConfigResolver.__new__(ConfigResolver)
-        fake_svc = _FakeConfigService(settings={})
-        async with db_factory() as session:
-            with patch("lib.config.resolver.get_project_manager") as mock_pm:
-                mock_pm.return_value.load_project.return_value = {
-                    "video_backend": "grok/grok-imagine-video",
-                }
-                caps = await resolver._resolve_video_capabilities(fake_svc, session, "demo")
+        caps = await _video_caps(db_factory, {"video_backend": "grok/grok-imagine-video"})
         assert caps["default_duration"] is None
-
-    async def test_unknown_model_raises(self, db_factory):
-        """悬空模型引用在任务类型桶解析闸即报错，携带可本地化的 code。"""
-        resolver = ConfigResolver.__new__(ConfigResolver)
-        fake_svc = _FakeConfigService(settings={})
-        async with db_factory() as session:
-            with patch("lib.config.resolver.get_project_manager") as mock_pm:
-                mock_pm.return_value.load_project.return_value = {
-                    "video_backend": "grok/nonexistent-model",
-                }
-                with pytest.raises(VideoBucketCapabilityError) as excinfo:
-                    await resolver._resolve_video_capabilities(fake_svc, session, "demo")
-        assert excinfo.value.code == "video_capability_reference_unavailable"
-        assert excinfo.value.generation_type == "i2v"
-
-    async def test_unknown_provider_raises(self, db_factory):
-        resolver = ConfigResolver.__new__(ConfigResolver)
-        fake_svc = _FakeConfigService(settings={})
-        async with db_factory() as session:
-            with patch("lib.config.resolver.get_project_manager") as mock_pm:
-                mock_pm.return_value.load_project.return_value = {
-                    "video_backend": "bogus-provider/some-model",
-                }
-                with pytest.raises(VideoBucketCapabilityError):
-                    await resolver._resolve_video_capabilities(fake_svc, session, "demo")
 
     async def test_video_capabilities_for_project_uses_passed_dict(self, db_factory):
         """video_capabilities_for_project(dict) 不调用 load_project；直接消费传入 dict。
@@ -675,141 +580,85 @@ class TestVideoCapabilities:
             caps = await resolver.video_capabilities_for_project({"video_backend": "kling/kling-v3"})
         assert caps["max_reference_images"] == 0
 
-    async def test_custom_provider_reads_db_supported_durations(self, db_factory):
-        """custom-<id>/<model> 走 DB 分支，返回 source='custom'。"""
+    @staticmethod
+    async def _seed_comfyui_video_model(db_factory, definition: dict, supported_durations: str) -> str:
+        """落一个 ComfyUI 视频模型行，返回 ``provider/model``。"""
+        from lib.db.models.custom_endpoint import CustomEndpoint
         from lib.db.models.custom_provider import CustomProvider, CustomProviderModel
 
-        resolver = ConfigResolver.__new__(ConfigResolver)
-        fake_svc = _FakeConfigService(settings={})
         async with db_factory() as session:
+            endpoint = CustomEndpoint(
+                definition=definition,
+                kind="comfyui",
+                schema_version="1.0.0",
+                media_type="video",
+                display_name="示例 ComfyUI 端点",
+            )
             provider = CustomProvider(
-                display_name="Custom X",
-                discovery_format="openai",
-                base_url="https://example.com",
-                api_key="xxx",
+                display_name="Comfy", discovery_format="comfyui", base_url="http://comfy.test:8188", api_key=""
             )
-            session.add(provider)
+            session.add_all([endpoint, provider])
             await session.flush()
-            model = CustomProviderModel(
-                provider_id=provider.id,
-                model_id="my-video-model",
-                display_name="My Video",
-                endpoint="newapi-video",
-                supported_durations="[5, 10]",
+            session.add(
+                CustomProviderModel(
+                    provider_id=provider.id,
+                    model_id="my-wan-workflow",
+                    display_name="My Workflow",
+                    endpoint=f"ce-{endpoint.id}",
+                    supported_durations=supported_durations,
+                )
             )
-            session.add(model)
-            await session.flush()
+            await session.commit()
+            return f"custom-{provider.id}/my-wan-workflow"
 
-            project_backend = f"custom-{provider.id}/my-video-model"
-            with patch("lib.config.resolver.get_project_manager") as mock_pm:
-                mock_pm.return_value.load_project.return_value = {
-                    "video_backend": project_backend,
-                }
-                caps = await resolver._resolve_video_capabilities(fake_svc, session, "demo")
-        assert caps["source"] == "custom"
-        assert caps["supported_durations"] == [5, 10]
-        assert caps["max_duration"] == 10
-        # newapi-video endpoint 不接受参考图，max=0（来源：EndpointSpec.video_max_reference_images）
-        assert caps["max_reference_images"] == 0
+    async def test_a_stale_tier_on_the_row_is_dropped_when_the_endpoint_lost_its_frames_binding(self, db_factory):
+        """端点说这一维给不出档位时，行上存着的那份一律作废：真相源是端点，不是行。
 
-    async def test_custom_video_openai_endpoint_resolves_max_one(self, db_factory):
-        """custom-<id>/<model> 经 openai-video endpoint 解析出 max_reference_images=1（不再静默落 9）。"""
-        from lib.db.models.custom_provider import CustomProvider, CustomProviderModel
+        两边分叉时沿用行上的 ``[5]``，能力接口与剧本规划就会宣称 5 秒，而端点目录已经把时长
+        控件禁掉——同一个问题两处答案不一样。
+        """
+        from tests.factories import comfyui_endpoint_definition
 
-        resolver = ConfigResolver.__new__(ConfigResolver)
-        fake_svc = _FakeConfigService(settings={})
-        async with db_factory() as session:
-            provider = CustomProvider(
-                display_name="Custom Sora",
-                discovery_format="openai",
-                base_url="https://example.com",
-                api_key="xxx",
-            )
-            session.add(provider)
-            await session.flush()
-            model = CustomProviderModel(
-                provider_id=provider.id,
-                model_id="sora-like",
-                display_name="Sora-like",
-                endpoint="openai-video",
-                supported_durations="[4, 8]",
-            )
-            session.add(model)
-            await session.flush()
+        definition = comfyui_endpoint_definition()
+        definition["bindings"]["start_image"] = [{"node": "11", "input": "image", "class_type": "LoadImage"}]
+        assert "frames" not in definition["bindings"]
+        # 行上存着的那份档位，与端点此刻的答案分叉。
+        backend = await self._seed_comfyui_video_model(db_factory, definition, "[5]")
 
-            project_backend = f"custom-{provider.id}/sora-like"
-            with patch("lib.config.resolver.get_project_manager") as mock_pm:
-                mock_pm.return_value.load_project.return_value = {
-                    "video_backend": project_backend,
-                }
-                caps = await resolver._resolve_video_capabilities(fake_svc, session, "demo")
-        assert caps["source"] == "custom"
-        assert caps["max_reference_images"] == 1
+        caps = await _video_caps(db_factory, {"video_backend": backend})
 
-    async def test_custom_disabled_model_errors_like_execution_layer(self, db_factory):
-        """project 仍指向已禁用的 model 时，能力解析与执行路径同样在任务类型桶解析闸报悬空引用。
+        assert caps["supported_durations"] == []
+        assert caps["max_duration"] == 0
+        assert caps["duration_endpoint_fixed"] is True
 
-        不静默换成该供应商的默认启用 model（``docs/adr/0054``）：宣称一个用户没选过的模型的能力，
-        与执行期直接报错的行为对不上。"""
-        from lib.db.models.custom_provider import CustomProvider, CustomProviderModel
+    async def test_an_empty_tier_on_the_row_gives_way_once_the_endpoint_can_drive_duration(self, db_factory):
+        """同一条规则的另一侧：行上是空集而端点给得出档位时，按端点的来。
 
-        resolver = ConfigResolver.__new__(ConfigResolver)
-        fake_svc = _FakeConfigService(settings={})
-        async with db_factory() as session:
-            provider = CustomProvider(
-                display_name="Custom Fallback",
-                discovery_format="openai",
-                base_url="https://example.com",
-                api_key="xxx",
-            )
-            session.add(provider)
-            await session.flush()
-            disabled = CustomProviderModel(
-                provider_id=provider.id,
-                model_id="disabled-model",
-                display_name="Disabled",
-                endpoint="ark-seedance",
-                is_enabled=False,
-                supported_durations="[5]",
-                capability_overrides={"last_frame": True},
-            )
-            default = CustomProviderModel(
-                provider_id=provider.id,
-                model_id="default-model",
-                display_name="Default",
-                endpoint="newapi-video",
-                is_enabled=True,
-                is_default=True,
-                supported_durations="[5, 10]",
-            )
-            session.add_all([disabled, default])
-            await session.flush()
+        沿用行上那份空集会让时长控件禁着、剧本规划借固定篇幅，而请求构造正在往图里写帧数。
+        """
+        from tests.factories import comfyui_endpoint_definition
 
-            project_backend = f"custom-{provider.id}/disabled-model"
-            with patch("lib.config.resolver.get_project_manager") as mock_pm:
-                mock_pm.return_value.load_project.return_value = {
-                    "video_backend": project_backend,
-                }
-                with pytest.raises(VideoBucketCapabilityError) as excinfo:
-                    await resolver._resolve_video_capabilities(fake_svc, session, "demo")
-        assert excinfo.value.code == "video_capability_reference_unavailable"
+        definition = comfyui_endpoint_definition()
+        definition["workflow"]["5"]["inputs"]["length"] = 81
+        definition["bindings"]["frames"] = [{"node": "5", "input": "length", "class_type": "EmptyLatentImage"}]
+        definition["bindings"]["start_image"] = [{"node": "11", "input": "image", "class_type": "LoadImage"}]
+        # 行上是空集，而端点此刻推得出一档原生时长。
+        backend = await self._seed_comfyui_video_model(db_factory, definition, "[]")
+
+        caps = await _video_caps(db_factory, {"video_backend": backend})
+
+        assert caps["supported_durations"] == [5]
+        assert caps["max_duration"] == 5
+        assert caps["duration_endpoint_fixed"] is False
 
 
 class TestVoiceConsistency:
     """voice_consistency 三维派生（模型能力 × generation_mode × 角色声音绑定方式）。全员经
-    `db_factory` 落真实 in-memory DB，按 CONTRIBUTING.md 的 pytest markers 纪律归 integration。"""
-
-    async def _caps(self, db_factory, project: dict) -> dict:
-        resolver = ConfigResolver.__new__(ConfigResolver)
-        fake_svc = _FakeConfigService(settings={})
-        async with db_factory() as session:
-            with patch("lib.config.resolver.get_project_manager") as mock_pm:
-                mock_pm.return_value.load_project.return_value = project
-                return await resolver._resolve_video_capabilities(fake_svc, session, "demo")
+    `db_factory` 落真实 in-memory DB，按 docs/standards/testing.md 的分档规则归 integration。"""
 
     async def test_seedance_2_reference_video_is_native(self, db_factory):
         """reference_audio_mode=direct、generation_mode=reference_video 且项目选了参考音频绑定 → native。"""
-        caps = await self._caps(
+        caps = await _video_caps(
             db_factory,
             {
                 "video_backend": "ark/doubao-seedance-2-0-260128",
@@ -821,7 +670,7 @@ class TestVoiceConsistency:
 
     async def test_prompt_binding_downgrades_native_to_soft(self, db_factory):
         """项目选提示词软约束时，原生音频参考通道的模型同样降格 soft：声音只靠 voice_style 约束。"""
-        caps = await self._caps(
+        caps = await _video_caps(
             db_factory,
             {
                 "video_backend": "ark/doubao-seedance-2-0-260128",
@@ -833,7 +682,7 @@ class TestVoiceConsistency:
 
     async def test_missing_binding_defaults_to_prompt_and_downgrades(self, db_factory):
         """字段缺省即默认档（提示词软约束）：新项目不写该字段时不得解出 native。"""
-        caps = await self._caps(
+        caps = await _video_caps(
             db_factory,
             {
                 "video_backend": "ark/doubao-seedance-2-0-260128",
@@ -844,7 +693,7 @@ class TestVoiceConsistency:
 
     async def test_unreadable_binding_falls_back_to_prompt(self, db_factory):
         """project.json 被手编成非法值时按默认档解读，不得升格成参考音频直传。"""
-        caps = await self._caps(
+        caps = await _video_caps(
             db_factory,
             {
                 "video_backend": "ark/doubao-seedance-2-0-260128",
@@ -857,7 +706,7 @@ class TestVoiceConsistency:
     async def test_requested_generate_audio_is_exposed_separately_from_pricing_value(self, db_factory):
         """caps 并列透出用户无声意图与计价口径：AI Studio Veo 恒按含音出账，但项目关掉音频时
         编排层必须读到 False（否则无声视频照旧上传参考音频）。"""
-        caps = await self._caps(
+        caps = await _video_caps(
             db_factory,
             {
                 "video_backend": "gemini-aistudio/veo-3.1-generate-preview",
@@ -869,12 +718,12 @@ class TestVoiceConsistency:
         assert caps["generate_audio"] is True
 
     async def test_requested_generate_audio_defaults_to_true(self, db_factory):
-        caps = await self._caps(db_factory, {"video_backend": "ark/doubao-seedance-2-0-260128"})
+        caps = await _video_caps(db_factory, {"video_backend": "ark/doubao-seedance-2-0-260128"})
         assert caps["requested_generate_audio"] is True
 
     async def test_seedance_2_non_reference_mode_downgrades_to_soft(self, db_factory):
         """同一模型非参考生视频路径：native 蕴含有音轨，降格恒落 soft，不落 none。"""
-        caps = await self._caps(
+        caps = await _video_caps(
             db_factory,
             {
                 "video_backend": "ark/doubao-seedance-2-0-260128",
@@ -885,12 +734,12 @@ class TestVoiceConsistency:
 
     async def test_seedance_2_missing_generation_mode_downgrades_to_soft(self, db_factory):
         """generation_mode 缺省（非 reference_video）同样降格 soft。"""
-        caps = await self._caps(db_factory, {"video_backend": "ark/doubao-seedance-2-0-260128"})
+        caps = await _video_caps(db_factory, {"video_backend": "ark/doubao-seedance-2-0-260128"})
         assert caps["voice_consistency"] == "soft"
 
     async def test_aistudio_veo_always_soft_regardless_of_generation_mode(self, db_factory):
         """AI Studio Veo 无参考音频通道，即便走参考生视频路径也只能 soft（恒有声不推 none）。"""
-        caps = await self._caps(
+        caps = await _video_caps(
             db_factory,
             {
                 "video_backend": "gemini-aistudio/veo-3.1-generate-preview",
@@ -900,39 +749,39 @@ class TestVoiceConsistency:
         assert caps["voice_consistency"] == "soft"
 
     async def test_grok_imagine_soft(self, db_factory):
-        """Grok Imagine：恒有声、无参考音频通道 → soft。"""
-        caps = await self._caps(db_factory, {"video_backend": "grok/grok-imagine-video"})
+        """Grok Imagine：音轨可开关、无参考音频通道 → soft。"""
+        caps = await _video_caps(db_factory, {"video_backend": "grok/grok-imagine-video"})
         assert caps["voice_consistency"] == "soft"
 
     async def test_sora_2_soft_after_token_correction(self, db_factory):
         """Sora 2 目录补 generate_audio 后派生 soft（不再因缺 token 误判 none）。"""
-        caps = await self._caps(db_factory, {"video_backend": "openai/sora-2"})
+        caps = await _video_caps(db_factory, {"video_backend": "openai/sora-2"})
         assert caps["voice_consistency"] == "soft"
 
     async def test_kling_v3_audio_models_are_soft(self, db_factory):
         """可灵 v3 系声明音频能力 → soft（注入 Voice_Profiles）。"""
         for model_id in ("kling-v3", "kling-v3-omni"):
-            caps = await self._caps(db_factory, {"video_backend": f"kling/{model_id}"})
+            caps = await _video_caps(db_factory, {"video_backend": f"kling/{model_id}"})
             assert caps["voice_consistency"] == "soft"
 
     async def test_kling_turbo_true_silent_is_none(self, db_factory):
         """可灵 v2-5-turbo 无音频开关 → none。"""
-        caps = await self._caps(db_factory, {"video_backend": "kling/kling-v2-5-turbo"})
+        caps = await _video_caps(db_factory, {"video_backend": "kling/kling-v2-5-turbo"})
         assert caps["voice_consistency"] == "none"
 
     async def test_minimax_true_silent_is_none(self, db_factory):
         """MiniMax 真无声模型 → none。"""
-        caps = await self._caps(db_factory, {"video_backend": "minimax/MiniMax-Hailuo-2.3"})
+        caps = await _video_caps(db_factory, {"video_backend": "minimax/MiniMax-Hailuo-2.3"})
         assert caps["voice_consistency"] == "none"
 
     async def test_agnes_true_silent_is_none(self, db_factory):
         """Agnes 真无声模型 → none。"""
-        caps = await self._caps(db_factory, {"video_backend": "agnes/agnes-video-v2.0"})
+        caps = await _video_caps(db_factory, {"video_backend": "agnes/agnes-video-v2.0"})
         assert caps["voice_consistency"] == "none"
 
     async def test_agnes_25_reference_audio_binding_is_native(self, db_factory):
         """2.5 / Flash 接上官方 audios 后，参考生视频 + 角色参考音频绑定 → native。"""
-        caps = await self._caps(
+        caps = await _video_caps(
             db_factory,
             {
                 "video_backend": "agnes/agnes-video-2.5-flash",
@@ -945,7 +794,7 @@ class TestVoiceConsistency:
 
     async def test_agnes_25_non_reference_mode_stays_none(self, db_factory):
         """成片音轨仍恒无声：非参考生视频路径没有 native 通道，档位保持 none。"""
-        caps = await self._caps(
+        caps = await _video_caps(
             db_factory,
             {
                 "video_backend": "agnes/agnes-video-2.5",
@@ -959,8 +808,6 @@ class TestVoiceConsistency:
         无信号时假定有声，不凭空判定为真无声模型。"""
         from lib.db.models.custom_provider import CustomProvider, CustomProviderModel
 
-        resolver = ConfigResolver.__new__(ConfigResolver)
-        fake_svc = _FakeConfigService(settings={})
         async with db_factory() as session:
             provider = CustomProvider(
                 display_name="Custom Voice",
@@ -978,15 +825,10 @@ class TestVoiceConsistency:
                 supported_durations="[4, 8]",
             )
             session.add(model)
-            await session.flush()
-
+            await session.commit()
             project_backend = f"custom-{provider.id}/sora-like"
-            with patch("lib.config.resolver.get_project_manager") as mock_pm:
-                mock_pm.return_value.load_project.return_value = {
-                    "video_backend": project_backend,
-                    "generation_mode": "reference_video",
-                }
-                caps = await resolver._resolve_video_capabilities(fake_svc, session, "demo")
+
+        caps = await _video_caps(db_factory, {"video_backend": project_backend, "generation_mode": "reference_video"})
         # openai-video endpoint 不带 reference_audio_capable，覆盖无法宣称 direct，故非 native；
         # 无音轨目录声明时假定有声 → soft，不落 none。
         assert caps["voice_consistency"] == "soft"
@@ -995,8 +837,6 @@ class TestVoiceConsistency:
         """自定义供应商覆盖 reference_audio_mode=direct + 上限 > 0，参考生视频路径 + 参考音频绑定 → native。"""
         from lib.db.models.custom_provider import CustomProvider, CustomProviderModel
 
-        resolver = ConfigResolver.__new__(ConfigResolver)
-        fake_svc = _FakeConfigService(settings={})
         async with db_factory() as session:
             provider = CustomProvider(
                 display_name="Custom Seedance",
@@ -1021,16 +861,17 @@ class TestVoiceConsistency:
                 },
             )
             session.add(model)
-            await session.flush()
-
+            await session.commit()
             project_backend = f"custom-{provider.id}/seedance-like"
-            with patch("lib.config.resolver.get_project_manager") as mock_pm:
-                mock_pm.return_value.load_project.return_value = {
-                    "video_backend": project_backend,
-                    "generation_mode": "reference_video",
-                    "character_voice_binding": "reference_audio",
-                }
-                caps = await resolver._resolve_video_capabilities(fake_svc, session, "demo")
+
+        caps = await _video_caps(
+            db_factory,
+            {
+                "video_backend": project_backend,
+                "generation_mode": "reference_video",
+                "character_voice_binding": "reference_audio",
+            },
+        )
         assert caps["voice_consistency"] == "native"
 
 
@@ -1351,7 +1192,7 @@ class TestResolveVideoBackendBuckets:
     """generation_type 给定时的视频四级解析（项目桶 > 项目默认 > 全局桶 > 全局默认 > 自动推断）与能力闸。
 
     能力闸样本取 backend 声明的真实能力位：vidu/viduq3-pro 仅 i2v、dashscope/happyhorse-1.0-r2v
-    仅 r2v、ark 全系两桶齐备（见 lib/generation_type_buckets.py 的判定口径）。
+    仅 r2v、ark 全系两桶齐备（见 lib/backends/generation_type_buckets.py 的判定口径）。
     """
 
     async def test_project_bucket_wins_over_project_default(self):
@@ -1624,7 +1465,7 @@ class TestTextBackendTierResolution:
     async def test_five_level_priority_all_combinations(self, p_tier, p_def, g_tier, g_def):
         from unittest.mock import MagicMock
 
-        from lib.text_backends.base import TextTaskType
+        from lib.backends.text_backends.base import TextTaskType
 
         settings = {}
         if g_tier:
@@ -1658,7 +1499,7 @@ class TestTextBackendTierResolution:
     async def test_no_project_name_skips_project_levels(self):
         from unittest.mock import MagicMock
 
-        from lib.text_backends.base import TextTaskType
+        from lib.backends.text_backends.base import TextTaskType
 
         resolver = ConfigResolver.__new__(ConfigResolver)
         fake_svc = _FakeConfigService(settings={"text_backend_complex": "g-tier/m", "default_text_backend": "g-def/m"})
@@ -1669,7 +1510,7 @@ class TestTextBackendTierResolution:
         """OVERVIEW / STYLE_ANALYSIS 归简单档，读 text_backend_simple 而非复杂档键。"""
         from unittest.mock import MagicMock
 
-        from lib.text_backends.base import TextTaskType
+        from lib.backends.text_backends.base import TextTaskType
 
         resolver = ConfigResolver.__new__(ConfigResolver)
         fake_svc = _FakeConfigService(settings={"text_backend_simple": "simple/m", "text_backend_complex": "complex/m"})
@@ -1680,7 +1521,7 @@ class TestTextBackendTierResolution:
     async def test_script_task_reads_complex_key(self):
         from unittest.mock import MagicMock
 
-        from lib.text_backends.base import TextTaskType
+        from lib.backends.text_backends.base import TextTaskType
 
         resolver = ConfigResolver.__new__(ConfigResolver)
         fake_svc = _FakeConfigService(settings={"text_backend_simple": "simple/m", "text_backend_complex": "complex/m"})
@@ -1691,7 +1532,7 @@ class TestTextBackendTierResolution:
         """无 "/" 的脏值视为未设置，落到下一级。"""
         from unittest.mock import MagicMock
 
-        from lib.text_backends.base import TextTaskType
+        from lib.backends.text_backends.base import TextTaskType
 
         resolver = ConfigResolver.__new__(ConfigResolver)
         fake_svc = _FakeConfigService(settings={"text_backend_complex": "no-slash", "default_text_backend": "g-def/m"})
@@ -1703,7 +1544,7 @@ class TestTextBackendTierResolution:
         不静默回退到全局默认的另一供应商。与图片 / 视频的项目层同构。"""
         from unittest.mock import MagicMock
 
-        from lib.text_backends.base import TextTaskType
+        from lib.backends.text_backends.base import TextTaskType
 
         resolver = ConfigResolver.__new__(ConfigResolver)
         fake_svc = _FakeConfigService(settings={"default_text_backend": "g-def/m"})
@@ -1719,18 +1560,31 @@ class TestStyleAnalysisVisionGuard:
     async def test_rejects_registry_model_without_vision(self):
         from unittest.mock import MagicMock
 
-        from lib.text_backends.base import TextTaskType
+        from lib.backends.text_backends.base import TextTaskType
 
         resolver = ConfigResolver.__new__(ConfigResolver)
-        # gemini-3.1-flash-lite-preview 在 registry 中未声明 vision
-        fake_svc = _FakeConfigService(settings={"text_backend_simple": "gemini-aistudio/gemini-3.1-flash-lite-preview"})
+        # qwen3-max 在 registry 中未声明 vision
+        fake_svc = _FakeConfigService(settings={"text_backend_simple": "dashscope/qwen3-max"})
         with pytest.raises(ValueError, match="vision"):
             await resolver._resolve_text_backend(fake_svc, MagicMock(), TextTaskType.STYLE_ANALYSIS, None)
+
+    @pytest.mark.parametrize("provider_id", ["gemini-aistudio", "gemini-vertex"])
+    async def test_accepts_multimodal_lite_model(self, provider_id):
+        from unittest.mock import MagicMock
+
+        from lib.backends.text_backends.base import TextTaskType
+        from lib.config.registry import PROVIDER_REGISTRY
+
+        assert "gemini-3.1-flash-lite" in PROVIDER_REGISTRY[provider_id].models
+        resolver = ConfigResolver.__new__(ConfigResolver)
+        fake_svc = _FakeConfigService(settings={"text_backend_simple": f"{provider_id}/gemini-3.1-flash-lite"})
+        result = await resolver._resolve_text_backend(fake_svc, MagicMock(), TextTaskType.STYLE_ANALYSIS, None)
+        assert result == (provider_id, "gemini-3.1-flash-lite")
 
     async def test_accepts_registry_model_with_vision(self):
         from unittest.mock import MagicMock
 
-        from lib.text_backends.base import TextTaskType
+        from lib.backends.text_backends.base import TextTaskType
 
         resolver = ConfigResolver.__new__(ConfigResolver)
         fake_svc = _FakeConfigService(settings={"text_backend_simple": "gemini-aistudio/gemini-3-flash-preview"})
@@ -1741,25 +1595,24 @@ class TestStyleAnalysisVisionGuard:
         """registry 之外（自定义供应商等）无逐模型能力事实，放行不猜测。"""
         from unittest.mock import MagicMock
 
-        from lib.text_backends.base import TextTaskType
+        from lib.backends.text_backends.base import TextTaskType
 
         resolver = ConfigResolver.__new__(ConfigResolver)
         fake_svc = _FakeConfigService(settings={"text_backend_simple": "custom-abc/some-model"})
         result = await resolver._resolve_text_backend(fake_svc, MagicMock(), TextTaskType.STYLE_ANALYSIS, None)
         assert result == ("custom-abc", "some-model")
 
-    async def test_complex_tier_task_not_vision_checked(self):
+    @pytest.mark.parametrize("provider_id", ["gemini-aistudio", "gemini-vertex"])
+    async def test_complex_tier_task_not_vision_checked(self, provider_id):
         """vision 校验只针对需要图像输入的任务，SCRIPT 不受限。"""
         from unittest.mock import MagicMock
 
-        from lib.text_backends.base import TextTaskType
+        from lib.backends.text_backends.base import TextTaskType
 
         resolver = ConfigResolver.__new__(ConfigResolver)
-        fake_svc = _FakeConfigService(
-            settings={"text_backend_complex": "gemini-aistudio/gemini-3.1-flash-lite-preview"}
-        )
+        fake_svc = _FakeConfigService(settings={"text_backend_complex": f"{provider_id}/gemini-3.1-flash-lite"})
         result = await resolver._resolve_text_backend(fake_svc, MagicMock(), TextTaskType.SCRIPT, None)
-        assert result == ("gemini-aistudio", "gemini-3.1-flash-lite-preview")
+        assert result == (provider_id, "gemini-3.1-flash-lite")
 
 
 class TestProjectGenerationModeCaps:
@@ -1802,45 +1655,13 @@ class TestProjectGenerationModeCaps:
             "voice_consistency"
         ] == "soft"
 
-    async def test_uses_reference_images_constraint_follows_project_route(self, db_factory):
-        """caps 的 generation_mode 是下游时长约束的入参，参考生视频据此施加「参考图↔时长」约束。"""
+    async def test_generation_mode_follows_project_route(self, db_factory):
+        """caps 的 generation_mode 与能力位跟随项目路线：参考生视频读 r2v 桶模型。"""
         caps = await _video_caps(
             db_factory, {"generation_mode": "reference_video", "video_provider_r2v": "minimax/S2V-01"}
         )
         assert caps["generation_mode"] == "reference_video"
         assert caps["max_reference_images"] == 1
-
-
-class TestResolveRawSupportedDurations:
-    """收窄前的时长全集：caps → registry 两级解析。"""
-
-    _VEO_PROJECT: ClassVar[dict[str, str]] = {"video_backend": "gemini-aistudio/veo-3.1-generate-preview"}
-
-    def test_caps_take_precedence_over_registry(self):
-        """caps 是 DB 驱动的当下真相，压过 project.json 自报身份查到的静态声明。"""
-        caps = {"supported_durations": [5, 10]}
-        assert resolve_raw_supported_durations(dict(self._VEO_PROJECT), caps) == [5, 10]
-
-    def test_falls_back_to_registry_identity_without_caps(self):
-        assert resolve_raw_supported_durations(dict(self._VEO_PROJECT)) == [4, 6, 8]
-
-    def test_custom_provider_resolves_only_through_caps(self):
-        """``custom-`` 前缀不在 registry：不带 caps 时无从解析，带 caps 时取 caps 的档位表。
-
-        这条是内容确认必须先解析 caps 的原因——同步两级链对自定义供应商恒为 None。
-        """
-        project = {"video_backend": "custom-7/acme-video"}
-        assert resolve_raw_supported_durations(project) is None
-        assert resolve_raw_supported_durations(project, {"supported_durations": [5, 10]}) == [5, 10]
-
-    def test_project_json_duration_field_is_not_a_source(self):
-        """project.json 不是档位来源：无生产写入者的字段不得再被当作一级回退读取，
-        否则伪造 / 陈旧的项目字段会盖过 registry 的真实声明。"""
-        project = dict(self._VEO_PROJECT) | {"_supported_durations": [99]}
-        assert resolve_raw_supported_durations(project) == [4, 6, 8]
-
-    def test_none_when_no_resolvable_model(self):
-        assert resolve_raw_supported_durations({}) is None
 
 
 class TestPayloadPinnedVideoModel:

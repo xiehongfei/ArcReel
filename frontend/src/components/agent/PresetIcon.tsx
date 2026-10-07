@@ -1,4 +1,4 @@
-import { type ComponentType, useEffect, useState } from "react";
+import { type ComponentType, type CSSProperties, useEffect, useState } from "react";
 
 interface IconProps {
   size?: number;
@@ -9,7 +9,7 @@ type IconLoader = () => Promise<{ default: ComponentType<IconProps> }>;
 /**
  * iconKey → @lobehub/icons 子组件路径。
  *
- * 与 lib/agent_provider_catalog.py 的 PresetProvider.icon_key 一一对应。
+ * 与 lib/agent/agent_provider_catalog.py 的 PresetProvider.icon_key 一一对应。
  * 优先使用 Color 变体；当上游包没有提供 Color 时回退 Mono。
  * 新增供应商时如缺失映射，组件会 fallback 到 monogram。
  */
@@ -88,7 +88,7 @@ export function PresetIcon({ iconKey, size = 20, className }: Props) {
         alt={iconKey ?? ""}
         width={size}
         height={size}
-        className={`rounded-[3px] object-cover ${className ?? ""}`}
+        className={`rounded-xs object-cover ${className ?? ""}`}
       />
     );
 
@@ -104,8 +104,8 @@ export function PresetIcon({ iconKey, size = 20, className }: Props) {
   return (
     <span
       data-testid="preset-icon-monogram"
-      className={`inline-flex items-center justify-center rounded-md bg-bg-grad-a text-[11px] font-bold text-text-3 ${className ?? ""}`}
-      style={{ width: size, height: size }}
+      className={`inline-flex size-(--icon-size) items-center justify-center rounded-md bg-card text-xs leading-none font-bold text-muted-foreground ${className ?? ""}`}
+      style={{ "--icon-size": `${size}px` } as CSSProperties}
     >
       {letter}
     </span>

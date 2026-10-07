@@ -10,8 +10,8 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from lib.project_migrations.runner import migrate_project_dir
-from lib.project_migrations.v7_to_v8_artifact_manifest import migrate_v7_to_v8
+from lib.project.project_migrations.runner import migrate_project_dir
+from lib.project.project_migrations.v7_to_v8_artifact_manifest import migrate_v7_to_v8
 from server.auth import CurrentUserInfo, get_current_user
 from server.error_handlers import register_error_handlers
 from tests.auth_deps import AUTH_DEPENDENCIES
@@ -64,11 +64,10 @@ def ad_client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> TestClient:
     migrate_v7_to_v8(project_dir)
     migrate_project_dir(project_dir)
 
-    from lib.project_manager import ProjectManager
+    from lib.project.project_manager import ProjectManager
     from server.routers import reference_videos as router_mod
 
-    monkeypatch.setattr(router_mod, "get_project_manager", lambda: ProjectManager(projects_root))
-    monkeypatch.setattr(router_mod, "tts_task_in_progress", AsyncMock(return_value=False))
+    monkeypatch.setattr(router_mod, "get_project_manager", lambda: ProjectManager(tmp_path))
     from tests.fakes import fake_reference_request_projector
 
     monkeypatch.setattr(
@@ -103,8 +102,8 @@ def test_list_and_legacy_derive_removal(ad_client: TestClient) -> None:
 
 
 def test_ad_units_support_crud_and_product_mentions(ad_client: TestClient) -> None:
-    from lib.project_manager import ProjectManager
-    from lib.reference_video.request_projection import unit_reference_declarations
+    from lib.project.project_manager import ProjectManager
+    from lib.script.reference_video.request_projection import unit_reference_declarations
 
     added = ad_client.post(
         "/api/v1/projects/ad-demo/reference-videos/episodes/1/units",
@@ -118,14 +117,14 @@ def test_ad_units_support_crud_and_product_mentions(ad_client: TestClient) -> No
         json={"prompt": "@[按摩仪] 正面朝向镜头"},
     )
     assert patched.status_code == 200, patched.text
-    project = ProjectManager(ad_client.project_dir.parent).load_project("ad-demo")
+    project = ProjectManager.for_project_dir(ad_client.project_dir).load_project("ad-demo")
     assert [(ref.type, ref.name) for ref in unit_reference_declarations(project, patched.json()["unit"])] == [
         ("product", "按摩仪")
     ]
 
     reordered = ad_client.post(
-        "/api/v1/projects/ad-demo/reference-videos/episodes/1/units/reorder",
-        json={"unit_ids": ["E1U2", "E1U1"]},
+        "/api/v1/projects/ad-demo/reference-videos/episodes/1/units/E1U2/move",
+        json={"after_unit_id": None},
     )
     assert reordered.status_code == 200
     assert [unit["unit_id"] for unit in _script(ad_client)["video_units"]] == ["E1U2", "E1U1"]
@@ -144,10 +143,7 @@ def test_generate_enqueues_self_contained_unit(ad_client: TestClient) -> None:
     assert kwargs["resource_id"] == "E1U1"
     assert kwargs["script_file"] == "scripts/episode_1.json"
     assert "prompt" not in kwargs["payload"]
-    assert kwargs["payload"]["reference_request_options"] == {
-        "narration_delivery": "post_production",
-        "confirmed_request_duration_seconds": 8,
-    }
+    assert kwargs["payload"]["reference_request_options"] == {"confirmed_request_duration_seconds": 8}
 
 
 def test_replan_shell_and_mixed_speech_are_blocked_before_enqueue(ad_client: TestClient) -> None:

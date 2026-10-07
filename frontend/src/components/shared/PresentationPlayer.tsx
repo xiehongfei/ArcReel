@@ -2,6 +2,8 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Download, Loader2 } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import { API } from "@/api";
+import { Button } from "@/components/ui/button";
+import { Toggle } from "@/components/ui/toggle";
 import { useAppStore } from "@/stores/app-store";
 import { useProjectsStore } from "@/stores/projects-store";
 import type {
@@ -11,6 +13,7 @@ import type {
 } from "@/types/presentation";
 import { errMsg } from "@/utils/async";
 import { downloadBlob } from "@/utils/download";
+import { itemIdWithinEpisode } from "@/utils/episode-display";
 
 interface PresentationPlayerProps {
   projectName: string;
@@ -20,8 +23,18 @@ interface PresentationPlayerProps {
   audioVersion?: number;
   posterPath?: string | null;
   initialVariant?: PresentationVariant;
+  /**
+   * 载入后从该时间（秒，单元视频自身的时间轴）开始播放；超出可播放范围时夹到范围内。
+   * 同一个 `requestId` 只生效一次，换一个 `requestId` 就再定位一次。浏览器拦截自动播放时停在该位置等用户点播放。
+   */
+  startAt?: { seconds: number; requestId: string };
+  /** `startAt` 生效后回调，参数为该请求的 `requestId`。 */
+  onStartApplied?: (requestId: string) => void;
   className?: string;
 }
+
+/** 起始位置离可播放范围末尾至少留出这么多，免得一播放就撞上边界停住。 */
+const START_END_MARGIN_SECONDS = 0.05;
 
 interface PresentationLoadState {
   resourceKey: string;
@@ -39,6 +52,8 @@ export function PresentationPlayer({
   audioVersion,
   posterPath,
   initialVariant = "post_production",
+  startAt,
+  onStartApplied,
   className = "",
 }: PresentationPlayerProps) {
   const { t } = useTranslation("dashboard");
@@ -212,6 +227,30 @@ export function PresentationPlayer({
     [presentation, synchronizeNarrationControls],
   );
 
+  const appliedStartRef = useRef<string | null>(null);
+  useEffect(() => {
+    const video = videoRef.current;
+    if (!startAt || !presentation || !video || appliedStartRef.current === startAt.requestId) return;
+    const first = presentation.video.start_microseconds / 1_000_000;
+    const end = first + presentation.video.duration_microseconds / 1_000_000;
+    const target = Math.min(Math.max(startAt.seconds, first), Math.max(first, end - START_END_MARGIN_SECONDS));
+    const apply = () => {
+      appliedStartRef.current = startAt.requestId;
+      video.currentTime = target;
+      // 播放器可能在可滚动栏里的折叠位置之下，先滚到可见处。
+      video.scrollIntoView?.({ block: "nearest", behavior: "smooth" });
+      void video.play().catch(() => undefined);
+      onStartApplied?.(startAt.requestId);
+    };
+    if (video.readyState >= HTMLMediaElement.HAVE_METADATA) {
+      apply();
+      return;
+    }
+    video.addEventListener("loadedmetadata", apply, { once: true });
+    return () => video.removeEventListener("loadedmetadata", apply);
+    // 视频元素在 presentation 就绪后才挂载，所以载入结果变化时要重跑。
+  }, [startAt, presentation, onStartApplied]);
+
   const stopAtPresentationBoundary = useCallback(
     (video: HTMLVideoElement) => {
       if (!presentation) return false;
@@ -317,7 +356,7 @@ export function PresentationPlayer({
       <div
         className={`flex h-full w-full flex-col items-center justify-center gap-2 bg-black/40 p-4 text-center ${className}`}
       >
-        <p role="alert" className="text-xs text-amber-200">
+        <p role="alert" className="text-xs text-warn">
           {error || t("presentation_unavailable")}
         </p>
         {loadState.supportsVariants && (
@@ -338,7 +377,7 @@ export function PresentationPlayer({
         ref={bindVideo}
         src={videoUrl}
         poster={posterUrl}
-        aria-label={t("presentation_video_aria", { id: presentation.unit_id })}
+        aria-label={t("presentation_video_aria", { id: itemIdWithinEpisode(presentation.unit_id) })}
         controls
         playsInline
         preload="metadata"
@@ -377,7 +416,7 @@ export function PresentationPlayer({
         <audio
           ref={bindNarration}
           src={narrationUrl}
-          aria-label={t("presentation_tts_track_aria", { id: presentation.unit_id })}
+          aria-label={t("presentation_tts_track_aria", { id: itemIdWithinEpisode(presentation.unit_id) })}
           preload="metadata"
           className="hidden"
         >
@@ -394,27 +433,25 @@ export function PresentationPlayer({
       )}
 
       <div className="absolute inset-x-2 top-2 flex flex-wrap items-center gap-1.5">
-        <span className="rounded bg-black/70 px-1.5 py-0.5 text-[9px] font-semibold text-white/85">
+        <span className="rounded-sm bg-black/70 px-1.5 py-0.5 text-xs font-medium text-white/85">
           {t(`presentation_selection_${presentation.selection}`)}
         </span>
         {presentation.provenance === "unavailable" && (
-          <span className="rounded bg-amber-950/85 px-1.5 py-0.5 text-[9px] font-semibold text-amber-200">
+          <span className="rounded-sm bg-black/70 px-1.5 py-0.5 text-xs font-medium text-warn">
             {t("presentation_provenance_unavailable")}
           </span>
         )}
         {presentation.currency && (
           <span
-            className={`rounded px-1.5 py-0.5 text-[9px] font-semibold ${
-              presentation.currency === "current"
-                ? "bg-emerald-950/80 text-emerald-200"
-                : "bg-amber-950/85 text-amber-200"
+            className={`rounded-sm bg-black/70 px-1.5 py-0.5 text-xs font-medium ${
+              presentation.currency === "current" ? "text-good" : "text-warn"
             }`}
           >
             {t(`presentation_currency_${presentation.currency}`)}
           </span>
         )}
         {presentation.timing === "mechanical" && (
-          <span className="rounded bg-black/70 px-1.5 py-0.5 text-[9px] text-white/70">
+          <span className="rounded-sm bg-black/70 px-1.5 py-0.5 text-xs text-white/70">
             {t("presentation_mechanical_timing")}
           </span>
         )}
@@ -427,20 +464,15 @@ export function PresentationPlayer({
             onChoose={chooseVariant}
           />
         )}
-        <button
-          type="button"
+        <Button
+          variant="secondary"
+          size="icon-xs"
           onClick={() => void downloadBundle()}
           disabled={downloading}
           aria-label={t("presentation_download")}
-          title={t("presentation_download")}
-          className="focus-ring grid h-6 w-6 place-items-center rounded-md bg-black/70 text-white/80 hover:text-white disabled:opacity-50"
         >
-          {downloading ? (
-            <Loader2 className="h-3 w-3 animate-spin" aria-hidden />
-          ) : (
-            <Download className="h-3 w-3" aria-hidden />
-          )}
-        </button>
+          {downloading ? <Loader2 className="animate-spin" aria-hidden /> : <Download aria-hidden />}
+        </Button>
       </div>
     </div>
   );
@@ -458,7 +490,7 @@ function VariantControls({
   onChoose: (variant: PresentationVariant) => void;
 }) {
   return (
-    <div className="flex rounded-md bg-black/70 p-0.5">
+    <div className="flex rounded-md bg-black/70 p-0.5 text-white">
       <VariantButton
         active={variant === "post_production"}
         label={postProductionLabel}
@@ -475,15 +507,8 @@ function VariantControls({
 
 function VariantButton({ active, label, onClick }: { active: boolean; label: string; onClick: () => void }) {
   return (
-    <button
-      type="button"
-      onClick={onClick}
-      aria-pressed={active}
-      className={`rounded px-1.5 py-0.5 text-[9px] font-medium ${
-        active ? "bg-white/20 text-white" : "text-white/55 hover:text-white"
-      }`}
-    >
+    <Toggle size="sm" pressed={active} onPressedChange={() => onClick()}>
       {label}
-    </button>
+    </Toggle>
   );
 }

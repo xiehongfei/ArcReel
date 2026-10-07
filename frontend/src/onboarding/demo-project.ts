@@ -47,8 +47,6 @@ export function isDemoProject(name: string | null | undefined): boolean {
 }
 
 const DEMO_STATUS: ProjectStatus = {
-  phase: "production",
-  phase_progress: 0.62,
   needs_repair: false,
   repair_reason: null,
   assets: {
@@ -57,12 +55,13 @@ const DEMO_STATUS: ProjectStatus = {
     prop: { total: 3, available: 2, stale: 0 },
   },
   episodes_summary: { total: 8, scripted: 1, in_production: 1, completed: 0 },
+  source_remaining: false,
 };
 
 /**
  * 8 集的状态分布，与 `DEMO_STATUS.episodes_summary` 的计数对齐。
  * 只有第 1 集在演示里带剧本，真实后端对没有剧本的分集只会算出 draft（见
- * `lib/workflow_state.py::_episode_production_status`）——第 2-8 集因此不能标成
+ * `lib/workflow/workflow_state.py::_episode_production_status`）——第 2-8 集因此不能标成
  * scripted/completed，否则点进去发现只有占位说明，统计与内容对不上。
  */
 const EPISODE_STATUSES: NonNullable<EpisodeMeta["status"]>[] = [
@@ -166,6 +165,8 @@ export function buildDemoProject(t: DemoT): ProjectSummary {
     style_image: null,
     thumbnail: null,
     status: DEMO_STATUS,
+    // 演示项目没有真实的修改记录，卡片上不写「几天前更新」。
+    last_activity_at: null,
   };
 }
 
@@ -228,7 +229,6 @@ export function buildDemoProjectData(t: DemoT): ProjectData {
   return {
     title: t("demo_project_title"),
     content_mode: "narration",
-    source_kind: "novel",
     style: t("demo_project_style"),
     aspect_ratio: "9:16",
     default_duration: 5,
@@ -279,7 +279,6 @@ export function buildDemoScripts(t: DemoT): Record<string, NarrationEpisodeScrip
         ambiance_audio: t(`demo_shot_${n}_audio`),
         dialogue: [],
       },
-      transition_to_next: skeleton.segmentBreak ? "fade" : "cut",
       generated_assets: {
         storyboard_image: skeleton.hasStoryboard
           ? demoPlaceholder(segmentId, "storyboard")

@@ -6,9 +6,10 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
+from lib.backends.providers import CallStatus
 from lib.db.models.api_call import ApiCall
 from lib.db.models.task import Task
-from lib.providers import CallStatus
+from lib.project.project_manager import ProjectManager
 from server.auth import CurrentUserInfo, get_current_user
 from server.error_handlers import register_error_handlers
 from server.routers import usage
@@ -192,6 +193,98 @@ class TestUsageRecordsList:
         ).decode()
 
         assert records_client.get(f"/api/v1/usage/records?cursor={cursor}").status_code == 422
+
+
+class TestUsageRecordEpisodeItemRefs:
+    """条目 ID 里的集 ID 不给创作者看：记录附上所属集的标题、播出位置与集内 ID。"""
+
+    @pytest.fixture
+    async def client(self, db_factory, monkeypatch, tmp_path):
+        projects = ProjectManager(tmp_path / "projects")
+        projects.create_project("demo")
+        projects.create_project_metadata("demo", "Demo")
+        projects.update_project(
+            "demo",
+            lambda project: project.update(
+                episodes=[
+                    {"episode": 7, "title": "山门", "script_file": "scripts/episode_7.json"},
+                    {"episode": 3, "title": "", "script_file": "scripts/episode_3.json"},
+                ]
+            ),
+        )
+        monkeypatch.setattr(usage, "get_project_manager", lambda: projects)
+        async with db_factory() as session:
+            session.add_all(
+                [
+                    make_call(started_at=BASE_TIME, segment_id="E7S02"),
+                    make_call(started_at=BASE_TIME + timedelta(minutes=1), segment_id="E3U01"),
+                    make_call(started_at=BASE_TIME + timedelta(minutes=2), segment_id="E9S01"),
+                    make_call(started_at=BASE_TIME + timedelta(minutes=3), segment_id="E7S01", project_name="gone"),
+                ]
+            )
+            await session.commit()
+        return build_client(db_factory, monkeypatch)
+
+    def test_records_carry_the_episode_title_and_broadcast_position(self, client):
+        items = client.get("/api/v1/usage/records").json()["items"]
+
+        assert {item["segment_id"]: item["segment_ref"] for item in items} == {
+            "E7S02": {"episode_title": "山门", "episode_position": 1, "item_id": "S02"},
+            "E3U01": {"episode_title": "", "episode_position": 2, "item_id": "U01"},
+            "E9S01": None,
+            "E7S01": None,
+        }
+
+    def test_detail_carries_the_same_ref(self, client):
+        record_id = client.get("/api/v1/usage/records?segment_id=E7S02").json()["items"][0]["id"]
+
+        detail = client.get(f"/api/v1/usage/records/{record_id}").json()
+
+        assert detail["segment_ref"] == {"episode_title": "山门", "episode_position": 1, "item_id": "S02"}
+
+
+class TestUsageRecordProjectTitles:
+    """项目列显示标题；项目读不到或没有标题时不给标题，由界面回退显示项目名。"""
+
+    @pytest.fixture
+    async def client(self, db_factory, monkeypatch, tmp_path):
+        projects = ProjectManager(tmp_path / "projects")
+        projects.create_project("demo")
+        projects.create_project_metadata("demo", "雨夜行舟")
+        projects.create_project("untitled")
+        projects.create_project_metadata("untitled", "")
+        monkeypatch.setattr(usage, "get_project_manager", lambda: projects)
+        async with db_factory() as session:
+            session.add_all(
+                [
+                    make_call(started_at=BASE_TIME, segment_id="a", project_name="demo"),
+                    make_call(started_at=BASE_TIME + timedelta(minutes=1), segment_id="b", project_name="untitled"),
+                    make_call(
+                        started_at=BASE_TIME + timedelta(minutes=2),
+                        segment_id="c",
+                        project_name="demo#deleted-20260301T120000Z",
+                    ),
+                    make_call(started_at=BASE_TIME + timedelta(minutes=3), segment_id="d", project_name=""),
+                ]
+            )
+            await session.commit()
+        return build_client(db_factory, monkeypatch)
+
+    def test_records_carry_the_title_only_when_the_project_has_one(self, client):
+        items = client.get("/api/v1/usage/records").json()["items"]
+
+        assert {item["segment_id"]: item["project_title"] for item in items} == {
+            "a": "雨夜行舟",
+            "b": None,
+            "c": None,
+            "d": None,
+        }
+
+    def test_detail_and_summary_use_the_same_titles(self, client):
+        record_id = client.get("/api/v1/usage/records?segment_id=a").json()["items"][0]["id"]
+
+        assert client.get(f"/api/v1/usage/records/{record_id}").json()["project_title"] == "雨夜行舟"
+        assert client.get("/api/v1/usage/summary").json()["filter_options"]["project_titles"] == {"demo": "雨夜行舟"}
 
 
 class TestUsageRecordDetail:

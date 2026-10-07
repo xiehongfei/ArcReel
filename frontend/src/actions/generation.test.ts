@@ -27,7 +27,9 @@ import {
   enqueueReferenceVideoBatch,
   enqueueReferenceVideoUnit,
   enqueueScene,
+  enqueueScriptPlan,
   enqueueStoryboard,
+  enqueueStoryboardBatch,
   enqueueVideo,
 } from "@/actions/generation";
 
@@ -133,18 +135,12 @@ describe("enqueueStoryboard", () => {
 });
 
 describe("单资源入队动作的乐观标记 kind / taskType", () => {
-  it("video 将请求级旁白交付与精确确认档位原样交给 API", async () => {
+  it("video 只把提示词、剧本与时长交给 API", async () => {
     const generate = vi.spyOn(API, "generateVideo").mockResolvedValue(SINGLE_OK);
 
-    await enqueueVideo("demo", "seg-1", "p", "episode_1.json", 8, {
-      narration_delivery: "use_tts",
-      confirmed_request_duration_seconds: 12,
-    });
+    await enqueueVideo("demo", "seg-1", "p", "episode_1.json", 8);
 
-    expect(generate).toHaveBeenCalledWith("demo", "seg-1", "p", "episode_1.json", 8, {
-      narration_delivery: "use_tts",
-      confirmed_request_duration_seconds: 12,
-    });
+    expect(generate).toHaveBeenCalledWith("demo", "seg-1", "p", "episode_1.json", 8);
   });
 
   it.each([
@@ -164,28 +160,28 @@ describe("单资源入队动作的乐观标记 kind / taskType", () => {
     },
     {
       label: "character",
-      run: () => enqueueCharacter("demo", "Hero", "p"),
+      run: () => enqueueCharacter("demo", "Hero"),
       method: "generateCharacter" as const,
       kind: "character" as const,
       resourceId: "Hero",
     },
     {
       label: "scene",
-      run: () => enqueueScene("demo", "Temple", "p"),
+      run: () => enqueueScene("demo", "Temple"),
       method: "generateProjectScene" as const,
       kind: "scene" as const,
       resourceId: "Temple",
     },
     {
       label: "prop",
-      run: () => enqueueProp("demo", "Sword", "p"),
+      run: () => enqueueProp("demo", "Sword"),
       method: "generateProjectProp" as const,
       kind: "prop" as const,
       resourceId: "Sword",
     },
     {
       label: "product",
-      run: () => enqueueProduct("demo", "Phone", "p"),
+      run: () => enqueueProduct("demo", "Phone"),
       method: "generateProjectProduct" as const,
       kind: "product" as const,
       resourceId: "Phone",
@@ -202,7 +198,7 @@ describe("单资源入队动作的乐观标记 kind / taskType", () => {
 
   it.each([
     { label: "video", run: () => enqueueVideo("demo", "seg-1", "p", "episode_1.json", 4), method: "generateVideo" as const },
-    { label: "character", run: () => enqueueCharacter("demo", "Hero", "p"), method: "generateCharacter" as const },
+    { label: "character", run: () => enqueueCharacter("demo", "Hero"), method: "generateCharacter" as const },
   ])("$label：请求失败时回滚，不留下占用", async ({ run, method }) => {
     vi.spyOn(API, method).mockRejectedValue(new Error("boom"));
 
@@ -306,6 +302,7 @@ describe("enqueueGrid", () => {
       grid_ids: ["g1"],
       task_ids: ["t1"],
       task_ids_by_grid: { g1: "t1" },
+      unsplit_grid_ids: [],
       deduped: false,
       message: "已入队 1 个多宫格分镜",
     });
@@ -326,6 +323,7 @@ describe("enqueueGrid", () => {
       grid_ids: ["g1", "g2"],
       task_ids: ["t1", "t2"],
       task_ids_by_grid: { g1: "t1", g2: "t2" },
+      unsplit_grid_ids: [],
       deduped: false,
       message: "已入队 2 个多宫格分镜",
     });
@@ -353,6 +351,7 @@ describe("enqueueGrid", () => {
       grid_ids: [],
       task_ids: [],
       task_ids_by_grid: {},
+      unsplit_grid_ids: [],
       deduped: false,
       message: "无匹配分组",
     });
@@ -396,6 +395,30 @@ describe("enqueueGridRegenerate", () => {
   });
 });
 
+describe("enqueueScriptPlan", () => {
+  it("成功时静默（即时动作成功不弹提示），仍打标并返回任务", async () => {
+    vi.spyOn(API, "planScript").mockResolvedValue({
+      batch: { batch_id: "b1", members: [{ unit_id: "episode-1", task_id: "t1" }] },
+    });
+
+    const res = await enqueueScriptPlan("demo", 1, { instructions: null });
+
+    expect(res).toEqual({ taskIds: ["t1"], deduped: false });
+    expect(useAppStore.getState().toast).toBeNull();
+    expect(occupied("demo", "text_script_plan", "episode-1")).toBe(true);
+  });
+
+  it("deduped=true 时仍弹统一去重提示", async () => {
+    vi.spyOn(API, "planScript").mockResolvedValue({
+      batch: { batch_id: "b1", members: [{ unit_id: "episode-1", task_id: "t1", deduped: true }] },
+    });
+
+    await enqueueScriptPlan("demo", 1, {});
+
+    expect(useAppStore.getState().toast?.text).toBe(i18n.t("dashboard:enqueue_deduped_toast"));
+  });
+});
+
 describe("enqueueReferenceVideoUnit", () => {
   it("成功时打标并弹入队 info 提示", async () => {
     const generate = vi
@@ -429,7 +452,6 @@ describe("enqueueReferenceVideoBatch", () => {
   const ADMISSION = {
     operation: "generate_reference_videos_batch",
     selection: "explicit",
-    narration_delivery: "post_production",
     units: [],
     confirmation: null,
     skipped_unit_ids: [],
@@ -448,12 +470,10 @@ describe("enqueueReferenceVideoBatch", () => {
       } as never);
 
     const res = await enqueueReferenceVideoBatch("demo", 1, {
-      narration_delivery: "post_production",
       unit_ids: ["E1U1", "E1U2"],
     });
 
     expect(batch).toHaveBeenCalledWith("demo", 1, {
-      narration_delivery: "post_production",
       unit_ids: ["E1U1", "E1U2"],
     });
     expect(occupied("demo", "reference_video", "E1U1")).toBe(true);
@@ -475,7 +495,6 @@ describe("enqueueReferenceVideoBatch", () => {
     } as never);
 
     await enqueueReferenceVideoBatch("demo", 1, {
-      narration_delivery: "post_production",
       unit_ids: ["E1U1", "E1U2"],
     });
 
@@ -511,7 +530,6 @@ describe("enqueueReferenceVideoBatch", () => {
     } as never);
 
     const res = await enqueueReferenceVideoBatch("demo", 1, {
-      narration_delivery: "post_production",
       unit_ids: ["E1U1", "E1U2"],
     });
 
@@ -554,8 +572,7 @@ describe("enqueueReferenceVideoBatch", () => {
 
     try {
       await enqueueReferenceVideoBatch("demo", 1, {
-        narration_delivery: "post_production",
-        unit_ids: ["E1U1", "E1U2"],
+          unit_ids: ["E1U1", "E1U2"],
       });
     } finally {
       useAppStore.setState({ pushToast: realPushToast });
@@ -583,8 +600,7 @@ describe("enqueueReferenceVideoBatch", () => {
       } as never);
 
       const res = await enqueueReferenceVideoBatch("demo", 1, {
-        narration_delivery: "post_production",
-        unit_ids: ["E1U1"],
+          unit_ids: ["E1U1"],
       });
 
       expect(res.decision).toBe(decision);
@@ -597,12 +613,48 @@ describe("enqueueReferenceVideoBatch", () => {
     vi.spyOn(API, "generateReferenceVideoBatch").mockRejectedValue(new Error("boom"));
 
     await expect(enqueueReferenceVideoBatch("demo", 1, {
-        narration_delivery: "post_production",
-        unit_ids: ["E1U1"],
+          unit_ids: ["E1U1"],
       })).rejects.toThrow(
       "boom",
     );
 
     expect(markCounts()).toEqual({ resource: 0, scriptFile: 0 });
+  });
+});
+
+describe("enqueueStoryboardBatch", () => {
+  it("按服务端返回的分镜逐项打占用标记，并弹提交与未排上的提示", async () => {
+    vi.spyOn(API, "submitStoryboardBatch").mockResolvedValue({
+      batch_id: "b1",
+      task_ids_by_unit: { E1S01: "t1", E1S02: "t2" },
+      skipped: [{ unit_id: "E1S04", reason: "missing_prompt" }],
+      enqueue_failures: [{ unit_id: "E1S03", problem: { code: "generation_enqueue_failed" } }],
+    });
+
+    await enqueueStoryboardBatch("demo", 1, "storyboards");
+
+    expect(occupied("demo", "storyboard", "E1S01")).toBe(true);
+    expect(occupied("demo", "storyboard", "E1S02")).toBe(true);
+    expect(occupied("demo", "storyboard", "E1S03")).toBe(false);
+    expect(useAppStore.getState().toast).toMatchObject({
+      text: i18n.t("dashboard:storyboard_batch_enqueue_failed", { count: 1 }),
+      tone: "warning",
+    });
+  });
+
+  it("分镜视频整批准入未通过时不打标、不提示", async () => {
+    vi.spyOn(API, "submitStoryboardBatch").mockResolvedValue({
+      batch_id: null,
+      task_ids_by_unit: {},
+      skipped: [],
+      enqueue_failures: [],
+      admission: { decision: "blocked", operation: "generate_videos", selection: "missing_only", units: [] },
+    });
+
+    const res = await enqueueStoryboardBatch("demo", 1, "videos");
+
+    expect(res.admission?.decision).toBe("blocked");
+    expect(markCounts().resource).toBe(0);
+    expect(useAppStore.getState().toast).toBeNull();
   });
 });

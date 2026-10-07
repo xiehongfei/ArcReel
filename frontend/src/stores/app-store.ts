@@ -1,5 +1,6 @@
 import { create } from "zustand";
 import type {
+  PlaybackStartRequest,
   WorkspaceFocusTarget,
   WorkspaceFocusTargetInput,
   WorkspaceNotification,
@@ -7,22 +8,25 @@ import type {
   WorkspaceNotificationTarget,
 } from "@/types";
 
-interface Toast {
+/** 提示上的操作按钮，用于可逆操作的「撤销」；点击后执行回调并关闭这条提示。 */
+interface ToastAction {
+  label: string;
+  onClick: () => void;
+}
+
+export interface Toast {
   id: string;
   text: string;
   tone: "info" | "success" | "error" | "warning";
+  action?: ToastAction;
 }
 
-interface FocusedContext {
-  type: "character" | "scene" | "prop" | "segment";
-  id: string;
-}
-
+const PLAYBACK_START_TTL_MS = 8000;
 const ALL_ENTITIES_REVISION_KEY = "__all__";
 
-export const ASSISTANT_PANEL_DEFAULT_WIDTH = 505;
-export const ASSISTANT_PANEL_MIN_WIDTH = 360;
-export const ASSISTANT_PANEL_MAX_WIDTH = 720;
+export const ASSISTANT_PANEL_DEFAULT_WIDTH = 420;
+export const ASSISTANT_PANEL_MIN_WIDTH = 320;
+export const ASSISTANT_PANEL_MAX_WIDTH = 640;
 const ASSISTANT_PANEL_WIDTH_STORAGE_KEY = "arcreel_assistant_panel_width";
 const ASSISTANT_PANEL_OPEN_STORAGE_KEY = "arcreel_assistant_panel_open";
 
@@ -66,29 +70,25 @@ function persistAssistantPanelOpen(open: boolean): void {
   }
 }
 
-const initialAssistantPanelOpen = readPersistedAssistantPanelOpen();
-
 interface AppState {
-  // Context focus (design doc "Context-Aware" feature)
-  focusedContext: FocusedContext | null;
-  setFocusedContext: (ctx: FocusedContext | null) => void;
-
   // Scroll targeting (Agent-triggered)
   scrollTarget: WorkspaceFocusTarget | null;
   triggerScrollTo: (target: WorkspaceFocusTargetInput) => void;
   clearScrollTarget: (requestId?: string) => void;
+  playbackStart: PlaybackStartRequest | null;
+  requestPlaybackStart: (input: Omit<PlaybackStartRequest, "request_id">) => void;
+  clearPlaybackStart: (requestId?: string) => void;
   assistantToolActivitySuppressed: boolean;
   setAssistantToolActivitySuppressed: (suppressed: boolean) => void;
 
-  // Toast
+  // Toast：最近一次发出的提示；ToastOverlay 订阅每次写入，同一批次连发的几条都会显示
   toast: Toast | null;
-  pushToast: (text: string, tone?: Toast["tone"]) => void;
+  pushToast: (text: string, tone?: Toast["tone"], options?: { action?: ToastAction }) => void;
   pushNotification: (
     text: string,
     tone?: Toast["tone"],
     options?: { target?: WorkspaceNotificationTarget | null },
   ) => void;
-  clearToast: () => void;
   workspaceNotifications: WorkspaceNotification[];
   pushWorkspaceNotification: (input: WorkspaceNotificationInput) => void;
   markWorkspaceNotificationRead: (id: string) => void;
@@ -96,22 +96,18 @@ interface AppState {
   removeWorkspaceNotification: (id: string) => void;
   clearWorkspaceNotifications: () => void;
 
-  // Panels
+  // Agent 面板：默认展开，用户手动开合（toggleAssistantPanel）后记住选择；
+  // 程序打开（setAssistantPanelOpen，如把指令预填进输入框）只影响本次，不覆盖用户的选择。
   assistantPanelOpen: boolean;
-  assistantPanelInitialized: boolean;
-  initializeAssistantPanel: (openByDefault: boolean) => void;
   toggleAssistantPanel: () => void;
   setAssistantPanelOpen: (open: boolean) => void;
+  /** 展开时的宽度；挤压画布时实际宽度还受画布最小宽度约束。 */
   assistantPanelWidth: number;
   setAssistantPanelWidth: (width: number) => void;
   persistAssistantPanelWidth: () => void;
   /** 顶栏用量悬浮层的开合；画布侧也从这里打开面板。 */
   usagePanelOpen: boolean;
   setUsagePanelOpen: (open: boolean) => void;
-
-  // Source files invalidation signal
-  sourceFilesVersion: number;
-  invalidateSourceFiles: () => void;
 
   // Grid list invalidation signal (incremented on grid_ready SSE events)
   gridsRevision: number;
@@ -132,8 +128,8 @@ interface AppState {
 /**
  * 通知系统分工规则：
  *
- * - pushToast(text, tone)
- *     用于：用户主动操作的即时反馈。
+ * - pushToast(text, tone, { action? })
+ *     用于：用户主动操作的即时反馈。可逆操作附「撤销」action；不可逆操作先用 AlertDialog 确认。
  *     典型：表单保存/校验、导入/删除/切换/上传成功、scroll target 未找到、
  *          后台任务提交成功回执（task_submitted）、入队请求同步失败
  *          （用户在场可立即重试，不进 drawer）、轻量错误提示。
@@ -172,9 +168,6 @@ function buildWorkspaceNotification(
 }
 
 export const useAppStore = create<AppState>((set, get) => ({
-  focusedContext: null,
-  setFocusedContext: (ctx) => set({ focusedContext: ctx }),
-
   scrollTarget: null,
   triggerScrollTo: (target) =>
     set({
@@ -195,14 +188,28 @@ export const useAppStore = create<AppState>((set, get) => ({
       }
       return s;
     }),
+  playbackStart: null,
+  requestPlaybackStart: (input) => {
+    const requestId = `${Date.now()}-${Math.random()}`;
+    set({ playbackStart: { ...input, request_id: requestId } });
+    // 单元没有可播放的视频时播放器不会出现，到期后作废，免得日后打开该单元时突然开播。
+    setTimeout(() => get().clearPlaybackStart(requestId), PLAYBACK_START_TTL_MS);
+  },
+  clearPlaybackStart: (requestId) =>
+    set((s) => {
+      if (!requestId || s.playbackStart?.request_id === requestId) {
+        return { playbackStart: null };
+      }
+      return s;
+    }),
   assistantToolActivitySuppressed: false,
   setAssistantToolActivitySuppressed: (suppressed) =>
     set({ assistantToolActivitySuppressed: suppressed }),
 
   toast: null,
-  pushToast: (text, tone = "info") =>
+  pushToast: (text, tone = "info", options) =>
     set({
-      toast: { id: `${Date.now()}-${Math.random()}`, text, tone },
+      toast: { id: `${Date.now()}-${Math.random()}`, text, tone, action: options?.action },
     }),
   pushNotification: (text, tone = "info", options) =>
     set((s) => ({
@@ -212,7 +219,6 @@ export const useAppStore = create<AppState>((set, get) => ({
         ...s.workspaceNotifications,
       ].slice(0, MAX_WORKSPACE_NOTIFICATIONS),
     })),
-  clearToast: () => set({ toast: null }),
   workspaceNotifications: [],
   pushWorkspaceNotification: (input) =>
     set((s) => ({
@@ -239,24 +245,14 @@ export const useAppStore = create<AppState>((set, get) => ({
     })),
   clearWorkspaceNotifications: () => set({ workspaceNotifications: [] }),
 
-  assistantPanelOpen: initialAssistantPanelOpen ?? false,
-  assistantPanelInitialized: initialAssistantPanelOpen !== null,
-  initializeAssistantPanel: (openByDefault) =>
-    set((s) => {
-      if (s.assistantPanelInitialized) return s;
-      return {
-        assistantPanelOpen: readPersistedAssistantPanelOpen() ?? openByDefault,
-        assistantPanelInitialized: true,
-      };
-    }),
+  assistantPanelOpen: readPersistedAssistantPanelOpen() ?? true,
   toggleAssistantPanel: () =>
     set((s) => {
       const open = !s.assistantPanelOpen;
       persistAssistantPanelOpen(open);
-      return { assistantPanelOpen: open, assistantPanelInitialized: true };
+      return { assistantPanelOpen: open };
     }),
-  setAssistantPanelOpen: (open) =>
-    set({ assistantPanelOpen: open, assistantPanelInitialized: true }),
+  setAssistantPanelOpen: (open) => set({ assistantPanelOpen: open }),
   assistantPanelWidth: readPersistedAssistantPanelWidth(),
   setAssistantPanelWidth: (width) =>
     set({ assistantPanelWidth: clampAssistantPanelWidth(width) }),
@@ -274,9 +270,6 @@ export const useAppStore = create<AppState>((set, get) => ({
   },
   usagePanelOpen: false,
   setUsagePanelOpen: (open) => set({ usagePanelOpen: open }),
-
-  sourceFilesVersion: 0,
-  invalidateSourceFiles: () => set((s) => ({ sourceFilesVersion: s.sourceFilesVersion + 1 })),
 
   gridsRevision: 0,
   invalidateGrids: () => set((s) => ({ gridsRevision: s.gridsRevision + 1 })),

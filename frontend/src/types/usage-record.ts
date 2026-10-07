@@ -1,3 +1,4 @@
+import type { EpisodeItemRef } from "./project";
 import type { CallType } from "./provider";
 
 /** 调用状态词汇，与后端 `CallStatus` 一致。 */
@@ -8,6 +9,8 @@ export interface UsageRecord {
   id: number;
   /** 端点试跑记录为空串。 */
   project_name: string;
+  /** 项目标题；项目已删除、读不到或未设标题时为 null，界面回退到项目名。 */
+  project_title?: string | null;
   purpose: string | null;
   task_id: string | null;
   task_type: string | null;
@@ -20,6 +23,8 @@ export interface UsageRecord {
   /** 供应商返回的失败原文，无错误码时按它渲染。 */
   error_message: string | null;
   segment_id: string | null;
+  /** segment_id 所属集的标题与播出位置；ID 不带集前缀或集已不在账本里时为 null。 */
+  segment_ref?: EpisodeItemRef | null;
   output_path: string | null;
   started_at: string;
   finished_at: string | null;
@@ -132,6 +137,7 @@ export interface UsageConsecutiveFailuresAttention {
   project_name: string;
   media_type: CallType;
   segment_id: string;
+  segment_ref?: EpisodeItemRef | null;
   count: number;
   first_failed_at: string;
   last_failed_at: string;
@@ -145,6 +151,8 @@ export type UsageAttention =
 /** 筛选候选值取全表 distinct，不随筛选变化。 */
 export interface UsageFilterOptions {
   projects: string[];
+  /** 候选项目里读得到标题的那部分：项目名 → 标题。 */
+  project_titles?: Record<string, string>;
   providers: { provider: string; label: string }[];
   models: { provider: string; model: string }[];
 }

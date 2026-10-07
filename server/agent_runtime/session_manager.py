@@ -14,12 +14,12 @@ from pathlib import Path
 from typing import Any, ClassVar, Optional
 from uuid import uuid4
 
-from lib.agent_memory_paths import project_memory_dir
+from lib.agent.agent_memory_paths import project_memory_dir
 from lib.db.base import DEFAULT_USER_ID
 from lib.i18n import DEFAULT_LOCALE
-from lib.logging_config import resolve_log_dir
-from lib.logging_utils import redact_diagnostic_text
-from lib.path_safety import PathTraversalError, safe_join
+from lib.infra.data_root_layout import DataRootLayout
+from lib.infra.logging_utils import redact_diagnostic_text
+from lib.infra.path_safety import PathTraversalError, safe_join
 from server.agent_runtime.agent_access_policy import AgentAccessPolicy
 from server.agent_runtime.entry_pipeline import SessionEntryPipeline
 from server.agent_runtime.event_log import (
@@ -64,12 +64,13 @@ from claude_agent_sdk import ClaudeSDKClient
 from claude_agent_sdk.types import (
     PermissionResultAllow,
     PermissionResultDeny,
+    SettingSource,
 )
 
+from lib.backends.providers import PROVIDER_ANTHROPIC, CallPurpose, CallStatus
+from lib.billing.ledger import Ledger
 from lib.config.service import ConfigService
 from lib.db import async_session_factory
-from lib.ledger import Ledger
-from lib.providers import PROVIDER_ANTHROPIC, CallPurpose, CallStatus
 
 SDK_AVAILABLE = True
 
@@ -219,6 +220,8 @@ class ManagedSession:
     # 据此显式回报失败（事件日志是时间线唯一读源，seq 0 缺失不可接受）。
     initial_user_entry_error: Exception | None = None
     last_user_prompt: str = ""
+    # 当前轮次的身份：发起该轮的用户消息在事件日志里的 uuid；工具写入据此记录所属 Agent 轮次。
+    current_turn: str | None = None
     assistant_model: str = ""
     interrupt_requested: bool = False
     last_activity: float | None = None  # updated on every send/receive
@@ -313,6 +316,16 @@ class ManagedSession:
         return [pending.payload for pending in self.pending_questions.values()]
 
 
+def _current_turn_of(managed_ref: list[ManagedSession | None]) -> Callable[[], str | None]:
+    """会话当前轮次的读取器：会话对象在 options 构建之后才建出，经引用延迟取值。"""
+    return lambda: managed_ref[0].current_turn if managed_ref[0] is not None else None
+
+
+def _entry_uuid(entry: dict[str, Any] | None) -> str | None:
+    uuid = entry.get("uuid") if entry is not None else None
+    return str(uuid) if uuid else None
+
+
 class SessionManager:
     """Manages all active ClaudeSDKClient instances."""
 
@@ -333,13 +346,13 @@ class SessionManager:
         "WebFetch",
         "AskUserQuestion",
     ]
-    DEFAULT_SETTING_SOURCES: ClassVar[list[str]] = ["project"]
+    DEFAULT_SETTING_SOURCES: ClassVar[list[SettingSource]] = ["project"]
 
     def __init__(
         self,
         project_root: Path,
         meta_store: SessionMetaStore,
-        projects_root: Path | None = None,
+        data_root: Path | None = None,
         in_docker: bool = False,
         sandbox_enabled: bool = True,
         event_log_store: EventLogStore | None = None,
@@ -350,15 +363,16 @@ class SessionManager:
         self._sdk_id_timeout = sdk_id_timeout
         self.project_root = Path(project_root)
         # Tests construct SessionManager directly without going through
-        # AssistantService, so we fall back to the legacy ``project_root/projects``
-        # convention. Production passes the configured app_data_dir() explicitly.
+        # AssistantService, so we fall back to the default data root
+        # ``project_root/projects``. Production passes the configured app_data_dir() explicitly.
         # 两路都 resolve，避免符号链接场景下 _resolve_project_cwd 的 relative_to
         # 校验失败（project_cwd 已经 resolve 过）。strict=False 容忍目录不存在。
-        self.projects_root = (
-            Path(projects_root).resolve(strict=False)
-            if projects_root is not None
+        self.data_root = (
+            Path(data_root).resolve(strict=False)
+            if data_root is not None
             else (self.project_root / "projects").resolve()
         )
+        self.layout = DataRootLayout(self.data_root)
         self.meta_store = meta_store
         self.sessions: dict[str, ManagedSession] = {}
         # 轮次终结时仍未被认领的回显登记累计数，见 _drain_pending_user_echoes。
@@ -371,21 +385,18 @@ class SessionManager:
         self._project_root_resolved = self.project_root.resolve()
         # agent_runtime_profile 实际位置：``ARCREEL_PROFILE_DIR`` env 覆盖 >
         # ``self.project_root / "agent_runtime_profile"``（test-friendly：
-        # 不读 ``lib.env_init.PROJECT_ROOT`` 全局）。
+        # 不读 ``lib.infra.env_init.PROJECT_ROOT`` 全局）。
         profile_override = os.getenv("ARCREEL_PROFILE_DIR", "").strip()
         if profile_override:
             self._agent_profile_root = Path(profile_override).expanduser().resolve(strict=False)
         else:
             self._agent_profile_root = (self._project_root_resolved / "agent_runtime_profile").resolve(strict=False)
-        # 访问规则真相源：env 解析（profile / 日志目录）在此完成，policy 只消费
-        # resolve 后的进程级根路径（零 I/O 纯构造）。用 resolve_log_dir() 拿日志
-        # 真实路径，覆盖 ``ARCREEL_LOG_DIR`` 自定义场景——无论落在 repo 内还是外
-        # 都必须 deny。
+        # 访问规则真相源：env 解析（profile 目录）在此完成，policy 只消费
+        # resolve 后的进程级根路径（零 I/O 纯构造）。
         self.access_policy = AgentAccessPolicy(
             project_root=self._project_root_resolved,
-            projects_root=self.projects_root,
+            data_root=self.data_root,
             agent_profile_root=self._agent_profile_root,
-            log_dir=resolve_log_dir().resolve(),
             sandbox_enabled=sandbox_enabled,
             in_docker=in_docker,
         )
@@ -398,7 +409,7 @@ class SessionManager:
         # 同源，避免 store 与用量落到不同 per-user 命名空间。_resolve_project_cwd
         # （项目名校验/作用域）留在会话管理侧，作为依赖注入。
         self._options_assembler = OptionsAssembler(
-            projects_root=self.projects_root,
+            data_root=self.data_root,
             allowed_tools=self.DEFAULT_ALLOWED_TOOLS,
             setting_sources=self.DEFAULT_SETTING_SOURCES,
             access_policy_provider=lambda: self.access_policy,
@@ -454,6 +465,7 @@ class SessionManager:
         locale: str = DEFAULT_LOCALE,
         stderr: Callable[[str], None] | None = None,
         session_id: str | None = None,
+        agent_turn: Callable[[], str | None] | None = None,
     ) -> Any:
         """委派给 ``OptionsAssembler.build``——SessionManager 不再直接构建 options 与
         hook，仅调用装配器；凭证注入、prompt 装配、hook 工厂均由装配器持有。"""
@@ -464,6 +476,7 @@ class SessionManager:
             locale=locale,
             stderr=stderr,
             session_id=session_id,
+            agent_turn=agent_turn,
         )
 
     def _build_session_store(self):
@@ -474,7 +487,7 @@ class SessionManager:
     def _resolve_project_cwd(self, project_name: str) -> Path:
         """Resolve and validate per-session project working directory."""
         try:
-            project_cwd = safe_join(self.projects_root, project_name)
+            project_cwd = safe_join(self.layout.projects_dir, project_name)
         except PathTraversalError as exc:
             raise ValueError("invalid project name") from exc
         if not project_cwd.exists() or not project_cwd.is_dir():
@@ -594,6 +607,7 @@ class SessionManager:
                 can_use_tool=await self._build_can_use_tool_callback(temp_id, managed_ref),
                 locale=locale,
                 stderr=startup_stderr,
+                agent_turn=_current_turn_of(managed_ref),
             )
         except Exception as exc:
             sdk_stderr = startup_stderr.render()
@@ -620,6 +634,7 @@ class SessionManager:
         )
         if user_entry is not None:
             managed.pending_initial_user_entry = {"entry": user_entry, "client_key": client_key}
+        managed.current_turn = _entry_uuid(user_entry)
         managed.entry_pipeline = self._build_entry_pipeline(managed)
         managed_ref[0] = managed
         managed.last_activity = time.monotonic()
@@ -881,11 +896,11 @@ class SessionManager:
     ) -> ManagedSession:
         """Get existing managed session or spin up an actor for resumed session.
 
-        ``locale`` only matters when this call revives a cold session: the SDK's
-        ``resume`` rebuilds the whole system prompt from current options, so the
-        language regulation segment must reflect the caller's request locale. An
-        already-resident session returns from cache and ``locale`` is ignored —
-        the session-fixed system prompt stays unchanged.
+        ``locale`` only shapes the system prompt of a session's first turn: the
+        system prompt is snapshotted into the session on its first request
+        (``SystemPromptPreset.snapshot``), so a resumed session keeps the language
+        regulation it started with and an already-resident session returns from
+        cache. Here it matters for ``resumable=False`` sessions, which start fresh.
 
         ``resumable=False`` 用于元数据行已建、transcript 却是空的会话（改写第一条
         消息分叉出的分支）：这类会话没有历史可 resume，改以 ``session_id=`` 预指定
@@ -927,6 +942,7 @@ class SessionManager:
                     locale=locale,
                     stderr=startup_stderr,
                     session_id=None if resumable else meta.id,
+                    agent_turn=_current_turn_of(managed_ref),
                 )
             except Exception as exc:
                 sdk_stderr = startup_stderr.render()
@@ -1002,9 +1018,8 @@ class SessionManager:
     ) -> dict[str, Any] | None:
         """Send a message via the session actor.
 
-        ``locale`` is forwarded to ``get_or_connect`` so a cold-recovered
-        session rebuilds its language regulation from the current request's
-        locale rather than the default.
+        ``locale`` is forwarded to ``get_or_connect``; it shapes the system
+        prompt only when the revival starts a fresh session (see there).
 
         ``user_entry`` 是本条用户消息的事件日志条目：先写日志分配身份（并发
         与容量校验之后、送入 SDK 之前），返回权威条目供受理响应回传；同一
@@ -1055,6 +1070,7 @@ class SessionManager:
             if len(managed.pending_user_echoes) > 20:
                 managed.pending_user_echoes.pop(0)
         managed.last_user_prompt = display_text
+        managed.current_turn = _entry_uuid(log_entry)
 
         await self.meta_store.update_status(session_id, "running")
 
@@ -1192,8 +1208,8 @@ class SessionManager:
         managed.cancel_pending_questions("session completed")
         explicit = str(result_msg.get("session_status") or "").strip()
         final_status: SessionStatus = (
-            explicit  # type: ignore[assignment]
-            if explicit in {"idle", "running", "completed", "error", "interrupted"}
+            explicit
+            if explicit in ("idle", "running", "completed", "error", "interrupted")
             else self._resolve_result_status(
                 result_msg,
                 interrupt_requested=managed.interrupt_requested,
@@ -1694,9 +1710,9 @@ class SessionManager:
     async def _subscribe(self, session_id: str, *, locale: str = DEFAULT_LOCALE) -> tuple[SseChannel, asyncio.Queue]:
         """Register a live-message queue for a session.
 
-        ``locale`` is forwarded to ``get_or_connect`` so reviving a cold session
-        through the stream path rebuilds its language regulation from the current
-        request's locale, matching the send-message path.
+        ``locale`` is forwarded to ``get_or_connect``, matching the send-message
+        path; it shapes the system prompt only when the revival starts a fresh
+        session.
 
         Private: the only consumer is :meth:`stream_messages`, which owns the
         deterministic unsubscribe via its context-manager ``__aexit__``.

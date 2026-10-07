@@ -1,6 +1,8 @@
 import dataclasses
 import json
+import os
 import shutil
+import sys
 from io import BytesIO
 from pathlib import Path
 from typing import ClassVar
@@ -10,19 +12,27 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from PIL import Image
 
-import lib.project_manager as project_manager_module
-from lib.artifact_activation import ArtifactCurrencyResolver
-from lib.artifact_manifest import MANIFEST_FILENAME, ArtifactKey, ArtifactStatus, ProjectArtifactManifestAdapter
+import lib.project.project_manager as project_manager_module
+from lib.artifacts.artifact_activation import ArtifactCurrencyResolver, register_current_resource_artifact
+from lib.artifacts.artifact_manifest import (
+    MANIFEST_FILENAME,
+    ArtifactKey,
+    ArtifactStatus,
+    ProjectArtifactManifestAdapter,
+)
+from lib.backends.providers import CallPurpose
 from lib.i18n.en import assets as en_assets
 from lib.i18n.vi import assets as vi_assets
 from lib.i18n.zh import assets as zh_assets
 from lib.i18n.zh import errors as zh_errors
-from lib.project_schema import CURRENT_PROJECT_SCHEMA_VERSION
-from lib.prompt_templates.builtin import builtin_templates
-from lib.providers import CallPurpose
+from lib.project.project_schema import CURRENT_PROJECT_SCHEMA_VERSION
+from lib.prompts.prompt_templates.builtin import builtin_templates
+from lib.script import script_review
+from lib.workflow.workflow_state import WorkflowStateService
 from server.auth import CurrentUserInfo, get_current_user
 from server.error_handlers import register_error_handlers
 from server.routers import files
+from server.services.currency import upload_finalize
 from tests.factories import wav_bytes
 
 
@@ -42,7 +52,7 @@ class _FakeTextBackend:
         return set()
 
     async def generate(self, request):
-        from lib.text_backends.base import TextGenerationResult
+        from lib.backends.text_backends.base import TextGenerationResult
 
         _FakeTextBackend.requests.append(request)
         return TextGenerationResult(text="cinematic, high contrast", provider="fake", model="fake-model")
@@ -60,7 +70,7 @@ def _img_bytes(fmt="JPEG", color=(255, 0, 0)):
 
 
 def _client(monkeypatch, tmp_path):
-    pm = project_manager_module.ProjectManager(tmp_path / "projects")
+    pm = project_manager_module.ProjectManager(tmp_path)
     pm.create_project("demo")
     pm.create_project_metadata("demo", "Demo", "Anime", "narration")
     pm.add_character("demo", "Alice", "desc")
@@ -68,7 +78,7 @@ def _client(monkeypatch, tmp_path):
     pm.add_product("demo", "保温杯", "不锈钢保温杯")
 
     monkeypatch.setattr(files, "get_project_manager", lambda: pm)
-    monkeypatch.setattr("lib.text_generator.create_text_backend_for_task", _fake_create_backend)
+    monkeypatch.setattr("lib.backends.text_generator.create_text_backend_for_task", _fake_create_backend)
 
     app = FastAPI()
     register_error_handlers(app)
@@ -96,8 +106,7 @@ class TestFilesRouter:
             assert any(item["name"] == "chapter.txt" for item in listed.json()["files"]["source"])
 
             served = client.get("/api/v1/files/demo/source/chapter.txt")
-            assert served.status_code == 200
-            assert served.text == "hello"
+            assert served.status_code == 404
 
             get_source = client.get("/api/v1/projects/demo/source/chapter.txt")
             assert get_source.status_code == 200
@@ -115,6 +124,344 @@ class TestFilesRouter:
 
             missing = client.get("/api/v1/projects/demo/source/missing.txt")
             assert missing.status_code == 404
+
+    def test_episode_role_upload_registers_an_own_source_episode_at_the_end(self, tmp_path, monkeypatch):
+        client, pm = _client(monkeypatch, tmp_path)
+        pm.update_project(
+            "demo",
+            lambda project: project.update(
+                episodes=[
+                    {"episode": 4, "title": "已有", "script_file": "scripts/episode_4.json", "source_origin": "none"}
+                ],
+                episode_id_high_water=4,
+            ),
+        )
+
+        with client:
+            upload = client.post(
+                "/api/v1/projects/demo/upload/source?role=episode",
+                files={"file": ("第五集.txt", "第五集的原文\r\n第二行".encode(), "text/plain")},
+            )
+
+        assert upload.status_code == 200
+        assert upload.json()["episode"] == 5
+        assert upload.json()["path"] == "source/episode_5.txt"
+        project = pm.load_project("demo")
+        assert [(e["episode"], e["source_origin"]) for e in project["episodes"]] == [(4, "none"), (5, "own")]
+        assert project["whole_source_files"] == []
+        episode_file = pm.get_project_path("demo") / "source" / "episode_5.txt"
+        assert episode_file.read_text(encoding="utf-8") == "第五集的原文\n第二行"
+        summary = WorkflowStateService(pm).get_project_summary("demo")
+        assert [episode.episode for episode in summary.episodes] == [4, 5]
+
+    def test_drama_upload_records_the_chosen_source_kind_on_each_source(self, tmp_path, monkeypatch):
+        """剧情演绎上传时逐个记源文件类型，缺省为小说；其他创作类型不记。"""
+        client, pm = _client(monkeypatch, tmp_path)
+        pm.update_project("demo", lambda project: project.update(content_mode="drama"))
+
+        with client:
+            for query, name in (("?source_kind=screenplay", "剧本.txt"), ("", "小说.txt")):
+                resp = client.post(
+                    f"/api/v1/projects/demo/upload/source{query}", files={"file": (name, "正文", "text/plain")}
+                )
+                assert resp.status_code == 200
+            resp = client.post(
+                "/api/v1/projects/demo/upload/source?role=episode&source_kind=screenplay",
+                files={"file": ("番外.txt", "番外原文", "text/plain")},
+            )
+            assert resp.status_code == 200
+
+        project = pm.load_project("demo")
+        assert project["whole_source_files"] == [
+            {"source_file": "source/剧本.txt", "source_kind": "screenplay"},
+            {"source_file": "source/小说.txt", "source_kind": "novel"},
+        ]
+        assert project["episodes"][-1]["source_kind"] == "screenplay"
+
+    def test_non_drama_upload_records_no_source_kind(self, tmp_path, monkeypatch):
+        client, pm = _client(monkeypatch, tmp_path)
+
+        with client:
+            whole = client.post(
+                "/api/v1/projects/demo/upload/source?source_kind=screenplay",
+                files={"file": ("剧本.txt", "正文", "text/plain")},
+            )
+            episode = client.post(
+                "/api/v1/projects/demo/upload/source?role=episode&source_kind=screenplay",
+                files={"file": ("番外.txt", "番外原文", "text/plain")},
+            )
+
+        assert (whole.status_code, episode.status_code) == (200, 200)
+        project = pm.load_project("demo")
+        assert project["whole_source_files"] == [{"source_file": "source/剧本.txt"}]
+        assert "source_kind" not in project["episodes"][-1]
+
+    def test_episode_role_upload_keeps_an_unregistered_file_with_the_new_id(self, tmp_path, monkeypatch):
+        client, pm = _client(monkeypatch, tmp_path)
+        pm.update_project("demo", lambda project: project.update(episode_id_high_water=4))
+        source_dir = pm.get_project_path("demo") / "source"
+        (source_dir / "episode_5.txt").write_text("没有登记的旧文件", encoding="utf-8")
+
+        with client:
+            upload = client.post(
+                "/api/v1/projects/demo/upload/source?role=episode",
+                files={"file": ("第五集.txt", "第五集的原文".encode(), "text/plain")},
+            )
+
+        assert upload.status_code == 200
+        assert upload.json()["episode"] == 5
+        assert (source_dir / "episode_5.txt").read_text(encoding="utf-8") == "第五集的原文"
+        assert (source_dir / "_episode_5.txt.bak").read_text(encoding="utf-8") == "没有登记的旧文件"
+
+    def test_source_writes_refuse_while_the_project_migration_is_blocked(self, tmp_path, monkeypatch):
+        import lib.project.project_migration_guard as guard
+        from lib.project.project_migration_failure import MIGRATION_FAILURE_CODE, record_migration_failure
+
+        client, pm = _client(monkeypatch, tmp_path)
+        monkeypatch.setattr(guard, "get_project_manager", lambda: pm)
+        source_dir = pm.get_project_path("demo") / "source"
+        (source_dir / "novel.txt").write_text("旧整本源文", encoding="utf-8")
+        record_migration_failure(
+            pm.get_project_path("demo"), RuntimeError("step failed"), schema_version=CURRENT_PROJECT_SCHEMA_VERSION
+        )
+        before = pm.load_project("demo")
+        refusal = zh_errors.MESSAGES[MIGRATION_FAILURE_CODE].split("{")[0]
+
+        with client:
+            responses = [
+                client.post("/api/v1/projects/demo/upload/source", files={"file": ("new.txt", "新文件", "text/plain")}),
+                client.post(
+                    "/api/v1/projects/demo/upload/source?role=episode",
+                    files={"file": ("ep.txt", "一集原文", "text/plain")},
+                ),
+                client.put(
+                    "/api/v1/projects/demo/source/new.txt", content="新文件", headers={"content-type": "text/plain"}
+                ),
+                client.delete("/api/v1/projects/demo/source/novel.txt"),
+            ]
+
+        for resp in responses:
+            assert resp.status_code == 409
+            assert resp.json()["detail"].startswith(refusal)
+        assert pm.load_project("demo") == before
+        assert sorted(path.name for path in source_dir.iterdir() if path.is_file()) == ["novel.txt"]
+
+    def test_put_source_refuses_episode_file_names(self, tmp_path, monkeypatch):
+        client, pm = _client(monkeypatch, tmp_path)
+        pm.update_project(
+            "demo",
+            lambda project: project.update(
+                episodes=[
+                    {"episode": 3, "title": "", "script_file": "scripts/episode_3.json", "source_origin": "none"}
+                ],
+                episode_id_high_water=3,
+            ),
+        )
+
+        with client:
+            resp = client.put(
+                "/api/v1/projects/demo/source/episode_3.txt", content="绕过集页", headers={"content-type": "text/plain"}
+            )
+
+        assert resp.status_code == 400
+        assert resp.json()["detail"] == zh_errors.MESSAGES["source_name_reserved"]
+        assert not (pm.get_project_path("demo") / "source" / "episode_3.txt").exists()
+        assert pm.load_project("demo")["episodes"][0]["source_origin"] == "none"
+
+    def test_delete_source_refuses_a_cut_episode_file(self, tmp_path, monkeypatch):
+        client, pm = _client(monkeypatch, tmp_path)
+        source_dir = pm.get_project_path("demo") / "source"
+        (source_dir / "novel.txt").write_text("甲乙丙丁", encoding="utf-8")
+        (source_dir / "episode_1.txt").write_text("甲乙", encoding="utf-8")
+        pm.update_project(
+            "demo",
+            lambda project: project.update(
+                whole_source_files=[{"source_file": "source/novel.txt"}],
+                episodes=[
+                    {
+                        "episode": 1,
+                        "title": "",
+                        "script_file": "scripts/episode_1.json",
+                        "source_origin": "whole_source",
+                        "source_range": {"source_file": "source/novel.txt", "start": 0, "end": 2},
+                    }
+                ],
+                episode_id_high_water=1,
+            ),
+        )
+        before = pm.load_project("demo")
+
+        with client:
+            resp = client.delete("/api/v1/projects/demo/source/episode_1.txt")
+
+        assert resp.status_code == 409
+        assert resp.json()["detail"] == zh_errors.MESSAGES["episode_source_derived"]
+        assert (source_dir / "episode_1.txt").read_text(encoding="utf-8") == "甲乙"
+        assert pm.load_project("demo") == before
+
+    def test_delete_source_keeps_the_file_when_the_ledger_cannot_be_written(self, tmp_path, monkeypatch):
+        client, pm = _client(monkeypatch, tmp_path)
+        source_dir = pm.get_project_path("demo") / "source"
+        (source_dir / "novel.txt").write_bytes("整本源文\r\n第二行".encode())
+        pm.update_project(
+            "demo", lambda project: project.update(whole_source_files=[{"source_file": "source/novel.txt"}])
+        )
+        project_file = pm.get_project_path("demo") / "project.json"
+        real_atomic_write = project_manager_module.atomic_write_json
+
+        def _fail_project_write(path, data):
+            if path == project_file:
+                raise OSError("injected project write failure")
+            return real_atomic_write(path, data)
+
+        monkeypatch.setattr(project_manager_module, "atomic_write_json", _fail_project_write)
+
+        with client:
+            resp = client.delete("/api/v1/projects/demo/source/novel.txt")
+
+        assert resp.status_code == 500
+        assert (source_dir / "novel.txt").read_bytes() == "整本源文\r\n第二行".encode()
+        assert pm.load_project("demo")["whole_source_files"] == [{"source_file": "source/novel.txt"}]
+
+    def test_episode_role_upload_rejects_blank_text(self, tmp_path, monkeypatch):
+        client, pm = _client(monkeypatch, tmp_path)
+
+        with client:
+            upload = client.post(
+                "/api/v1/projects/demo/upload/source?role=episode",
+                files={"file": ("空.txt", b"  \n ", "text/plain")},
+            )
+
+        assert upload.status_code == 422
+        assert upload.json()["detail"] == zh_errors.MESSAGES["episode_source_empty"]
+        assert pm.load_project("demo")["episodes"] == []
+
+    def test_whole_source_uploads_are_appended_to_the_file_list(self, tmp_path, monkeypatch):
+        client, pm = _client(monkeypatch, tmp_path)
+
+        with client:
+            for name in ("第2章.txt", "第1章.txt"):
+                upload = client.post(
+                    "/api/v1/projects/demo/upload/source", files={"file": (name, "正文", "text/plain")}
+                )
+                assert upload.status_code == 200
+            reserved = client.post(
+                "/api/v1/projects/demo/upload/source", files={"file": ("episode_3.txt", "正文", "text/plain")}
+            )
+            assert client.delete("/api/v1/projects/demo/source/第2章.txt").status_code == 200
+
+        assert reserved.status_code == 400
+        assert reserved.json()["detail"] == zh_errors.MESSAGES["source_name_reserved"]
+        assert not (pm.get_project_path("demo") / "source" / "episode_3.txt").exists()
+        assert pm.load_project("demo")["whole_source_files"] == [{"source_file": "source/第1章.txt"}]
+
+    def test_whole_source_upload_can_be_inserted_at_a_position(self, tmp_path, monkeypatch):
+        client, pm = _client(monkeypatch, tmp_path)
+
+        with client:
+            for name, insert_at in (("卷二.txt", None), ("卷一.txt", 0), ("卷三.txt", 5), ("序.txt", 0)):
+                query = "" if insert_at is None else f"?insert_at={insert_at}"
+                upload = client.post(
+                    f"/api/v1/projects/demo/upload/source{query}", files={"file": (name, "正文", "text/plain")}
+                )
+                assert upload.status_code == 200
+            negative = client.post(
+                "/api/v1/projects/demo/upload/source?insert_at=-1", files={"file": ("附录.txt", "正文", "text/plain")}
+            )
+
+        assert negative.status_code == 422
+        assert [item["source_file"] for item in pm.load_project("demo")["whole_source_files"]] == [
+            "source/序.txt",
+            "source/卷一.txt",
+            "source/卷二.txt",
+            "source/卷三.txt",
+        ]
+
+    def test_registered_whole_source_writes_go_through_the_remap(self, tmp_path, monkeypatch):
+        client, pm = _client(monkeypatch, tmp_path)
+        source_dir = pm.get_project_path("demo") / "source"
+        (source_dir / "a.txt").write_text("甲乙丙丁", encoding="utf-8")
+        (source_dir / "b.txt").write_text("戊己庚辛", encoding="utf-8")
+        (source_dir / "episode_1.txt").write_text("丙丁戊己", encoding="utf-8")
+        crossing = {
+            "episode": 1,
+            "title": "",
+            "script_file": "scripts/episode_1.json",
+            "source_origin": "whole_source",
+            "source_range": {"source_file": "source/a.txt", "start": 2, "end_file": "source/b.txt", "end": 2},
+            "ledger_status": "planned",
+        }
+        pm.update_project(
+            "demo",
+            lambda project: project.update(
+                whole_source_files=[{"source_file": "source/a.txt"}, {"source_file": "source/b.txt"}],
+                episodes=[crossing],
+                episode_id_high_water=1,
+            ),
+        )
+
+        with client:
+            inserted = client.post(
+                "/api/v1/projects/demo/upload/source?insert_at=1", files={"file": ("插.txt", "插叙", "text/plain")}
+            )
+            written_before_confirm = (source_dir / "插.txt").exists()
+            confirmed = client.post(
+                f"/api/v1/projects/demo/upload/source?insert_at=1&revision={inserted.json()['revision']}",
+                files={"file": ("插.txt", "插叙", "text/plain")},
+            )
+            put = client.put(
+                "/api/v1/projects/demo/source/b.txt", content="戊己庚辛壬", headers={"content-type": "text/plain"}
+            )
+            deleted = client.delete("/api/v1/projects/demo/source/a.txt")
+
+        assert (inserted.json()["status"], inserted.json()["success"]) == ("confirmation_required", False)
+        assert inserted.json()["impact"]["changed_without_products"] == [1]
+        assert written_before_confirm is False
+        assert (confirmed.json()["status"], confirmed.json()["filename"]) == ("applied", "插.txt")
+        assert (source_dir / "episode_1.txt").read_text(encoding="utf-8") == "丙丁插叙戊己"
+        assert put.json()["status"] == "applied"
+        assert (deleted.status_code, deleted.json()["status"]) == (200, "confirmation_required")
+        assert (source_dir / "a.txt").exists()
+
+    def test_deleting_a_whole_source_file_is_refused_while_a_removed_episode_has_active_tasks(
+        self,
+        tmp_path,
+        monkeypatch,
+        active_episode_tasks,
+    ):
+        client, pm = _client(monkeypatch, tmp_path)
+        source_dir = pm.get_project_path("demo") / "source"
+        (source_dir / "a.txt").write_text("甲乙丙丁", encoding="utf-8")
+        pm.update_project(
+            "demo",
+            lambda project: project.update(
+                whole_source_files=[{"source_file": "source/a.txt"}],
+                episodes=[
+                    {
+                        "episode": 1,
+                        "title": "",
+                        "script_file": "scripts/episode_1.json",
+                        "source_origin": "whole_source",
+                        "source_range": {"source_file": "source/a.txt", "start": 0, "end": 4},
+                        "ledger_status": "planned",
+                    }
+                ],
+                episode_id_high_water=1,
+            ),
+        )
+
+        active_episode_tasks["queued"] = [
+            {"resource_id": "script_plan", "script_file": None, "payload": {"episode": 1}}
+        ]
+
+        with client:
+            preview = client.delete("/api/v1/projects/demo/source/a.txt")
+            refused = client.delete(f"/api/v1/projects/demo/source/a.txt?revision={preview.json()['revision']}")
+
+        assert preview.json()["impact"]["removed"] == [1]
+        assert refused.status_code == 409
+        assert (source_dir / "a.txt").exists()
+        assert [entry["episode"] for entry in pm.load_project("demo")["episodes"]] == [1]
 
     def test_source_upload_race_project_deleted_reports_project_not_found(self, tmp_path, monkeypatch):
         client, _ = _client(monkeypatch, tmp_path)
@@ -241,19 +588,31 @@ class TestFilesRouter:
             project_dir = pm.get_project_path("demo")
             target = project_dir / first.json()["path"]
             manifest = project_dir / ".arcreel_artifacts.json"
-            before = (target.read_bytes(), (project_dir / "project.json").read_bytes(), manifest.read_bytes())
+            versions_file = project_dir / "versions" / "versions.json"
+
+            def _durable_state():
+                snapshots = sorted(path.name for path in (project_dir / "versions" / "characters").iterdir())
+                return (
+                    target.read_bytes(),
+                    (project_dir / "project.json").read_bytes(),
+                    manifest.read_bytes(),
+                    versions_file.read_bytes(),
+                    snapshots,
+                )
+
+            before = _durable_state()
 
             def _fail(*_args, **_kwargs):
                 raise RuntimeError("injected manifest failure")
 
-            monkeypatch.setattr(files, "register_current_resource_artifact", _fail)
+            monkeypatch.setattr(upload_finalize, "register_current_resource_artifact", _fail)
             failed = client.post(
                 "/api/v1/projects/demo/upload/character?name=Alice",
                 files={"file": ("replacement.png", _img_bytes("PNG", (0, 0, 255)), "image/png")},
             )
 
             assert failed.status_code == 500
-            assert (target.read_bytes(), (project_dir / "project.json").read_bytes(), manifest.read_bytes()) == before
+            assert _durable_state() == before
 
     def test_formal_sheet_upload_rechecks_a_definition_created_before_install(self, tmp_path, monkeypatch):
         client, pm = _client(monkeypatch, tmp_path)
@@ -276,7 +635,7 @@ class TestFilesRouter:
                 name,
                 relative_path,
                 generated,
-                on_commit=lambda _target: files.register_current_resource_artifact(
+                on_commit=lambda _target: register_current_resource_artifact(
                     project_dir,
                     resource_type="characters",
                     resource_id=name,
@@ -310,6 +669,51 @@ class TestFilesRouter:
             ArtifactCurrencyResolver(project_dir).compare(key, artifact_path=entry.artifact_path).status
             is ArtifactStatus.CURRENT
         )
+
+    def test_bgm_upload_registers_the_track_and_lists_it_for_playback(self, tmp_path, monkeypatch):
+        client, pm = _client(monkeypatch, tmp_path)
+        with client:
+            upload = client.post(
+                "/api/v1/projects/demo/upload/bgm",
+                files={"file": ("雨夜.wav", wav_bytes(1.0, tone_hz=330), "audio/wav")},
+            )
+            assert upload.status_code == 200
+            bgm = upload.json()["bgm"]
+            assert (bgm["name"], bgm["duration"]) == ("雨夜", 1.0)
+            assert bgm["path"] == f"bgm/{bgm['id']}.wav"
+            assert 0 < bgm["gain"] < 1
+
+            listed = client.get("/api/v1/projects/demo/bgm")
+            assert listed.status_code == 200
+            assert listed.json() == {"bgm": [bgm]}
+
+            played = client.get(bgm["url"])
+            assert played.status_code == 200
+            assert played.content == wav_bytes(1.0, tone_hz=330)
+        assert set(pm.load_project("demo")["bgm"]) == {bgm["id"]}
+
+    @pytest.mark.parametrize(
+        ("filename", "content", "message_key", "params"),
+        [
+            ("silence.wav", wav_bytes(1.0), "bgm_silent", {}),
+            ("broken.mp3", b"not audio", "invalid_audio_file", {}),
+            ("cover.jpg", b"jpeg", "unsupported_audio_type", {"ext": ".jpg", "allowed": ".mp3, .wav, .m4a"}),
+        ],
+    )
+    def test_bgm_upload_refuses_unusable_audio_with_a_localized_reason(
+        self, tmp_path, monkeypatch, filename, content, message_key, params
+    ):
+        client, pm = _client(monkeypatch, tmp_path)
+        with client:
+            resp = client.post("/api/v1/projects/demo/upload/bgm", files={"file": (filename, content, "audio/wav")})
+            assert resp.status_code == 400
+            assert resp.json()["detail"] == zh_errors.MESSAGES[message_key].format(**params)
+        assert "bgm" not in pm.load_project("demo")
+
+    def test_bgm_list_of_unknown_project_is_404(self, tmp_path, monkeypatch):
+        client, _ = _client(monkeypatch, tmp_path)
+        with client:
+            assert client.get("/api/v1/projects/absent/bgm").status_code == 404
 
     def test_character_audio_ref_upload_success(self, tmp_path, monkeypatch):
         client, pm = _client(monkeypatch, tmp_path)
@@ -357,13 +761,6 @@ class TestFilesRouter:
             assert resp.json()["detail"] == zh_errors.MESSAGES["upload_too_large"].format(max_mb=15)
 
     def test_character_audio_ref_rejects_duration_out_of_range(self, tmp_path, monkeypatch):
-        import shutil as _shutil
-
-        if _shutil.which("ffprobe") is None:
-            import pytest
-
-            pytest.skip("ffprobe not available")
-
         client, pm = _client(monkeypatch, tmp_path)
         with client:
             resp = client.post(
@@ -722,7 +1119,7 @@ class TestFilesRouter:
             assert any(item["name"] == "保温杯.jpg" for item in listed.json()["files"]["products"])
 
     def test_style_image_endpoints(self, tmp_path, monkeypatch):
-        from lib.text_generator import TextGenerator
+        from lib.backends.text_generator import TextGenerator
 
         client, pm = _client(monkeypatch, tmp_path)
         captured: dict[str, object] = {}
@@ -842,6 +1239,7 @@ class TestFilesRouter:
         ]
         payloads = {
             "character_audio_ref": ("v.wav", wav_bytes(3), "audio/wav"),
+            "bgm": ("m.wav", wav_bytes(3), "audio/wav"),
             # source 不使用 name，但校验在其早返分支之前，同样应拒
             "source": ("novel.txt", b"chapter one", "text/plain"),
         }
@@ -1057,6 +1455,36 @@ class TestFilesRouter:
             unknown_draft = client.delete("/api/v1/projects/demo/drafts/9/script_plan")
             assert unknown_draft.status_code == 404
 
+    def test_plain_script_plan_save_is_rejected_once_confirmed(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+        client, pm = _client(monkeypatch, tmp_path)
+        project_dir = pm.get_project_path("demo")
+        plan_path = project_dir / "drafts" / "episode_1" / "script_plan_segments.json"
+        plan_path.parent.mkdir(parents=True)
+        plan_path.write_text('{"episode": 1, "segments": []}', encoding="utf-8")
+        # 该集已产出正式剧本，确认记录记的是当前规划。
+        (project_dir / "scripts").mkdir(exist_ok=True)
+        (project_dir / "scripts" / "episode_1.json").write_text('{"episode": 1, "segments": []}', encoding="utf-8")
+        fingerprint = script_review.content_fingerprint(plan_path)
+        assert fingerprint is not None
+
+        def _confirm(project: dict) -> None:
+            project["episodes"] = [{"episode": 1, "script_file": "scripts/episode_1.json"}]
+            script_review.apply_confirmation(project, 1, fingerprint, "2026-01-01T00:00:00+00:00")
+
+        pm.update_project("demo", _confirm)
+        before = plan_path.read_bytes()
+
+        with client:
+            refused = client.put(
+                "/api/v1/projects/demo/drafts/1/script_plan",
+                content='{"episode": 1, "segments": [{"segment_id": "E1S01"}]}',
+                headers={"content-type": "text/plain"},
+            )
+
+        assert refused.status_code == 409, refused.text
+        assert refused.json()["diagnostic"] == {"code": "script_plan_confirmed"}
+        assert plan_path.read_bytes() == before
+
     def test_plain_script_plan_save_registers_active_manifest_and_rolls_back_on_registration_failure(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -1124,11 +1552,12 @@ class TestFilesRouter:
 
         with monkeypatch.context() as registration_patch:
             registration_patch.setattr(
-                "lib.artifact_activation.register_current_artifact_if_provable",
+                "lib.artifacts.artifact_activation.register_current_artifact_if_provable",
                 _fail_registration,
             )
             with pytest.raises(RuntimeError, match="manifest unavailable"):
                 files._write_plain_draft(
+                    "demo",
                     project_dir,
                     1,
                     draft_path,
@@ -1169,6 +1598,7 @@ class TestFilesRouter:
             resp = client.get("/api/v1/files/demo/versions/storyboards/E1S01_v1.png")
             assert resp.status_code == 200
             assert "immutable" in resp.headers.get("cache-control", "")
+            assert resp.headers["x-content-type-options"] == "nosniff"
 
     def test_no_cache_control_without_version(self, tmp_path, monkeypatch):
         """无 ?v= 参数且非 versions 路径时不应有 immutable 头"""
@@ -1210,8 +1640,11 @@ class TestFilesRouter:
         project_json = project_dir / "project.json"
         payload = json.loads(project_json.read_text(encoding="utf-8"))
         payload["generation_mode"] = "reference_video"
+        # 分集须在账本里（save_content 的写入前置）：登记为自带原文的集
+        payload["episodes"] = [
+            {"episode": 1, "title": "", "script_file": "scripts/episode_1.json", "source_origin": "own"}
+        ]
         project_json.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-        # 分集须可登记（save_content 的写入前置）：派生源文在场即可经孤儿分集自愈补建条目
         (project_dir / "source").mkdir(parents=True, exist_ok=True)
         (project_dir / "source" / "episode_1.txt").write_text("原文", encoding="utf-8")
 
@@ -1277,6 +1710,9 @@ class TestFilesRouter:
         project_json = project_dir / "project.json"
         payload = json.loads(project_json.read_text(encoding="utf-8"))
         payload["generation_mode"] = "reference_video"
+        payload["episodes"] = [
+            {"episode": 2, "title": "", "script_file": "scripts/episode_2.json", "source_origin": "own"}
+        ]
         project_json.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
         drafts_dir = project_dir / "drafts" / "episode_2"
@@ -1393,7 +1829,7 @@ class TestFilesRouter:
             assert resp.status_code in (400, 403, 404)
 
     def test_global_asset_symlink_escape_returns_403(self, tmp_path, monkeypatch):
-        """在 _global_assets/character/ 里放一个指向外部文件的 symlink,应被 resolve-relative 检查拦截为 403。"""
+        """在 global_assets/character/ 里放一个指向外部文件的 symlink,应被 resolve-relative 检查拦截为 403。"""
         import os
         import sys
 
@@ -1404,11 +1840,11 @@ class TestFilesRouter:
 
         client, pm = _client(monkeypatch, tmp_path)
 
-        # 在 tmp_path 下(但不在 _global_assets 里)创建一个外部目标文件
+        # 在 tmp_path 下(但不在 global_assets 里)创建一个外部目标文件
         outside = tmp_path / "outside.png"
         outside.write_bytes(b"secret")
 
-        # 在 _global_assets/character/ 下建立指向外部目标的 symlink
+        # 在 global_assets/character/ 下建立指向外部目标的 symlink
         global_dir = pm.get_global_assets_root() / "character"
         global_dir.mkdir(parents=True, exist_ok=True)
         link = global_dir / "evil.png"
@@ -1417,6 +1853,144 @@ class TestFilesRouter:
         with client:
             r = client.get("/api/v1/global-assets/character/evil.png")
             assert r.status_code == 403
+
+
+class TestPublicFileRouteServesMediaOnly:
+    """公开文件路由只放行媒体目录内的媒体扩展名文件，其余与文件不存在同形返回 404。"""
+
+    @pytest.mark.parametrize(
+        "rel_path",
+        [
+            "storyboards/scene_E1S01.png",
+            "end_frames/scene_E1S01.png",
+            "videos/scene_E1S01.mp4",
+            "renders/episode_1/tl-0000abcd/final_cut.without_narration.no_subtitles.mp4",
+            "reference_videos/E1U1.mp4",
+            "reference_videos/thumbnails/E1U1.jpg",
+            "thumbnails/scene_E1S01.jpg",
+            "characters/Alice.png",
+            "characters/refs/Alice.webp",
+            "characters/refs_audio/Alice.mp3",
+            "characters/derivatives/Alice/young.png",
+            "scenes/酒馆.jpeg",
+            "props/玉佩.png",
+            "products/refs/cup_1.jpg",
+            "grids/grid_1.png",
+            "audio/segment_E1S01.wav",
+            "versions/storyboards/scene_E1S01_v1_20260101T000000.png",
+            "versions/audio/segment_E1S01_v2_20260101T000000.wav",
+            "style_reference.png",
+        ],
+    )
+    def test_media_file_is_served_with_nosniff(self, tmp_path, monkeypatch, rel_path):
+        client, pm = _client(monkeypatch, tmp_path)
+        target = pm.get_project_path("demo") / rel_path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(b"media-bytes")
+
+        with client:
+            resp = client.get(f"/api/v1/files/demo/{rel_path}")
+        assert resp.status_code == 200
+        assert resp.content == b"media-bytes"
+        assert resp.headers["x-content-type-options"] == "nosniff"
+
+    @pytest.mark.parametrize(
+        "rel_path",
+        [
+            "project.json",
+            "scripts/episode_1.json",
+            "source/chapter.txt",
+            "drafts/episode_1/step1_segments.md",
+            "subtitles/episode_1/segments.json",
+            "output/final.mp4",
+            "renders/episode_1/tl-0000abcd/.final_cut.abcd.partial.mp4",
+            "renders/episode_1/tl-0000abcd/.final_cut.abcd.work/segment_0000.mp4",
+            "renders/episode_1/tl-0000abcd/final_cut.render.json",
+            "renders/episode_1/tl-0000abcd/jianying_draft.without_narration.zip",
+            "renders/episode_1/tl-0000abcd/.jianying_draft.with_narration.abcd.partial.zip",
+            "renders/episode_1/tl-0000abcd/.jianying_draft.with_narration.abcd.work/c1.png",
+            "renders/episode_1/tl-0000abcd/jianying_draft.with_narration.render.json",
+            "versions/versions.json",
+            "grids/grid_1.json",
+            "storyboards/page.html",
+            "storyboards/page.htm",
+            "characters/icon.svg",
+            "videos/meta.xml",
+            "audio/notes.txt",
+            "thumbnails/app.js",
+            "versions/scripts/episode_1.png",
+            "versions/scene_E1S01.png",
+            "style_reference.svg",
+            "style_reference.mp4",
+            "STYLE_REFERENCE.png",
+            "Storyboards/scene_E1S01.png",
+            "videos/scene_E1S01.webm",
+            "cover.png",
+            ".claude/settings.json",
+        ],
+    )
+    def test_non_media_file_returns_404(self, tmp_path, monkeypatch, rel_path):
+        client, pm = _client(monkeypatch, tmp_path)
+        target = pm.get_project_path("demo") / rel_path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(b"content")
+
+        with client:
+            resp = client.get(f"/api/v1/files/demo/{rel_path}")
+        assert resp.status_code == 404
+        assert b"content" not in resp.content
+
+    def test_non_media_file_and_missing_file_share_not_found_response(self, tmp_path, monkeypatch):
+        client, _ = _client(monkeypatch, tmp_path)
+        not_found = zh_errors.MESSAGES["file_not_found"]
+
+        with client:
+            existing = client.get("/api/v1/files/demo/project.json")
+            missing = client.get("/api/v1/files/demo/missing.json")
+        assert existing.status_code == missing.status_code == 404
+        assert existing.json() == {"detail": not_found.format(path="project.json")}
+        assert missing.json() == {"detail": not_found.format(path="missing.json")}
+
+    def test_media_named_symlink_to_non_media_file_returns_404(self, tmp_path, monkeypatch):
+        if sys.platform == "win32":
+            pytest.skip("symlinks require admin on Windows")
+        client, pm = _client(monkeypatch, tmp_path)
+        project_dir = pm.get_project_path("demo")
+        link = project_dir / "storyboards" / "scene_E1S01.png"
+        link.parent.mkdir(parents=True, exist_ok=True)
+        os.symlink(project_dir / "project.json", link)
+
+        with client:
+            resp = client.get("/api/v1/files/demo/storyboards/scene_E1S01.png")
+        assert resp.status_code == 404
+
+    def test_extension_check_is_case_insensitive(self, tmp_path, monkeypatch):
+        client, pm = _client(monkeypatch, tmp_path)
+        target = pm.get_project_path("demo") / "storyboards" / "scene_E1S01.PNG"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(b"img")
+
+        with client:
+            resp = client.get("/api/v1/files/demo/storyboards/scene_E1S01.PNG")
+        assert resp.status_code == 200
+
+    def test_global_asset_media_is_served_with_nosniff(self, tmp_path, monkeypatch):
+        client, pm = _client(monkeypatch, tmp_path)
+        (pm.get_global_assets_root() / "character" / "abc.webp").write_bytes(b"img")
+
+        with client:
+            resp = client.get("/api/v1/global-assets/character/abc.webp")
+        assert resp.status_code == 200
+        assert resp.headers["x-content-type-options"] == "nosniff"
+
+    @pytest.mark.parametrize("filename", ["abc.svg", "abc.html", "abc.json", "abc.txt"])
+    def test_global_asset_non_media_returns_404(self, tmp_path, monkeypatch, filename):
+        client, pm = _client(monkeypatch, tmp_path)
+        (pm.get_global_assets_root() / "character" / filename).write_bytes(b"content")
+
+        with client:
+            resp = client.get(f"/api/v1/global-assets/character/{filename}")
+        assert resp.status_code == 404
 
 
 # ==================== Source 多格式上传 ====================
@@ -1522,7 +2096,7 @@ class TestSourceMultiFormatUpload:
 
     def test_upload_source_rejects_oversized_upload_by_content_length(self, tmp_path, monkeypatch):
         client, _ = _client(monkeypatch, tmp_path)
-        from lib.source_loader import SourceLoader
+        from lib.script.source_loader import SourceLoader
 
         # We don't actually send 50MB+ of data — instead post a small body with a fake
         # content-length header. Starlette validates content-length vs actual body length
@@ -1640,18 +2214,18 @@ class TestFilesUnexpectedErrorsMapTo500:
 
     def test_upload_style_image_vision_unsupported_maps_to_localized_400(self, tmp_path, monkeypatch):
         """简单档模型不支持 vision 时，400 detail 走 i18n 翻译，不透出裸中文技术消息。"""
+        from lib.backends.text_backends.base import TextTaskType
         from lib.config.resolver import VisionCapabilityError
-        from lib.text_backends.base import TextTaskType
 
         async def _raise_vision_error(*args, **kwargs):
             raise VisionCapabilityError(
                 task_type=TextTaskType.STYLE_ANALYSIS,
                 provider_id="gemini-aistudio",
-                model_id="gemini-3.1-flash-lite-preview",
+                model_id="gemini-3.1-flash-lite",
             )
 
         client, _ = _client(monkeypatch, tmp_path)
-        monkeypatch.setattr("lib.text_generator.create_text_backend_for_task", _raise_vision_error)
+        monkeypatch.setattr("lib.backends.text_generator.create_text_backend_for_task", _raise_vision_error)
         with client:
             resp = client.post(
                 "/api/v1/projects/demo/style-image",
@@ -1659,7 +2233,7 @@ class TestFilesUnexpectedErrorsMapTo500:
             )
         assert resp.status_code == 400
         detail = resp.json()["detail"]
-        assert "gemini-aistudio/gemini-3.1-flash-lite-preview" in detail
+        assert "gemini-aistudio/gemini-3.1-flash-lite" in detail
         assert "vision" in detail
         # 英文 zh 环境默认无 Accept-Language，走中文翻译文案，而非 __str__ 的英文技术消息
         assert "不支持图像输入" in detail
@@ -1672,7 +2246,7 @@ class TestFilesUnexpectedErrorsMapTo500:
             raise ValueError(f"凭证文件 {sentinel} 中未找到 project_id")
 
         client, _ = _client(monkeypatch, tmp_path)
-        monkeypatch.setattr("lib.text_generator.create_text_backend_for_task", _raise_backend_error)
+        monkeypatch.setattr("lib.backends.text_generator.create_text_backend_for_task", _raise_backend_error)
         with client:
             resp = client.post(
                 "/api/v1/projects/demo/style-image",

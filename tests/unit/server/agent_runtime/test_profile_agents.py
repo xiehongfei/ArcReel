@@ -9,7 +9,7 @@ from server.agent_runtime.profile_agents import load_project_agents
 _REPO = Path(__file__).resolve().parents[4]
 _BUILTIN_PROFILE = _REPO / "agent_runtime_profile"
 _BUILTIN_AGENT_NAMES = {
-    "analyze-assets",
+    "review-footage",
     "create-episode-script",
     "generate-assets",
     "normalize-drama-script",

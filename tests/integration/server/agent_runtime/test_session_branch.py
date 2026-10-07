@@ -10,9 +10,10 @@ import asyncio
 from uuid import uuid4
 
 import pytest
+from claude_agent_sdk import SessionKey, SessionListSubkeysKey, SessionStoreEntry
 
-from lib.agent_session_store import make_project_key
-from lib.agent_session_store.store import DbSessionStore
+from lib.agent.agent_session_store import make_project_key
+from lib.agent.agent_session_store.store import DbSessionStore
 from server.agent_runtime.event_log import EventLogService, EventLogStore
 from server.agent_runtime.sdk_transcript_adapter import SdkTranscriptAdapter
 from server.agent_runtime.session_branch import BranchedSession, SessionBranchError, SessionBranchService
@@ -236,16 +237,16 @@ class _StoreFailingAfterMainWrite:
     def __init__(self, inner: DbSessionStore) -> None:
         self._inner = inner
 
-    async def load(self, key: dict) -> list[dict] | None:
+    async def load(self, key: SessionKey) -> list[SessionStoreEntry] | None:
         return await self._inner.load(key)
 
-    async def append(self, key: dict, entries: list[dict]) -> None:
+    async def append(self, key: SessionKey, entries: list[SessionStoreEntry]) -> None:
         await self._inner.append(key, entries)
 
-    async def list_subkeys(self, key: dict) -> list[str]:
+    async def list_subkeys(self, key: SessionListSubkeysKey) -> list[str]:
         raise _StoreGone
 
-    async def delete(self, key: dict) -> None:
+    async def delete(self, key: SessionKey) -> None:
         await self._inner.delete(key)
 
 

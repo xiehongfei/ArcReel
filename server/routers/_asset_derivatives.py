@@ -7,7 +7,7 @@
 
 本模块只做登记（新增、改描述、删除）与改名；衍生资产图的生成、版本与过期判定不在此处。
 改名与删除是例外：那张图的落盘坐标含衍生名，改名要连带搬图、版本历史与清单键
-（``lib.asset_derivative_rename``），删除要连带清掉三者（``lib.asset_derivative_cleanup``），
+（``lib.project.asset_derivative_rename``），删除要连带清掉三者（``lib.project.asset_derivative_cleanup``），
 两者都与登记写入同属一次提交。
 """
 
@@ -22,25 +22,25 @@ from typing import Any
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
-from lib.api_errors import NotFoundError, UnprocessableError
-from lib.asset_derivative_cleanup import purge_derivative_sheets
-from lib.asset_derivatives import ensure_derivative_table
-from lib.asset_rename import (
+from lib.infra.api_errors import NotFoundError, UnprocessableError
+from lib.project.asset_derivative_cleanup import purge_derivative_sheets
+from lib.project.asset_derivatives import ensure_derivative_table
+from lib.project.asset_rename import (
     AssetRenameConflictError,
     AssetRenameFileCollisionError,
     AssetRenameHistoryCollisionError,
     AssetRenameNotFoundError,
 )
-from lib.asset_types import (
+from lib.project.asset_types import (
     ASSET_SPECS,
     DERIVATIVES_FIELD,
     AssetSpec,
     resolve_asset_key,
     validate_asset_name,
 )
-from lib.i18n import Translator
-from lib.project_change_hints import project_change_source
-from lib.project_manager import ProjectManager
+from lib.project.project_change_hints import project_change_source
+from lib.project.project_manager import ProjectManager
+from server.i18n import Translator
 
 logger = logging.getLogger(__name__)
 
@@ -156,10 +156,8 @@ def register_derivative_routes(
             logger.exception("请求处理失败")
             raise HTTPException(status_code=500, detail=_t("internal_server_error")) from exc
 
-    # 以下四个处理器由 @router.* 就地注册，模块内无其它引用；basedpyright 把函数作用域内的符号
-    # 一律判为私有，逐个标注的 reportUnusedFunction 均为工具误报。
     @router.post(base)
-    async def add_derivative(  # pyright: ignore[reportUnusedFunction]
+    async def add_derivative(
         project_name: str,
         entry_name: str,
         req: _DerivativeCreateRequest,
@@ -184,7 +182,7 @@ def register_derivative_routes(
         return {"success": True, asset_type: result}
 
     @router.patch(f"{base}/{{derivative_name}}")
-    async def update_derivative(  # pyright: ignore[reportUnusedFunction]
+    async def update_derivative(
         project_name: str,
         entry_name: str,
         derivative_name: str,
@@ -212,7 +210,7 @@ def register_derivative_routes(
         return {"success": True, asset_type: result}
 
     @router.post(f"{base}/{{derivative_name}}/rename")
-    async def rename_derivative(  # pyright: ignore[reportUnusedFunction]
+    async def rename_derivative(
         project_name: str,
         entry_name: str,
         derivative_name: str,
@@ -234,7 +232,7 @@ def register_derivative_routes(
         return {"success": True, asset_type: result}
 
     @router.delete(f"{base}/{{derivative_name}}")
-    async def delete_derivative(  # pyright: ignore[reportUnusedFunction]
+    async def delete_derivative(
         project_name: str,
         entry_name: str,
         derivative_name: str,

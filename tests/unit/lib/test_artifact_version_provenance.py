@@ -2,8 +2,8 @@
 
 import pytest
 
-from lib.artifact_manifest import ArtifactBasis
-from lib.artifact_version_provenance import IMAGE_ARTIFACT_BASIS_FIELD, parse_image_version_basis
+from lib.artifacts.artifact_manifest import ArtifactBasis
+from lib.artifacts.artifact_version_provenance import IMAGE_ARTIFACT_BASIS_FIELD, parse_image_version_basis
 
 
 @pytest.mark.parametrize("kind_version", [1, 2])

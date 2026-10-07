@@ -1,7 +1,7 @@
 # ============================================================
 # Stage 1: 构建前端
 # ============================================================
-FROM node:22-slim AS frontend-builder
+FROM node:24-slim AS frontend-builder
 
 WORKDIR /build/frontend
 
@@ -24,9 +24,13 @@ RUN pnpm build
 # ============================================================
 FROM python:3.12-slim AS production
 
-# 安装系统依赖
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    ffmpeg \
+# 安装系统依赖，并把基础镜像预装的系统包升级到当前仓库版本。
+# APT_REFRESH 由 CI 按 ISO 周传入，值变化时本层缓存失效，保证系统包定期刷新
+ARG APT_REFRESH=unset
+RUN echo "apt refresh: ${APT_REFRESH}" \
+    && apt-get update \
+    && DEBIAN_FRONTEND=noninteractive apt-get upgrade -y \
+    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
     curl \
     bubblewrap \
     socat \
@@ -48,8 +52,9 @@ ENV PYTHONUNBUFFERED=1
 # 默认时区，可由 docker-compose / 运行时 -e TZ=... 覆盖
 ENV TZ=Asia/Shanghai
 
-# 先复制依赖和包元数据文件，利用缓存
+# 先复制依赖和包元数据文件，利用缓存；workspace 子包作为依赖随这一步安装，源码须先就位
 COPY pyproject.toml uv.lock README.md ./
+COPY packages/ packages/
 RUN uv sync --no-dev --no-install-project
 
 # 复制应用代码
@@ -60,12 +65,12 @@ COPY alembic.ini ./
 COPY scripts/ scripts/
 COPY agent_runtime_profile/ agent_runtime_profile/
 COPY public/ public/
+# 随包 ffmpeg 的许可证声明（见 NOTICE）随镜像分发
+COPY LICENSE NOTICE ./
+COPY LICENSES/ LICENSES/
 
 # 复制前端构建产物
 COPY --from=frontend-builder /build/frontend/dist/ frontend/dist/
-
-# 创建运行时目录
-RUN mkdir -p projects vertex_keys
 
 # 暴露端口
 EXPOSE 1241

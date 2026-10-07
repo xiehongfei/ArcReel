@@ -12,7 +12,7 @@ from pathlib import Path
 
 from claude_agent_sdk import AgentDefinition
 
-from lib.profile_frontmatter import FrontmatterError, parse_agent_document
+from lib.agent.profile_frontmatter import FrontmatterError, parse_agent_document
 
 logger = logging.getLogger(__name__)
 

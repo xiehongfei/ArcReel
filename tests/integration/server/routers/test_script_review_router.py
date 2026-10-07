@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import cast
 
@@ -9,46 +10,18 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from lib.config.resolver import ConfigResolver
+from lib.generation.video_request_facts import VideoRequestFactsFailure
 from lib.i18n import _ as i18n_message
-from lib.json_io import atomic_write_json
-from lib.project_manager import ProjectManager
+from lib.infra.json_io import atomic_write_json
+from lib.project.project_manager import ProjectManager
+from lib.script import script_review
 from server.auth import CurrentUserInfo, get_current_user
 from server.error_handlers import register_error_handlers
 from server.routers import script_review as router_mod
-from server.services.script_review import ScriptReviewService
+from server.services.project.script_review import ScriptReviewService
 from tests.auth_deps import AUTH_DEPENDENCIES
-
-
-class _StubConfigResolver:
-    """能力解析替身：两条 caps 取值路径最终都只经 ``video_capabilities_for_project`` 这一个读点。
-
-    经生产已有的 ``config_resolver`` 注入位下去，``_fetch_caps_with_fallback`` 与
-    ``_fetch_reference_caps_with_fallback`` 本体照常执行——档位收窄、空集软回退、默认时长的
-    成员性判定都仍在覆盖内；整体替换取值器会把这三段一起绕过去。
-
-    本文件现有断言都落在与时长无关的违约码上，注入档位买的是确定性而非断言支撑：不注入时
-    解析会去连真实数据库，用例的档位取决于「跑测试的机器上恰好没有库」这一环境事实。
-    """
-
-    def __init__(self, caps: dict) -> None:
-        self._caps = caps
-
-    async def video_capabilities_for_project(self, project: dict, *, generation_type: object = None) -> dict:
-        return self._caps
-
-
-def _custom_provider_caps(*, durations: list[int], default_duration: int | None = 4, max_refs: int = 3) -> dict:
-    """自定义供应商（``custom-`` 前缀）不在 ``PROVIDER_REGISTRY``，不声明任何时长联动约束。
-
-    caps 里的档位即最终生效档位，用例要什么档位就直接写什么，不必去挑一个恰好合适的真实型号。
-    """
-    return {
-        "provider_id": "custom-acme",
-        "model": "acme-video",
-        "supported_durations": list(durations),
-        "default_duration": default_duration,
-        "max_reference_images": max_refs,
-    }
+from tests.factories import make_video_request_facts
+from tests.fakes import FakeConfigResolver
 
 
 def _drama_script_plan() -> dict:
@@ -91,7 +64,6 @@ def _client(
     *,
     generation_mode: str | None = None,
     content_mode: str = "drama",
-    caps: dict | None = None,
 ) -> tuple[TestClient, ProjectManager]:
     pm = ProjectManager(tmp_path / "projects")
     pm.create_project("demo")
@@ -102,13 +74,14 @@ def _client(
         pm.update_project("demo", lambda p: p.__setitem__("generation_mode", generation_mode))
 
     monkeypatch.setattr(router_mod, "get_project_manager", lambda: pm)
-    if caps is not None:
-        resolver = cast(ConfigResolver, _StubConfigResolver(caps))
-        monkeypatch.setattr(
-            router_mod,
-            "ScriptReviewService",
-            lambda project_manager: ScriptReviewService(project_manager, config_resolver=resolver),
-        )
+    # 面板档位与确认转换的档位断言都读视频请求事实，事实由用例经 ``set_video_request_facts`` /
+    # ``video_request_facts`` 供给；这里的解析器只是服务构造所需的占位，不触碰配置库。
+    resolver = cast(ConfigResolver, FakeConfigResolver())
+    monkeypatch.setattr(
+        router_mod,
+        "ScriptReviewService",
+        lambda project_manager: ScriptReviewService(project_manager, config_resolver=resolver),
+    )
 
     app = FastAPI()
     register_error_handlers(app)
@@ -117,20 +90,41 @@ def _client(
     return TestClient(app), pm
 
 
+def _register_script_plan(pm: ProjectManager) -> None:
+    """确认转换读的是已登记的正式脚本规划：补上源文并激活产物清单。"""
+    from lib.artifacts.artifact_activation import activate_artifact_target_state
+
+    project_path = pm.get_project_path("demo")
+    source = project_path / "source" / "episode_1.txt"
+    if not source.exists():
+        source.parent.mkdir(parents=True, exist_ok=True)
+        source.write_text("三年后，阿离立于屋檐下：你终于回来了。", encoding="utf-8")
+    activate_artifact_target_state(project_path, bump_schema=False)
+
+
 def _write_script_plan(pm: ProjectManager, content: dict) -> None:
     drafts = pm.get_project_path("demo") / "drafts" / "episode_1"
     drafts.mkdir(parents=True, exist_ok=True)
     atomic_write_json(drafts / "script_plan_normalized_script.json", content)
+    _register_script_plan(pm)
 
 
 def _write_rv_script_plan(pm: ProjectManager, content: dict) -> None:
     drafts = pm.get_project_path("demo") / "drafts" / "episode_1"
     drafts.mkdir(parents=True, exist_ok=True)
     atomic_write_json(drafts / "script_plan_reference_units.json", content)
+    _register_script_plan(pm)
+
+
+def _admitted_drama_script_plan() -> dict:
+    """确认即转换，转换过发声准入：分镜只留台词，不与画外音混排。"""
+    plan = _drama_script_plan()
+    plan["scenes"][0]["utterances"] = [{"kind": "dialogue", "speaker": "阿离", "text": "你终于回来了。"}]
+    return plan
 
 
 class TestScriptReviewRouter:
-    def test_full_gate_flow(self, tmp_path, monkeypatch):
+    def test_full_gate_flow(self, tmp_path, monkeypatch, video_request_facts):
         client, pm = _client(monkeypatch, tmp_path)
         with client:
             base = "/api/v1/projects/demo/episodes/1/script-review"
@@ -141,28 +135,139 @@ class TestScriptReviewRouter:
             assert got.json()["status"] == "no_script_plan"
 
             # script_plan 产出 → pending_review，结构化内容可见
-            _write_script_plan(pm, _drama_script_plan())
+            _write_script_plan(pm, _admitted_drama_script_plan())
             got = client.get(base)
             body = got.json()
             assert body["status"] == "pending_review"
-            assert body["content"]["scenes"][0]["utterances"][1]["speaker"] == "阿离"
+            assert body["content"]["scenes"][0]["utterances"][0]["speaker"] == "阿离"
 
-            # 确认前 prompt_authoring 被阻塞
-            from lib import script_review
+            # 确认前内容确认待审
+            from lib.script import script_review
 
             assert (
-                script_review.gate_blocks_prompt_authoring(pm.get_project_path("demo"), pm.load_project("demo"), 1)
-                is True
+                script_review.review_status(pm.get_project_path("demo"), pm.load_project("demo"), 1) == "pending_review"
             )
 
             # 确认 → confirmed，prompt_authoring 放行
             confirmed = client.post(f"{base}/confirm")
             assert confirmed.status_code == 200
             assert confirmed.json()["status"] == "confirmed"
-            assert (
-                script_review.gate_blocks_prompt_authoring(pm.get_project_path("demo"), pm.load_project("demo"), 1)
-                is False
+            # 正式脚本由确认直接转出：状态只描述内容确认，确认之外没有预演或转换入口。
+            assert "script_entry_currency" not in client.get(base).json()
+            assert client.get(f"{base}/conversion-preview").status_code == 404
+            assert client.post(f"{base}/convert").status_code == 404
+            assert script_review.review_status(pm.get_project_path("demo"), pm.load_project("demo"), 1) == "confirmed"
+
+    def test_saving_confirmed_script_plan_is_rejected_with_recognizable_code(
+        self, tmp_path, monkeypatch, video_request_facts
+    ):
+        client, pm = _client(monkeypatch, tmp_path)
+        with client:
+            base = "/api/v1/projects/demo/episodes/1/script-review"
+            _write_script_plan(pm, _admitted_drama_script_plan())
+            confirmed = client.post(f"{base}/confirm")
+            assert confirmed.status_code == 200, confirmed.text
+            plan_path = pm.get_project_path("demo") / "drafts" / "episode_1" / "script_plan_normalized_script.json"
+            before = plan_path.read_bytes()
+
+            edited = _admitted_drama_script_plan()
+            edited["scenes"][0]["scene_description"] = "雨势渐急，阿离仍站在屋檐下"
+            refused = client.put(
+                f"{base}/content", params={"base_fingerprint": confirmed.json()["fingerprint"]}, json=edited
             )
+
+            assert refused.status_code == 409
+            assert refused.json()["detail"] == i18n_message("script_review_script_plan_confirmed")
+            assert refused.json()["diagnostic"] == {"code": "script_plan_confirmed"}
+            assert plan_path.read_bytes() == before
+            assert client.get(base).json()["status"] == "confirmed"
+
+    def test_confirm_over_existing_script_requires_acknowledgement(self, tmp_path, monkeypatch, video_request_facts):
+        client, pm = _client(monkeypatch, tmp_path)
+        with client:
+            base = "/api/v1/projects/demo/episodes/1/script-review"
+            _write_script_plan(pm, _admitted_drama_script_plan())
+            assert client.post(f"{base}/confirm").status_code == 200
+            script_path = pm.get_project_path("demo") / "scripts" / "episode_1.json"
+            produced = json.loads(script_path.read_text(encoding="utf-8"))
+            produced["scenes"][0]["end_frame_image"] = "end_frames/scene_E1S01.png"
+            produced["scenes"][0].setdefault("generated_assets", {}).update(
+                {
+                    "storyboard_image": "storyboards/scene_E1S01.png",
+                    "video_clip": "videos/scene_E1S01.mp4",
+                    "narration_audio": "audio/segment_E1S01.wav",
+                    "grid_id": "grid_ab12",
+                    "grid_cell_index": 0,
+                }
+            )
+            script_path.write_text(json.dumps(produced, ensure_ascii=False), encoding="utf-8")
+            before = script_path.read_bytes()
+            expected_overwrite = {
+                "revision": script_review.content_fingerprint_of_data(json.loads(before)),
+                "entries": [
+                    {
+                        "id": "E1S01",
+                        "has_storyboard": True,
+                        "has_video": True,
+                        "has_narration_audio": True,
+                        "has_end_frame": True,
+                        "grid_id": "grid_ab12",
+                    }
+                ],
+                "storyboard_count": 1,
+                "video_count": 1,
+                "narration_audio_count": 1,
+                "end_frame_count": 1,
+                "grid_member_count": 1,
+                "grid_count": 1,
+            }
+            expected_overwrite["text"] = script_review.render_overwrite_loss_text(expected_overwrite, i18n_message)
+            # 丢失清单列出配音、尾帧与宫格归属；Web 诊断按标题指称条目。
+            for lost in ("分镜图 1 张", "视频 1 段", "配音 1 段", "尾帧 1 张", "宫格归属 1 处"):
+                assert lost in expected_overwrite["text"]
+
+            rerun = _admitted_drama_script_plan()
+            rerun["scenes"][0]["scene_description"] = "雨势渐急，阿离仍站在屋檐下"
+            _write_script_plan(pm, rerun)
+            state = client.get(base).json()
+            assert state["status"] == "pending_review"
+            assert state["script_overwrite"] == expected_overwrite
+
+            refused = client.post(f"{base}/confirm")
+            assert refused.status_code == 409
+            assert refused.json()["detail"] == i18n_message("script_review_overwrite_required")
+            displayed_overwrite = refused.json()["diagnostic"]["script_overwrite"]
+            displayed_text = displayed_overwrite.pop("text")
+            assert displayed_overwrite == {key: value for key, value in expected_overwrite.items() if key != "text"}
+            assert "E1S01" not in displayed_text
+            assert "S01" in displayed_text
+            for lost in ("分镜图 1 张", "视频 1 段", "配音 1 段", "尾帧 1 张", "宫格归属 1 处"):
+                assert lost in displayed_text
+            assert script_path.read_bytes() == before
+            assert client.get(base).json()["status"] == "pending_review"
+
+            assert client.post(f"{base}/confirm", json={"unexpected": True}).status_code == 422
+            confirmed = client.post(f"{base}/confirm", json={"overwrite_revision": expected_overwrite["revision"]})
+            assert confirmed.status_code == 200, confirmed.text
+            assert confirmed.json()["status"] == "confirmed"
+            assert pm.load_script("demo", "episode_1.json")["scenes"][0]["pending_authoring"] is True
+
+    def test_confirm_without_resolvable_video_model_names_the_missing_configuration(
+        self, tmp_path, monkeypatch, set_video_request_facts
+    ):
+        """确认转换要确定分镜时长档位：视频请求事实解析不出时按事实的问题码回 422，与预检、执行同码。"""
+        set_video_request_facts(VideoRequestFactsFailure("video_capability_unavailable", (("capability", "i2v"),)))
+        client, pm = _client(monkeypatch, tmp_path)
+        with client:
+            base = "/api/v1/projects/demo/episodes/1/script-review"
+            _write_script_plan(pm, _admitted_drama_script_plan())
+
+            refused = client.post(f"{base}/confirm")
+
+            assert refused.status_code == 422
+            assert refused.json()["detail"] == i18n_message("video_capability_unavailable", capability="i2v")
+            assert not (pm.get_project_path("demo") / "scripts" / "episode_1.json").exists()
+            assert client.get(base).json()["status"] == "pending_review"
 
     def test_edit_content_repends(self, tmp_path, monkeypatch):
         client, pm = _client(monkeypatch, tmp_path)
@@ -237,9 +342,9 @@ class TestScriptReviewRouter:
 
 
 class TestReferenceVideoRouter:
-    def test_full_gate_flow(self, tmp_path, monkeypatch):
+    def test_full_gate_flow(self, tmp_path, monkeypatch, video_request_facts):
         """rv 走同一 HTTP gate：结构化 units 可读、可编辑、web 确认放行 prompt_authoring（与 web 确认等价）。"""
-        from lib import script_review
+        from lib.script import script_review
 
         client, pm = _client(monkeypatch, tmp_path, generation_mode="reference_video")
         with client:
@@ -255,8 +360,7 @@ class TestReferenceVideoRouter:
             assert body["content"]["units"][0]["unit_id"] == "E1U01"
             assert body["quarantine"] is None
             assert (
-                script_review.gate_blocks_prompt_authoring(pm.get_project_path("demo"), pm.load_project("demo"), 1)
-                is True
+                script_review.review_status(pm.get_project_path("demo"), pm.load_project("demo"), 1) == "pending_review"
             )
 
             # 编辑单元正文 → 重新等待确认
@@ -269,20 +373,17 @@ class TestReferenceVideoRouter:
             confirmed = client.post(f"{base}/confirm")
             assert confirmed.status_code == 200
             assert confirmed.json()["status"] == "confirmed"
-            assert (
-                script_review.gate_blocks_prompt_authoring(pm.get_project_path("demo"), pm.load_project("demo"), 1)
-                is False
-            )
+            assert script_review.review_status(pm.get_project_path("demo"), pm.load_project("demo"), 1) == "confirmed"
 
-    def test_quarantine_surfaced_with_recomputed_line_anchored_violations(self, tmp_path, monkeypatch):
+    def test_quarantine_surfaced_with_recomputed_line_anchored_violations(
+        self, tmp_path, monkeypatch, video_request_facts
+    ):
         """草稿在场时 GET 附带 ``quarantine`` 字段：违约按产出时那套校验器读时重算，
         不信任草稿里上一轮的快照（这里把快照消息故意写成 "stale" 来验证）。"""
-        from lib.draft_quarantine import QUARANTINE_KIND_SCRIPT_PLAN, write_quarantine
-        from lib.reference_video.draft_validation import DraftViolation
+        from lib.script.draft_quarantine import QUARANTINE_KIND_SCRIPT_PLAN, write_quarantine
+        from lib.script.reference_video.draft_validation import DraftViolation
 
-        client, pm = _client(
-            monkeypatch, tmp_path, generation_mode="reference_video", caps=_custom_provider_caps(durations=[4, 6, 8])
-        )
+        client, pm = _client(monkeypatch, tmp_path, generation_mode="reference_video")
         project_path = pm.get_project_path("demo")
         novel = "阿离站在屋檐下。"
         (project_path / "source").mkdir(parents=True, exist_ok=True)
@@ -313,15 +414,13 @@ class TestReferenceVideoRouter:
             confirmed = client.post(f"{base}/confirm")
             assert confirmed.status_code == 409
 
-    def test_quarantine_schema_invalid_keeps_raw_content(self, tmp_path, monkeypatch):
+    def test_quarantine_schema_invalid_keeps_raw_content(self, tmp_path, monkeypatch, video_request_facts):
         """草稿 units 被改成非数组：违约报 schema_invalid，``content`` 原样回传（不做收编），
         呈现层据此退回原始文本视图而非当作 units 列表遍历。"""
-        from lib.draft_quarantine import QUARANTINE_KIND_SCRIPT_PLAN, write_quarantine
-        from lib.reference_video.draft_validation import DraftViolation
+        from lib.script.draft_quarantine import QUARANTINE_KIND_SCRIPT_PLAN, write_quarantine
+        from lib.script.reference_video.draft_validation import DraftViolation
 
-        client, pm = _client(
-            monkeypatch, tmp_path, generation_mode="reference_video", caps=_custom_provider_caps(durations=[4, 6, 8])
-        )
+        client, pm = _client(monkeypatch, tmp_path, generation_mode="reference_video")
         project_path = pm.get_project_path("demo")
         (project_path / "source").mkdir(parents=True, exist_ok=True)
         (project_path / "source" / "episode_1.txt").write_text("阿离站在屋檐下。", encoding="utf-8")
@@ -341,11 +440,13 @@ class TestReferenceVideoRouter:
             assert [v["code"] for v in quarantine["violations"]] == ["schema_invalid"]
             assert quarantine["violations"][0]["message"] != "stale"
 
-    def test_quarantine_meta_broken_reports_recompute_failure_not_snapshot(self, tmp_path, monkeypatch):
+    def test_quarantine_meta_broken_reports_recompute_failure_not_snapshot(
+        self, tmp_path, monkeypatch, video_request_facts
+    ):
         """``meta.source`` 缺失 → 无从重算：报「无法重算」本身，而不是退回草稿里那份上一轮
         快照——报告一律对现值负责。"""
-        from lib.draft_quarantine import QUARANTINE_KIND_SCRIPT_PLAN, write_quarantine
-        from lib.reference_video.draft_validation import DraftViolation
+        from lib.script.draft_quarantine import QUARANTINE_KIND_SCRIPT_PLAN, write_quarantine
+        from lib.script.reference_video.draft_validation import DraftViolation
 
         client, pm = _client(monkeypatch, tmp_path, generation_mode="reference_video")
         write_quarantine(
@@ -364,18 +465,16 @@ class TestReferenceVideoRouter:
             assert "stale" not in violations[0]["message"]
             assert violations[0]["label"] == ""
 
-    def test_quarantine_surfaced_for_narration_variant(self, tmp_path, monkeypatch):
+    def test_quarantine_surfaced_for_narration_variant(self, tmp_path, monkeypatch, video_request_facts):
         """narration 的待修复草稿同样进 GET 响应：违约按 narration 那套校验器读时重算。
 
         呈现按 kind 分派，不写死参考生视频——否则另两条路线的草稿在场时面板看起来「干净」，
         实际确认已被阻塞，用户看不到任何原因。
         """
-        from lib.draft_quarantine import QUARANTINE_KIND_NARRATION_SCRIPT_PLAN, write_quarantine
-        from lib.draft_violation import DraftViolation
+        from lib.script.draft_quarantine import QUARANTINE_KIND_NARRATION_SCRIPT_PLAN, write_quarantine
+        from lib.script.draft_violation import DraftViolation
 
-        client, pm = _client(
-            monkeypatch, tmp_path, content_mode="narration", caps=_custom_provider_caps(durations=[4, 6, 8])
-        )
+        client, pm = _client(monkeypatch, tmp_path, content_mode="narration")
         project_path = pm.get_project_path("demo")
         novel = "阿离站在屋檐下。"
         (project_path / "source").mkdir(parents=True, exist_ok=True)
@@ -410,12 +509,12 @@ class TestReferenceVideoRouter:
 
             assert client.post(f"{base}/confirm").status_code == 409
 
-    def test_quarantine_surfaced_for_drama_variant(self, tmp_path, monkeypatch):
+    def test_quarantine_surfaced_for_drama_variant(self, tmp_path, monkeypatch, video_request_facts):
         """drama 的待修复草稿（取回编辑工位）同样进 GET 响应：内容重判通过则违约为空、
         正文按现值收编回传，面板据此说明「等待晋升」而不是显示一片空白。"""
-        from lib.draft_quarantine import QUARANTINE_KIND_DRAMA_SCRIPT_PLAN, write_quarantine
+        from lib.script.draft_quarantine import QUARANTINE_KIND_DRAMA_SCRIPT_PLAN, write_quarantine
 
-        client, pm = _client(monkeypatch, tmp_path, caps=_custom_provider_caps(durations=[4, 6, 8]))
+        client, pm = _client(monkeypatch, tmp_path)
         project_path = pm.get_project_path("demo")
         novel = "阿离站在屋檐下。"
         (project_path / "source").mkdir(parents=True, exist_ok=True)
@@ -450,7 +549,7 @@ class TestReferenceVideoRouter:
 
             assert client.post(f"{base}/confirm").status_code == 409
 
-    def test_supported_durations_exposed_for_reference_video_only(self, tmp_path, monkeypatch):
+    def test_supported_durations_exposed_for_reference_video_only(self, tmp_path, monkeypatch, video_request_facts):
         """rv 变体的 GET 带出档位表供 web 渲染时长选择；drama 变体下为 None。"""
         rv_client, pm = _client(monkeypatch, tmp_path, generation_mode="reference_video")
         with rv_client:
@@ -469,12 +568,14 @@ class TestReferenceVideoRouter:
             assert body["supported_durations"] is None
             assert body["duration_tiers"] is None
 
-    def test_quarantine_corrupted_envelope_reported_not_treated_as_clean(self, tmp_path, monkeypatch):
+    def test_quarantine_corrupted_envelope_reported_not_treated_as_clean(
+        self, tmp_path, monkeypatch, video_request_facts
+    ):
         """草稿文件存在但信封本身损坏（非法 JSON）：``read_quarantine`` 按其自身读取口径
         返回 None，但 GET 响应不能把这等同于「无草稿」——那会让面板显示干净态、放行确认，
         而 confirm() 仍会按文件存在性 409（用户点确认却总是失败，且看不到任何解释）。
         """
-        from lib import script_review as lib_script_review
+        from lib.script import script_review as lib_script_review
 
         client, pm = _client(monkeypatch, tmp_path, generation_mode="reference_video")
         project_path = pm.get_project_path("demo")
@@ -496,13 +597,13 @@ class TestReferenceVideoRouter:
             assert confirmed.status_code == 409
 
     def test_quarantine_cleared_between_existence_check_and_read_is_not_reported_as_corrupted(
-        self, tmp_path, monkeypatch
+        self, tmp_path, monkeypatch, video_request_facts
     ):
         """存在性检查通过之后、``read_quarantine`` 真正读取之前，晋升工具把待处置草稿清掉了
         （正式内容已写入）：这不是信封损坏，这次读跨越了「清除」那一刻，应按「无草稿」处理，
         不能误报成损坏——那会让刚晋升完成的集看起来仍有待处置草稿。"""
-        from lib.draft_quarantine import QUARANTINE_KIND_SCRIPT_PLAN, write_quarantine
-        from server.services import script_review as mod
+        from lib.script.draft_quarantine import QUARANTINE_KIND_SCRIPT_PLAN, write_quarantine
+        from server.services.project import script_review as mod
 
         client, pm = _client(monkeypatch, tmp_path, generation_mode="reference_video")
         project_path = pm.get_project_path("demo")
@@ -529,13 +630,15 @@ class TestReferenceVideoRouter:
             body = client.get("/api/v1/projects/demo/episodes/1/script-review").json()
             assert body["quarantine"] is None
 
-    def test_quarantine_unreadable_message_localized_by_accept_language(self, tmp_path, monkeypatch):
+    def test_quarantine_unreadable_message_localized_by_accept_language(
+        self, tmp_path, monkeypatch, video_request_facts
+    ):
         """``quarantine_unreadable`` 违约的 message 走 ``_t`` 按 ``Accept-Language`` 本地化。
 
         其它违约 code 的 message 是产出时渲染好插值的中文模板，不做本地化；``quarantine_unreadable``
         是仅有的两处不带插值的固定字符串（草稿信封损坏 / 重算所需的 meta 缺失损坏），本地化
         改造范围就锁定在这两条。"""
-        from lib import script_review as lib_script_review
+        from lib.script import script_review as lib_script_review
 
         client, pm = _client(monkeypatch, tmp_path, generation_mode="reference_video")
         project_path = pm.get_project_path("demo")
@@ -549,12 +652,41 @@ class TestReferenceVideoRouter:
             base = "/api/v1/projects/demo/episodes/1/script-review"
             body = client.get(base, headers={"Accept-Language": "en"}).json()
             message = body["quarantine"]["violations"][0]["message"]
-            assert message == (
-                "The draft needing fixes is corrupted or malformed and can't be read; "
-                "ask the agent to re-split this episode"
+            assert message == i18n_message("script_review_quarantine_unreadable", locale="en")
+
+    def test_quarantine_recheck_reports_video_request_facts_failure_by_problem_code(
+        self, tmp_path, monkeypatch, set_video_request_facts
+    ):
+        """草稿读时重算遇到视频请求事实解析不出：报成事实问题码的违约并按其文案 key 本地化，
+        不误报成草稿损坏。"""
+        from lib.script.draft_quarantine import QUARANTINE_KIND_SCRIPT_PLAN, write_quarantine
+
+        set_video_request_facts(VideoRequestFactsFailure("reference_capability_unavailable", (("capability", "r2v"),)))
+        client, pm = _client(monkeypatch, tmp_path, generation_mode="reference_video")
+        project_path = pm.get_project_path("demo")
+        (project_path / "source").mkdir(parents=True, exist_ok=True)
+        (project_path / "source" / "episode_1.txt").write_text("阿离站在屋檐下。", encoding="utf-8")
+        _write_rv_script_plan(pm, _rv_script_plan())
+        write_quarantine(
+            project_path,
+            1,
+            QUARANTINE_KIND_SCRIPT_PLAN,
+            content={"units": [{"duration_seconds": 4, "source_text": "x", "text": "镜头1：门开了"}]},
+            violations=[],
+            meta={"source": "source/episode_1.txt"},
+        )
+
+        with client:
+            body = client.get(
+                "/api/v1/projects/demo/episodes/1/script-review", headers={"Accept-Language": "en"}
+            ).json()
+            violations = body["quarantine"]["violations"]
+            assert [v["code"] for v in violations] == ["reference_capability_unavailable"]
+            assert violations[0]["message"] == i18n_message(
+                "reference_capability_unavailable", locale="en", capability="r2v"
             )
 
-    def test_duration_tiers_survive_save_and_confirm_responses(self, tmp_path, monkeypatch):
+    def test_duration_tiers_survive_save_and_confirm_responses(self, tmp_path, monkeypatch, video_request_facts):
         """PUT / confirm 的响应同样带 ``duration_tiers``——它们各自独立调用 ``get_state``，
         不经过 GET 那次合并；不带的话前端 ``adopt()`` 用保存后的响应覆盖 GET 读到的收窄结果，
         退回未收窄的 ``supported_durations``，与刚加载时的呈现不一致。"""
@@ -571,31 +703,43 @@ class TestReferenceVideoRouter:
             confirm_body = client.post(f"{base}/confirm").json()
             assert "duration_tiers" in confirm_body
 
-    def test_duration_tiers_and_supported_durations_resolved_for_custom_provider(self, tmp_path, monkeypatch):
-        """自定义供应商（``custom-`` 前缀）不在 ``PROVIDER_REGISTRY``：caps 是它唯一的档位来源。
+    def test_duration_tiers_and_supported_durations_resolved_for_custom_provider(
+        self, tmp_path, monkeypatch, set_video_request_facts
+    ):
+        """自定义供应商（``custom-`` 前缀）不在 ``PROVIDER_REGISTRY``：视频请求事实是它唯一的档位来源。
 
-        ``supported_durations``（未收窄全集，供存量草稿的读时收编 clamp）与 ``duration_tiers``
-        （收窄后的逐 unit 可选项）都要经 caps 解析出真实档位，否则这类项目的内容确认只能退回
-        结构区间 clamp，读时迁移的收编对其整体失效。
+        ``supported_durations``（声明全集，供存量草稿的读时收编 clamp）与 ``duration_tiers``
+        （收窄后的逐 unit 可选项）都按事实给出真实档位，读时迁移的收编与面板可选项同源。
         """
-        client, pm = _client(
-            monkeypatch,
-            tmp_path,
-            generation_mode="reference_video",
-            caps=_custom_provider_caps(durations=[5, 10], default_duration=None),
+        set_video_request_facts(
+            make_video_request_facts(
+                route="reference_video",
+                generation_type="i2v",
+                provider_id="custom-acme",
+                model_id="acme-video",
+                supported_durations=(5, 10),
+                allowed_durations=(5, 10),
+            )
         )
+        client, pm = _client(monkeypatch, tmp_path, generation_mode="reference_video")
 
         with client:
             _write_rv_script_plan(pm, _rv_script_plan())
             body = client.get("/api/v1/projects/demo/episodes/1/script-review").json()
             assert body["supported_durations"] == [5, 10]
-            assert body["duration_tiers"] == {"with_references": [5, 10], "without_references": [5, 10]}
+            assert body["duration_tiers"] == {
+                "with_references": [5, 10],
+                "units": {"E1U01": body["duration_tiers"]["units"]["E1U01"]},
+            }
+            assert body["duration_tiers"]["units"]["E1U01"]["allowed_durations"] == [5, 10]
 
-    def test_quarantine_with_non_string_meta_source_degrades_gracefully(self, tmp_path, monkeypatch):
+    def test_quarantine_with_non_string_meta_source_degrades_gracefully(
+        self, tmp_path, monkeypatch, video_request_facts
+    ):
         """草稿信封本身合法，但 ``meta.source`` 被改成非字符串（如数字）：重算链路要把它当作
         「无法重算」降级，而不是让 ``safe_join`` 内部的 ``TypeError`` 冒穿成未处理的 500——那样
         用户在最需要看到面板给出修复指引的时刻，看到的反而是一个空白错误页。"""
-        from lib.draft_quarantine import QUARANTINE_KIND_SCRIPT_PLAN, write_quarantine
+        from lib.script.draft_quarantine import QUARANTINE_KIND_SCRIPT_PLAN, write_quarantine
 
         client, pm = _client(monkeypatch, tmp_path, generation_mode="reference_video")
         project_path = pm.get_project_path("demo")
@@ -614,11 +758,13 @@ class TestReferenceVideoRouter:
             violations = resp.json()["quarantine"]["violations"]
             assert [v["code"] for v in violations] == ["quarantine_unreadable"]
 
-    def test_quarantine_with_directory_valued_meta_source_degrades_gracefully(self, tmp_path, monkeypatch):
+    def test_quarantine_with_directory_valued_meta_source_degrades_gracefully(
+        self, tmp_path, monkeypatch, video_request_facts
+    ):
         """``meta.source`` 类型正确（字符串）但指向一个目录：``Path.exists()`` 对目录同样为
         True，直接 ``read_text()`` 会抛 ``IsADirectoryError``——同样要降级成 quarantine_unreadable，
         不能让这个既不是 ValueError 也不是类型错误的 OSError 子类冒穿成 500。"""
-        from lib.draft_quarantine import QUARANTINE_KIND_SCRIPT_PLAN, write_quarantine
+        from lib.script.draft_quarantine import QUARANTINE_KIND_SCRIPT_PLAN, write_quarantine
 
         client, pm = _client(monkeypatch, tmp_path, generation_mode="reference_video")
         project_path = pm.get_project_path("demo")
@@ -638,12 +784,14 @@ class TestReferenceVideoRouter:
             violations = resp.json()["quarantine"]["violations"]
             assert [v["code"] for v in violations] == ["quarantine_unreadable"]
 
-    def test_put_response_includes_quarantine_created_during_the_request(self, tmp_path, monkeypatch):
+    def test_put_response_includes_quarantine_created_during_the_request(
+        self, tmp_path, monkeypatch, video_request_facts
+    ):
         """保存作用于正式草稿，草稿是另一份文件——PUT 响应缺 ``quarantine`` 字段的话，
         面板 ``adopt()`` 会把它当成「无草稿」而放行确认，即使这份草稿在保存前后一直
         都在（这里用「保存时草稿已存在」模拟，等价于「保存在途时才产出」的时序）。"""
-        from lib.draft_quarantine import QUARANTINE_KIND_SCRIPT_PLAN, write_quarantine
-        from lib.reference_video.draft_validation import DraftViolation
+        from lib.script.draft_quarantine import QUARANTINE_KIND_SCRIPT_PLAN, write_quarantine
+        from lib.script.reference_video.draft_validation import DraftViolation
 
         client, pm = _client(monkeypatch, tmp_path, generation_mode="reference_video")
         project_path = pm.get_project_path("demo")
@@ -669,7 +817,7 @@ class TestReferenceVideoRouter:
             assert codes
             assert "quarantine_unreadable" not in codes
 
-    def test_put_with_stale_base_fingerprint_conflicts_409(self, tmp_path, monkeypatch):
+    def test_put_with_stale_base_fingerprint_conflicts_409(self, tmp_path, monkeypatch, video_request_facts):
         """PUT 携带的 ``base_fingerprint`` 与盘上现值不一致（编辑期间另一方已保存）→ 409、
         不落盘；拿最新指纹重试放行。缺省不带指纹的调用维持原语义（不比对）。"""
         client, pm = _client(monkeypatch, tmp_path, generation_mode="reference_video")
@@ -693,168 +841,3 @@ class TestReferenceVideoRouter:
             resp = client.put(f"{base}/content", params={"base_fingerprint": fresh}, json=mine)
             assert resp.status_code == 200
             assert resp.json()["content"]["units"][0]["text"] == "@[阿离] 立于屋檐下。"
-
-
-class TestScriptPlanConversionRouter:
-    """内容确认后的机械转换：预演只读，转换经内容确认门禁，回执列出三组条目。"""
-
-    @staticmethod
-    def _client_with_conversion(
-        monkeypatch, tmp_path: Path, *, generation_mode: str | None = None
-    ) -> tuple[TestClient, ProjectManager]:
-        from server.services import script_plan_conversion as conversion_mod
-        from tests.fakes import FakeConfigResolver
-
-        client, pm = _client(monkeypatch, tmp_path, generation_mode=generation_mode)
-        pm.update_project("demo", lambda project: project.__setitem__("style", "Anime"))
-        monkeypatch.setattr(conversion_mod, "get_project_manager", lambda: pm)
-        resolver = cast(ConfigResolver, FakeConfigResolver(supported_durations=(4, 6, 8)))
-        original = conversion_mod.ScriptGenerator
-        monkeypatch.setattr(
-            conversion_mod,
-            "ScriptGenerator",
-            lambda project_path, config_resolver=None: original(project_path, config_resolver=resolver),
-        )
-        return client, pm
-
-    @staticmethod
-    def _admitted_drama_script_plan() -> dict:
-        """机械转换与生成路径同一道发声准入：分镜只留台词，避免画外音 + 台词混排被拒。"""
-        plan = _drama_script_plan()
-        plan["scenes"][0]["utterances"] = [{"kind": "dialogue", "speaker": "阿离", "text": "你终于回来了。"}]
-        return plan
-
-    @staticmethod
-    def _write_registered_script_plan(pm: ProjectManager, content: dict) -> None:
-        """机械转换读的是已登记的脚本规划产物：落盘后按源文激活产物清单。"""
-        from lib.artifact_activation import activate_artifact_target_state
-
-        _write_script_plan(pm, content)
-        project_path = pm.get_project_path("demo")
-        source = project_path / "source" / "episode_1.txt"
-        source.parent.mkdir(parents=True, exist_ok=True)
-        source.write_text("三年后，阿离立于屋檐下：你终于回来了。", encoding="utf-8")
-        activate_artifact_target_state(project_path, bump_schema=False)
-
-    def test_preview_then_convert_then_no_op(self, tmp_path, monkeypatch):
-        client, pm = self._client_with_conversion(monkeypatch, tmp_path)
-        with client:
-            base = "/api/v1/projects/demo/episodes/1/script-review"
-            self._write_registered_script_plan(pm, self._admitted_drama_script_plan())
-
-            # 预演不经门禁：未确认也能读到「无正式剧本，将新建 1 条」
-            preview = client.get(f"{base}/conversion-preview")
-            assert preview.status_code == 200
-            assert preview.json() == {
-                "episode": 1,
-                "has_script": False,
-                "added": ["E1S01"],
-                "stale": [],
-                "removed": [],
-                "order_changed": False,
-                "title_changed": False,
-            }
-
-            # 转换经内容确认门禁：未确认 409
-            refused = client.post(f"{base}/convert")
-            assert refused.status_code == 409
-
-            assert client.post(f"{base}/confirm").status_code == 200
-            converted = client.post(f"{base}/convert")
-            assert converted.status_code == 200
-            assert converted.json() == {
-                "episode": 1,
-                "script_filename": "episode_1.json",
-                "added": ["E1S01"],
-                "refreshed": [],
-                "removed": [],
-            }
-            scene = pm.load_script("demo", "episode_1.json")["scenes"][0]
-            assert scene["image_prompt"] is None
-            assert scene["video_prompt"] is None
-            assert scene["utterances"][0]["text"] == "你终于回来了。"
-
-            # 逐条一致：再转一次三组为空，预演也报已同步
-            again = client.post(f"{base}/convert", json={"entry_ids": []})
-            assert again.status_code == 200
-            assert (again.json()["added"], again.json()["refreshed"], again.json()["removed"]) == ([], [], [])
-            synced = client.get(f"{base}/conversion-preview").json()
-            assert synced["has_script"] is True
-            assert (synced["added"], synced["stale"], synced["removed"]) == ([], [], [])
-            assert (synced["order_changed"], synced["title_changed"]) == (False, False)
-
-    def test_preview_distinguishes_a_missing_script_plan_from_a_missing_project(self, tmp_path, monkeypatch):
-        client, _pm = self._client_with_conversion(monkeypatch, tmp_path)
-        with client:
-            no_plan = client.get("/api/v1/projects/demo/episodes/1/script-review/conversion-preview")
-            assert no_plan.status_code == 422, no_plan.text
-            assert no_plan.json()["detail"] == i18n_message("script_review_no_script_plan")
-
-            no_project = client.get("/api/v1/projects/absent/episodes/1/script-review/conversion-preview")
-            assert no_project.status_code == 404, no_project.text
-
-    def test_preview_reports_missing_project_metadata_as_missing_project(self, tmp_path, monkeypatch):
-        """参考生视频路线读规划时项目元数据已不在：是项目缺失（404），不是脚本规划缺失（422）。"""
-        import lib.script_generator as generator_mod
-
-        client, pm = self._client_with_conversion(monkeypatch, tmp_path, generation_mode="reference_video")
-        _write_rv_script_plan(pm, _rv_script_plan())
-
-        class _MetadataGone(ProjectManager):
-            def load_project(self, project_name: str) -> dict:
-                raise FileNotFoundError("项目元数据文件不存在")
-
-        monkeypatch.setattr(generator_mod, "ProjectManager", _MetadataGone)
-        with client:
-            got = client.get("/api/v1/projects/demo/episodes/1/script-review/conversion-preview")
-            assert got.status_code == 404, got.text
-            assert got.json()["detail"] != i18n_message("script_review_no_script_plan")
-
-    def test_state_currency_survives_a_pending_draft_that_refuses_the_preview(self, tmp_path, monkeypatch):
-        """待修复草稿在场：预演过准入链整体 422，而 ``GET script-review`` 的条目时效仍列出失效条目——
-        时间线的「剧本内容已更新」提示读后者，不随草稿的出现而消失。"""
-        from lib.draft_quarantine import QUARANTINE_KIND_DRAMA_SCRIPT_PLAN, write_quarantine
-
-        client, pm = self._client_with_conversion(monkeypatch, tmp_path)
-        with client:
-            base = "/api/v1/projects/demo/episodes/1/script-review"
-            self._write_registered_script_plan(pm, self._admitted_drama_script_plan())
-            assert client.post(f"{base}/confirm").status_code == 200
-            assert client.post(f"{base}/convert").status_code == 200
-            synced = client.get(base).json()
-            assert synced["script_entry_currency"] == {"stale": [], "added": [], "removed": [], "order_changed": False}
-
-            # 只改原文锚：条目内容变了，剧本里那一条失效
-            edited = self._admitted_drama_script_plan()
-            edited["scenes"][0]["source_text"] = "三年后，阿离立于屋檐下，轻声道：你终于回来了。"
-            saved = client.put(f"{base}/content", params={"base_fingerprint": synced["fingerprint"]}, json=edited)
-            assert saved.status_code == 200, saved.text
-            assert saved.json()["script_entry_currency"]["stale"] == ["E1S01"]
-            assert client.get(f"{base}/conversion-preview").json()["stale"] == ["E1S01"]
-
-            write_quarantine(
-                pm.get_project_path("demo"),
-                1,
-                QUARANTINE_KIND_DRAMA_SCRIPT_PLAN,
-                content={"title": "第一集", "scenes": []},
-                violations=[],
-            )
-
-            refused = client.get(f"{base}/conversion-preview")
-            assert refused.status_code == 422, refused.text
-            state = client.get(base)
-            assert state.status_code == 200, state.text
-            assert state.json()["status"] == "pending_review"
-            assert state.json()["script_entry_currency"]["stale"] == ["E1S01"]
-
-    def test_adopting_a_current_entry_is_rejected(self, tmp_path, monkeypatch):
-        client, pm = self._client_with_conversion(monkeypatch, tmp_path)
-        with client:
-            base = "/api/v1/projects/demo/episodes/1/script-review"
-            self._write_registered_script_plan(pm, self._admitted_drama_script_plan())
-            assert client.post(f"{base}/confirm").status_code == 200
-            assert client.post(f"{base}/convert").status_code == 200
-
-            rejected = client.post(f"{base}/convert", json={"entry_ids": ["E1S01"]})
-            assert rejected.status_code == 422
-            assert "E1S01" in rejected.json()["diagnostic"]

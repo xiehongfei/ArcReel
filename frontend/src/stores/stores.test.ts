@@ -47,12 +47,6 @@ describe("stores", () => {
   it("updates app store state and counters", () => {
     const app = useAppStore.getState();
 
-    app.setFocusedContext({ type: "character", id: "hero" });
-    expect(useAppStore.getState().focusedContext).toEqual({
-      type: "character",
-      id: "hero",
-    });
-
     app.triggerScrollTo({ type: "segment", id: "S1", route: "/episodes/1", highlight: true });
     expect(useAppStore.getState().scrollTarget).toEqual(
       expect.objectContaining({
@@ -76,8 +70,7 @@ describe("stores", () => {
     expect(useAppStore.getState().toast?.text).toBe("hello");
     expect(useAppStore.getState().toast?.tone).toBe("info");
     expect(useAppStore.getState().workspaceNotifications).toHaveLength(0);
-    app.clearToast();
-    expect(useAppStore.getState().toast).toBeNull();
+    useAppStore.setState({ toast: null });
 
     // pushNotification 同时写两者，tone 与 target 正确传递
     app.pushNotification("task failed", "error", {
@@ -93,8 +86,7 @@ describe("stores", () => {
         target: expect.objectContaining({ id: "S1" }),
       }),
     );
-    app.clearToast();
-    useAppStore.setState({ workspaceNotifications: [] });
+    useAppStore.setState({ toast: null, workspaceNotifications: [] });
 
     app.pushWorkspaceNotification({
       text: "AI 刚更新了角色「hero」，点击查看",
@@ -116,10 +108,6 @@ describe("stores", () => {
 
     app.setUsagePanelOpen(true);
     expect(useAppStore.getState().usagePanelOpen).toBe(true);
-
-    expect(useAppStore.getState().sourceFilesVersion).toBe(0);
-    app.invalidateSourceFiles();
-    expect(useAppStore.getState().sourceFilesVersion).toBe(1);
 
     expect(useAppStore.getState().entityRevisions).toEqual({});
     expect(app.getEntityRevision("segment:S1")).toBe(0);
@@ -148,7 +136,7 @@ describe("stores", () => {
     expect(useTasksStore.getState().tasks).toHaveLength(2);
     expect(useTasksStore.getState().tasks[0].task_id).toBe("task-2");
 
-    tasks.setStats({ queued: 1, running: 1, cancelling: 0, succeeded: 0, failed: 0, cancelled: 0, total: 2 });
+    tasks.setStats({ queued: 1, running: 1, succeeded: 0, failed: 0, cancelled: 0, total: 2 });
     expect(useTasksStore.getState().stats.total).toBe(2);
 
     tasks.setConnected(true);
@@ -158,7 +146,9 @@ describe("stores", () => {
   it("updates projects store fields", () => {
     const projects = useProjectsStore.getState();
 
-    projects.setProjects([{ name: "demo", title: "Demo", style: "Anime", thumbnail: null, status: {} }]);
+    projects.setProjects([
+      { name: "demo", title: "Demo", style: "Anime", thumbnail: null, status: {}, last_activity_at: null },
+    ]);
     expect(useProjectsStore.getState().projects).toHaveLength(1);
 
     projects.setProjectsLoading(true);

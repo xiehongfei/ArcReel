@@ -106,7 +106,7 @@ describe("UsageRecordsSection breakdown", () => {
     renderUsageRecordsSection();
 
     const row = await screen.findByRole("button", { name: /MiniMax/ });
-    expect(row.querySelector('[aria-hidden="true"]')).toHaveStyle({ width: "30%" });
+    expect(row.querySelector('[aria-hidden="true"]')).toHaveStyle({ "--share": "30%" });
   });
 
   it("clears the provider when the pressed row is clicked again", async () => {
@@ -173,14 +173,12 @@ describe("UsageRecordsSection attention", () => {
     );
   }
 
-  it("stays hidden and lets the breakdown span the full row when nothing is wrong", async () => {
+  it("stays hidden when nothing is wrong", async () => {
     mockAttention([]);
     renderUsageRecordsSection();
 
-    const heading = await screen.findByRole("heading", { name: "构成" });
+    await screen.findByRole("heading", { name: "构成" });
     expect(screen.queryByRole("heading", { name: "需要关注" })).not.toBeInTheDocument();
-    expect(heading.closest("section")).toHaveClass("col-span-12");
-    expect(heading.closest("section")).not.toHaveClass("lg:col-span-7");
   });
 
   it("filters to the failing provider and model with the status switched to failed", async () => {
@@ -225,7 +223,7 @@ describe("UsageRecordsSection attention", () => {
     const { location } = renderUsageRecordsSection("section=usage&u_status=success");
 
     await userEvent.click(
-      await screen.findByRole("button", { name: /星海列车 · 分镜 E1S10 连续失败/ }),
+      await screen.findByRole("button", { name: /星海列车 · 分镜 未命名集 · S10 连续失败/ }),
     );
 
     await waitFor(() => {
@@ -248,7 +246,7 @@ describe("UsageRecordsSection attention", () => {
       }),
     );
 
-    await userEvent.click(screen.getByRole("button", { name: "清除筛选：分镜 E1S10" }));
+    await userEvent.click(screen.getByRole("button", { name: "清除筛选：分镜 未命名集 · S10" }));
 
     await waitFor(() => expect(lastQuery(location.history).has("u_segment")).toBe(false));
   });

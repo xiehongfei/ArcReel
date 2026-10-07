@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 import { ShotDetail } from "./ShotDetail";
 import { API } from "@/api";
@@ -109,5 +109,46 @@ describe("ShotDetail 提示词形态切换", () => {
     for (const button of screen.getAllByRole("button", { name: "文本" })) {
       expect(button).toBeDisabled();
     }
+  });
+});
+
+describe("ShotDetail 最终提示词预览", () => {
+  it("分镜图与视频各有入口，打开哪一侧就只展示哪一侧的最终文本", async () => {
+    const spy = vi.spyOn(API, "previewScriptItemPrompts").mockResolvedValue(preview());
+    renderDetail(makeSegment());
+
+    const [, videoButton] = screen.getAllByRole("button", { name: "查看提示词" });
+    expect(spy).not.toHaveBeenCalled();
+    fireEvent.click(videoButton);
+
+    const dialog = await screen.findByRole("dialog", { name: "视频最终提示词" });
+    expect(await within(dialog).findByText("最终视频提示词")).toBeInTheDocument();
+    expect(within(dialog).queryByText(/Scene: 雨夜街道/)).not.toBeInTheDocument();
+    expect(spy).toHaveBeenCalledWith("demo", "E1S01", "episode_1.json", {
+      signal: expect.any(AbortSignal),
+    });
+  });
+
+  it("有修改时先保存再预览，预览请求排在保存成功之后", async () => {
+    const save = vi.fn().mockResolvedValue(true);
+    const request = vi.spyOn(API, "previewScriptItemPrompts").mockResolvedValue(preview());
+    renderDetail(makeSegment(), { onUpdatePrompt: save });
+    fireEvent.change(screen.getByDisplayValue("雨夜街道"), { target: { value: "改过的画面" } });
+    fireEvent.click(screen.getAllByRole("button", { name: "保存并预览" })[0]);
+    const dialog = await screen.findByRole("dialog", { name: "分镜图最终提示词" });
+    expect(await within(dialog).findByText(/Scene: 雨夜街道/)).toBeInTheDocument();
+    expect(save.mock.invocationCallOrder[0]).toBeLessThan(request.mock.invocationCallOrder[0]);
+    expect(save).toHaveBeenCalledWith("E1S01", expect.objectContaining({ image_prompt: expect.objectContaining({ scene: "改过的画面" }) }));
+  });
+
+  it.each([false, new Error("写入失败")])("保存或刷新失败时不打开预览（%s）", async (result) => {
+    const save = result instanceof Error ? vi.fn().mockRejectedValue(result) : vi.fn().mockResolvedValue(result);
+    const request = vi.spyOn(API, "previewScriptItemPrompts").mockResolvedValue(preview());
+    renderDetail(makeSegment(), { onUpdatePrompt: save });
+    fireEvent.change(screen.getByDisplayValue("雨夜街道"), { target: { value: "改过的画面" } });
+    fireEvent.click(screen.getAllByRole("button", { name: "保存并预览" })[0]);
+    expect(await screen.findByRole("alert")).toBeInTheDocument();
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    expect(request).not.toHaveBeenCalled();
   });
 });

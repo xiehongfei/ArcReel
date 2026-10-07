@@ -1,7 +1,8 @@
 import { describe, it, expect, vi } from "vitest";
-import { fireEvent, render, screen } from "@testing-library/react";
+import { act, fireEvent, render, screen } from "@testing-library/react";
+import { useAppStore } from "@/stores/app-store";
 import { UnitPreviewPanel } from "./UnitPreviewPanel";
-import type { ReferenceVideoUnit } from "@/types";
+import type { ReferenceVideoUnit, UnitGeneratedAssets } from "@/types";
 
 // VersionTimeMachine 的 busy 只关面板内的恢复按钮，触发按钮的可用性不变；替身把这个
 // 入参渲染成可断言的属性，避免为了读它去展开面板、加载版本列表。
@@ -21,8 +22,8 @@ vi.mock("@/components/canvas/timeline/VersionTimeMachine", () => ({
 }));
 
 vi.mock("@/components/shared/PresentationPlayer", () => ({
-  PresentationPlayer: ({ resourceId }: { resourceId: string }) => (
-    <div data-testid="presentation-player" data-resource-id={resourceId} />
+  PresentationPlayer: ({ resourceId, startAt }: { resourceId: string; startAt?: { seconds: number } }) => (
+    <div data-testid="presentation-player" data-resource-id={resourceId} data-start-at={startAt?.seconds} />
   ),
 }));
 
@@ -30,12 +31,13 @@ function versionMachineBusy(): boolean {
   return screen.getByTestId("version-time-machine").dataset.busy === "true";
 }
 
-function mkUnit(overrides: Partial<ReferenceVideoUnit> = {}): ReferenceVideoUnit {
+function mkUnit(
+  overrides: Partial<ReferenceVideoUnit> = {},
+): ReferenceVideoUnit & { generated_assets: UnitGeneratedAssets } {
   return {
     unit_id: "E1U1",
     text: "x",
     duration_seconds: 3,
-    transition_to_next: "cut",
     note: null,
     generated_assets: {
       storyboard_image: null,
@@ -54,7 +56,7 @@ function mkUnit(overrides: Partial<ReferenceVideoUnit> = {}): ReferenceVideoUnit
 describe("UnitPreviewPanel", () => {
   it("shows placeholder when no unit is selected", () => {
     render(<UnitPreviewPanel unit={null} />);
-    expect(screen.getByText(/Select a unit|选中左侧 Unit/)).toBeInTheDocument();
+    expect(screen.getByText(/Select a unit|选中左侧的视频单元/)).toBeInTheDocument();
   });
 
   it("shows empty-video placeholder when unit has no video_clip", () => {
@@ -92,7 +94,7 @@ describe("UnitPreviewPanel", () => {
   });
 
   it("disables upload button while the unit is generating", () => {
-    const { container } = render(
+    render(
       <UnitPreviewPanel
         unit={mkUnit()}
         projectName="proj"
@@ -100,9 +102,7 @@ describe("UnitPreviewPanel", () => {
         onUploadVideo={vi.fn()}
       />,
     );
-    const input = container.querySelector<HTMLInputElement>('input[type="file"]');
-    const button = input?.nextElementSibling as HTMLButtonElement;
-    expect(button).toBeDisabled();
+    expect(screen.getByRole("button", { name: "上传视频" })).toBeDisabled();
   });
 
   it("keeps retained narration audio visible after the unit loses narration", () => {
@@ -140,10 +140,9 @@ describe("UnitPreviewPanel", () => {
       expect(versionMachineBusy()).toBe(true);
     });
 
-    it("取消中置 busy——占用比 running 状态活得更久", () => {
-      // cancelling 期间不展示为生成中（status 不是 running），但 worker 仍可能在写
-      // 成片文件，占用判定仍成立；仅看 status 会漏禁用
-      render(<UnitPreviewPanel unit={mkUnit()} projectName="proj" busy cancelling />);
+    it("占用命中而 status 仍是旧失败行时置 busy", () => {
+      // 重试的乐观窗口内旧失败行仍在，status 不是 running；仅看 status 会漏禁用
+      render(<UnitPreviewPanel unit={mkUnit()} projectName="proj" status="failed" busy />);
       expect(versionMachineBusy()).toBe(true);
     });
 
@@ -166,8 +165,7 @@ describe("UnitPreviewPanel", () => {
           restoring
         />,
       );
-      const uploadButton = container.querySelector<HTMLInputElement>('input[type="file"]')
-        ?.nextElementSibling as HTMLButtonElement;
+      const uploadButton = screen.getByRole("button", { name: "上传视频" });
       const generateButton = [...container.querySelectorAll("button")].find((b) =>
         b.textContent?.trim(),
       );
@@ -198,6 +196,32 @@ describe("UnitPreviewPanel", () => {
       fireEvent.click(screen.getByTestId("start-restore"));
 
       expect(onRestoringChange).toHaveBeenCalledWith("E1U2", true);
+    });
+  });
+
+  describe("链接带来的起始播放请求", () => {
+    const readyUnit = () =>
+      mkUnit({
+        generated_assets: { ...mkUnit().generated_assets, video_clip: "reference_videos/E1U1.mp4", status: "completed" },
+      });
+
+    it("把针对本单元的请求交给播放器，针对其他单元的不理会", () => {
+      render(<UnitPreviewPanel unit={readyUnit()} projectName="demo" status="ready" />);
+      expect(screen.getByTestId("presentation-player")).not.toHaveAttribute("data-start-at");
+
+      act(() => useAppStore.getState().requestPlaybackStart({ resource_type: "reference_videos", resource_id: "E1U2", seconds: 9 }));
+      expect(screen.getByTestId("presentation-player")).not.toHaveAttribute("data-start-at");
+
+      act(() => useAppStore.getState().requestPlaybackStart({ resource_type: "reference_videos", resource_id: "E1U1", seconds: 3.5 }));
+      expect(screen.getByTestId("presentation-player")).toHaveAttribute("data-start-at", "3.5");
+      act(() => useAppStore.setState({ playbackStart: null }));
+    });
+
+    it("不带时间点的请求不让播放器定位", () => {
+      render(<UnitPreviewPanel unit={readyUnit()} projectName="demo" status="ready" />);
+      act(() => useAppStore.getState().requestPlaybackStart({ resource_type: "reference_videos", resource_id: "E1U1", seconds: null }));
+      expect(screen.getByTestId("presentation-player")).not.toHaveAttribute("data-start-at");
+      act(() => useAppStore.setState({ playbackStart: null }));
     });
   });
 });

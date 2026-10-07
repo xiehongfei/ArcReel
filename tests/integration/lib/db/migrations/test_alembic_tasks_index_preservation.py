@@ -79,27 +79,36 @@ def test_full_chain_downgrade_only_drops_intentional_indexes(alembic_cfg):
 
     不依赖 ``REBUILD_MIGRATIONS`` 的枚举完备性：新迁移若引入同一模式，即便没被登记进上面的
     列表也会在这里红。去重索引一路存活到删表的 initial schema 为止。
+
+    迁移图在合并迁移处出现分叉（``down_revision`` 是父节点元组），逐节点降级只能在一条父链上
+    推进；这里按「每一条降级边」做账：先把库升到边的父迁移，再降一级。合并迁移的两条父链
+    因此都会被走查。
     """
     cfg, db_path = alembic_cfg
     script = ScriptDirectory.from_config(cfg)
     command.upgrade(cfg, "head")
 
-    before = _tasks_indexes(db_path)
-    assert before is not None
-    assert DEDUPE_INDEX in before
+    head_indexes = _tasks_indexes(db_path)
+    assert head_indexes is not None
+    assert DEDUPE_INDEX in head_indexes
 
     for revision in (s.revision for s in script.walk_revisions("base", "heads")):
-        down_revision = script.get_revision(revision).down_revision or "base"
-        command.downgrade(cfg, str(down_revision))
-        after = _tasks_indexes(db_path)
-        if after is None:
-            assert revision == INITIAL_SCHEMA_REVISION
-            assert DEDUPE_INDEX in before
-            return
+        down_revision = script.get_revision(revision).down_revision
+        parents = down_revision if isinstance(down_revision, tuple) else (down_revision,)
+        for parent in parents:
+            command.upgrade(cfg, str(revision))
+            before = _tasks_indexes(db_path)
+            assert before is not None
 
-        assert before - after == INTENTIONAL_TASKS_INDEX_DROPS.get(revision, frozenset()), (
-            f"{revision} 降级丢失了未登记的 tasks 索引"
-        )
-        before = after
+            command.downgrade(cfg, str(parent) if parent is not None else "base")
+            after = _tasks_indexes(db_path)
+            if after is None:
+                assert revision == INITIAL_SCHEMA_REVISION
+                assert DEDUPE_INDEX in before
+                return
+
+            assert before - after == INTENTIONAL_TASKS_INDEX_DROPS.get(revision, frozenset()), (
+                f"{revision} 降级丢失了未登记的 tasks 索引"
+            )
 
     pytest.fail(f"降到 base 也没走到 {INITIAL_SCHEMA_REVISION} 的删表步骤")

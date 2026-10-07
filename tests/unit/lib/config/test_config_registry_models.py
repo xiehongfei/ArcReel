@@ -4,7 +4,7 @@ from typing import ClassVar
 
 import pytest
 
-from lib.config.registry import PROVIDER_REGISTRY, ModelInfo, ProviderMeta
+from lib.config.registry import PROVIDER_REGISTRY, ModelInfo, ProviderMeta, default_model_for_provider
 
 
 class TestModelInfo:
@@ -132,6 +132,42 @@ class TestProviderRegistry:
             video_models = [mid for mid, m in meta.models.items() if m.media_type == "video"]
             assert len(video_models) > 0, f"{provider_id} has no video models"
 
+    @pytest.mark.parametrize(
+        ("provider_id", "model_id"),
+        [
+            ("gemini-aistudio", "gemini-3.1-flash-lite"),
+            ("gemini-vertex", "gemini-3.1-flash-lite"),
+            ("dashscope", "qwen3.6-plus"),
+            ("dashscope", "qwen3.6-flash"),
+        ],
+    )
+    def test_multimodal_text_models_declare_vision(self, provider_id, model_id):
+        assert "vision" in PROVIDER_REGISTRY[provider_id].models[model_id].capabilities
+
+    @pytest.mark.parametrize("provider_id", ["gemini-aistudio", "gemini-vertex"])
+    def test_retired_flash_lite_preview_is_absent(self, provider_id):
+        models = PROVIDER_REGISTRY[provider_id].models
+        assert "gemini-3.1-flash-lite" in models
+        assert "gemini-3.1-flash-lite-preview" not in models
+
+    def test_text_generation_models_register_max_output_tokens(self):
+        unregistered = [
+            f"{provider_id}/{model_id}"
+            for provider_id, meta in PROVIDER_REGISTRY.items()
+            for model_id, info in meta.models.items()
+            if "text_generation" in info.capabilities and not (info.max_output_tokens and info.max_output_tokens > 0)
+        ]
+        assert unregistered == [], f"带 text_generation 能力的内置模型须登记最大输出长度：{unregistered}"
+
+    def test_dashscope_qwen_long_does_not_declare_structured_output(self):
+        capabilities = PROVIDER_REGISTRY["dashscope"].models["qwen-long"].capabilities
+        assert "structured_output" not in capabilities
+
+    @pytest.mark.parametrize("model_id", ["qwen-plus", "qwen3.6-plus", "qwen3-max", "qwen3.7-max", "qwen3.6-flash"])
+    def test_dashscope_native_structured_models_still_declare_structured_output(self, model_id):
+        capabilities = PROVIDER_REGISTRY["dashscope"].models[model_id].capabilities
+        assert "structured_output" in capabilities
+
     def test_each_media_type_has_default(self):
         for provider_id, meta in PROVIDER_REGISTRY.items():
             by_type: dict[str, list[ModelInfo]] = {}
@@ -145,6 +181,45 @@ class TestProviderRegistry:
         for provider_id in self._TEXT_PROVIDERS:
             meta = PROVIDER_REGISTRY[provider_id]
             assert "text" in meta.media_types, f"{provider_id} missing 'text'"
+
+    def test_agnes_25_models_are_registered_and_legacy_models_are_hidden(self):
+        meta = PROVIDER_REGISTRY["agnes"]
+
+        for model_id in (
+            "agnes-3.0-flash",
+            "agnes-2.5-flash",
+            "agnes-2.5-pro",
+            "agnes-image-2.5-flash",
+            "agnes-video-2.5",
+            "agnes-video-2.5-flash",
+        ):
+            assert model_id in meta.models
+
+        assert meta.models["agnes-3.0-flash"].default is True
+        assert meta.models["agnes-2.5-flash"].default is False
+        assert meta.models["agnes-2.5-pro"].default is False
+        # 3.0 / 2.5 的官方文档都登记了 image_url 图像输入，能力集须含 vision。
+        assert meta.models["agnes-3.0-flash"].capabilities == ["text_generation", "structured_output", "vision"]
+        assert meta.models["agnes-2.5-flash"].capabilities == ["text_generation", "structured_output", "vision"]
+        assert meta.models["agnes-image-2.5-flash"].default is True
+        assert meta.models["agnes-video-2.5-flash"].default is True
+        assert meta.models["agnes-video-2.5"].default is False
+
+        assert meta.models["agnes-2.0-flash"].hidden is True
+        assert meta.models["agnes-image-2.1-flash"].hidden is True
+        assert meta.models["agnes-video-v2.0"].hidden is True
+
+        assert meta.models["agnes-image-2.5-flash"].resolutions == ["1K", "2K", "3K", "4K"]
+        assert meta.models["agnes-image-2.1-flash"].resolutions == ["1K", "2K"]
+        assert meta.models["agnes-video-2.5-flash"].supported_durations == list(range(4, 13))
+        assert meta.models["agnes-video-2.5-flash"].resolutions == ["720p"]
+        assert meta.models["agnes-video-2.5"].supported_durations == list(range(4, 13))
+        assert meta.models["agnes-video-2.5"].resolutions == ["720p", "1080p", "1K", "2K"]
+        assert "agnes-image-2.0-flash" not in meta.models
+
+        assert default_model_for_provider("agnes", "text") == "agnes-3.0-flash"
+        assert default_model_for_provider("agnes", "image") == "agnes-image-2.5-flash"
+        assert default_model_for_provider("agnes", "video") == "agnes-video-2.5-flash"
 
     def test_dashscope_video_models_include_happyhorse_11(self):
         meta = PROVIDER_REGISTRY["dashscope"]
@@ -204,48 +279,6 @@ class TestProviderRegistry:
         meta = PROVIDER_REGISTRY["ark-agent-plan"]
         assert not [mid for mid in meta.models if "seedance-2.5" in mid or "seedance-2-5" in mid]
 
-    def test_agnes_text_models_include_25_flash(self):
-        # 官方已将 2.0 标为废弃、2.5 为兼容替换；2.5 接管默认文本模型，2.0 仍可选手选。
-        meta = PROVIDER_REGISTRY["agnes"]
-        text_models = {mid: m for mid, m in meta.models.items() if m.media_type == "text"}
-        assert set(text_models) == {"agnes-2.5-flash", "agnes-2.0-flash"}
-        flash25 = text_models["agnes-2.5-flash"]
-        assert flash25.display_name == "Agnes 2.5 Flash"
-        assert flash25.default is True
-        assert flash25.capabilities == ["text_generation", "structured_output", "vision"]
-        assert text_models["agnes-2.0-flash"].default is False
-        assert text_models["agnes-2.0-flash"].capabilities == ["text_generation", "structured_output"]
-
-    def test_agnes_image_models_include_25_flash(self):
-        # 2.5 与 2.1 同契约；默认仍是网关已登记的 2.1，2.5 可选手选。
-        meta = PROVIDER_REGISTRY["agnes"]
-        image_models = {mid: m for mid, m in meta.models.items() if m.media_type == "image"}
-        assert set(image_models) == {"agnes-image-2.5-flash", "agnes-image-2.1-flash"}
-        flash25 = image_models["agnes-image-2.5-flash"]
-        assert flash25.display_name == "Agnes Image 2.5 Flash"
-        assert flash25.default is False
-        assert flash25.capabilities == ["text_to_image", "image_to_image"]
-        assert flash25.resolutions == ["1K", "2K"]
-        assert image_models["agnes-image-2.1-flash"].default is True
-        assert image_models["agnes-image-2.1-flash"].resolutions == ["1K", "2K"]
-
     def test_agnes_default_concurrency_serial_image_and_video(self):
         meta = PROVIDER_REGISTRY["agnes"]
         assert meta.default_concurrency == {"image": 1, "video": 1}
-
-    def test_agnes_video_models_include_25(self):
-        # 2.5 / 2.5 Flash 是新一代视频型号，时长/分辨率/计费与 v2.0 不同；v2.0 仍是默认以免改掉 1–3s / 13–18s 项目。
-        meta = PROVIDER_REGISTRY["agnes"]
-        video_models = {mid: m for mid, m in meta.models.items() if m.media_type == "video"}
-        assert set(video_models) == {"agnes-video-v2.0", "agnes-video-2.5", "agnes-video-2.5-flash"}
-        v25 = video_models["agnes-video-2.5"]
-        assert v25.display_name == "Agnes Video 2.5"
-        assert v25.default is False
-        assert v25.supported_durations == list(range(4, 13))
-        assert v25.resolutions == ["720p", "1080p", "1K", "2K"]
-        flash = video_models["agnes-video-2.5-flash"]
-        assert flash.display_name == "Agnes Video 2.5 Flash"
-        assert flash.default is False
-        assert flash.supported_durations == list(range(4, 13))
-        assert flash.resolutions == ["720p"]
-        assert video_models["agnes-video-v2.0"].default is True

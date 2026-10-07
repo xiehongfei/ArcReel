@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -216,6 +217,40 @@ class TestNormalizeInterrupt:
         assert entry["uuid"]
         assert entry["timestamp"]
         assert is_interrupt_entry(entry)
+
+
+class TestNormalizeCompactSummary:
+    SUMMARY = (
+        "This session is being continued from a previous conversation that ran out of context.\n"
+        "Summary:\n1. Primary Request: 生成第 8 集"
+    )
+
+    def test_flagged_transcript_summary_is_marked(self):
+        entries = normalize_sdk_message_to_entries(
+            {"type": "user", "content": "任意措辞的摘要", "uuid": "c-1", "is_compact_summary": True}
+        )
+        assert entries == [
+            {
+                "type": "user",
+                "subtype": "compact_summary",
+                "content": [{"type": "text", "text": "任意措辞的摘要"}],
+                "uuid": "c-1",
+                "timestamp": entries[0]["timestamp"],
+            }
+        ]
+
+    def test_live_summary_without_flag_is_recognized_by_cli_prefix(self):
+        entries = normalize_sdk_message_to_entries(
+            {"type": "user", "content": [{"type": "text", "text": self.SUMMARY}], "uuid": "c-2"}
+        )
+        assert len(entries) == 1
+        assert entries[0]["subtype"] == "compact_summary"
+        assert entries[0]["content"] == [{"type": "text", "text": self.SUMMARY}]
+
+    def test_prefix_midway_is_a_plain_user_message(self):
+        entries = normalize_sdk_message_to_entries({"type": "user", "content": f"这句话是什么意思：{self.SUMMARY}"})
+        assert entries[0]["type"] == "user"
+        assert "subtype" not in entries[0]
 
 
 class TestNormalizeTaskNotificationXml:
@@ -961,9 +996,10 @@ class TestUserMessageLink:
 
 
 class _FakeAdapter:
-    def __init__(self, messages, subagent_timelines=None):
+    def __init__(self, messages, subagent_timelines=None, subagent_descriptions=None):
         self._messages = messages
         self._subagent_timelines = subagent_timelines or {}
+        self._subagent_descriptions = subagent_descriptions or {}
         self.read_count = 0
 
     async def read_raw_messages(self, sdk_session_id, project_cwd=None):
@@ -972,6 +1008,9 @@ class _FakeAdapter:
 
     async def read_subagent_timelines(self, sdk_session_id, project_cwd=None):
         return {k: list(v) for k, v in self._subagent_timelines.items()}
+
+    async def read_subagent_descriptions(self, sdk_session_id, project_cwd, tool_use_ids):
+        return {k: v for k, v in self._subagent_descriptions.items() if k in tool_use_ids}
 
 
 class TestLazyBackfill:
@@ -1249,8 +1288,137 @@ class TestSubagentBackfillMerge:
         service = EventLogService(log_store, adapter)
 
         entries = await service.list_entries("old-session", None)
-        assert [e["uuid"] for e in entries] == ["u1", "g1"]
+        assert [e["uuid"] for e in entries] == ["u1", "g1", "subagent-outcome-tu-ghost"]
         assert entries[1]["parent_tool_use_id"] == "tu-ghost"
+
+    @staticmethod
+    def _orphan_outcome(entries):
+        outcomes = [e for e in entries if e.get("subtype") == "subagent_outcome"]
+        assert len(outcomes) == 1
+        assert "parent_tool_use_id" not in outcomes[0]
+        return outcomes[0]
+
+    async def test_unanchored_subagent_that_answered_is_inferred_completed(self, log_store: EventLogStore):
+        """压缩续接后锚点 tool_use 不在主线：描述取子时间线的首条指令（多行合并为一行），结论取最后的回答。"""
+        sub = [
+            {"type": "user", "content": "审片：检查第 8 集\n逐个镜头核对时长", "uuid": "s-u1"},
+            {
+                "type": "assistant",
+                "content": [{"type": "tool_use", "id": "tu-read", "name": "Read", "input": {}}],
+                "uuid": "s-a1",
+            },
+            {
+                "type": "user",
+                "content": [{"type": "tool_result", "tool_use_id": "tu-read", "content": "x"}],
+                "uuid": "s-u2",
+            },
+            {
+                "type": "assistant",
+                "content": [{"type": "text", "text": "全部 12 个镜头通过"}],
+                "uuid": "s-a2",
+                "timestamp": "2026-01-01T00:05:00Z",
+            },
+        ]
+        adapter = _FakeAdapter([{"type": "user", "content": "hi", "uuid": "u1"}], {"tu-ghost": sub})
+        service = EventLogService(log_store, adapter)
+
+        outcome = self._orphan_outcome(await service.list_entries("old-session", None))
+
+        assert outcome["type"] == "system"
+        assert outcome["tool_use_id"] == "tu-ghost"
+        assert outcome["description"] == "审片：检查第 8 集 逐个镜头核对时长"
+        assert outcome["task_status"] == "completed"
+        assert outcome["summary"] == "全部 12 个镜头通过"
+        assert outcome["timestamp"] == "2026-01-01T00:05:00Z"
+
+    async def test_unanchored_subagent_prefers_the_description_from_the_raw_call(self, log_store: EventLogStore):
+        """原始载荷里还留着压缩前的调用参数时，描述用父代理写下的 description。"""
+        sub = [
+            {"type": "user", "content": "逐个镜头核对第 8 集的时长\n列出超时的镜头", "uuid": "s-u1"},
+            {"type": "assistant", "content": [{"type": "text", "text": "全部通过"}], "uuid": "s-a1"},
+        ]
+        adapter = _FakeAdapter(
+            [{"type": "user", "content": "hi", "uuid": "u1"}],
+            {"tu-ghost": sub},
+            {"tu-ghost": "审片：第 8 集\n（时长）"},
+        )
+        service = EventLogService(log_store, adapter)
+
+        outcome = self._orphan_outcome(await service.list_entries("old-session", None))
+
+        assert outcome["description"] == "审片：第 8 集 （时长）"
+
+    async def test_unanchored_subagent_falls_back_when_reading_descriptions_fails(self, log_store: EventLogStore):
+        sub = [
+            {"type": "user", "content": "调研", "uuid": "s-u1"},
+            {"type": "assistant", "content": [{"type": "text", "text": "完成"}], "uuid": "s-a1"},
+        ]
+        adapter = _FakeAdapter([{"type": "user", "content": "hi", "uuid": "u1"}], {"tu-ghost": sub})
+        adapter.read_subagent_descriptions = AsyncMock(side_effect=RuntimeError("boom"))
+        service = EventLogService(log_store, adapter)
+
+        outcome = self._orphan_outcome(await service.list_entries("old-session", None))
+
+        assert outcome["description"] == "调研"
+        assert outcome["task_status"] == "completed"
+
+    async def test_unanchored_subagent_cut_off_mid_tool_call_is_inferred_stopped(self, log_store: EventLogStore):
+        sub = [
+            {"type": "user", "content": "调研", "uuid": "s-u1"},
+            {
+                "type": "assistant",
+                "content": [
+                    {"type": "text", "text": "先读文件"},
+                    {"type": "tool_use", "id": "tu-read", "name": "Read", "input": {}},
+                ],
+                "uuid": "s-a1",
+            },
+        ]
+        adapter = _FakeAdapter([{"type": "user", "content": "hi", "uuid": "u1"}], {"tu-ghost": sub})
+        service = EventLogService(log_store, adapter)
+
+        outcome = self._orphan_outcome(await service.list_entries("old-session", None))
+
+        assert outcome["task_status"] == "stopped"
+        assert outcome["summary"] is None
+
+    async def test_unanchored_subagent_ending_in_api_error_is_inferred_failed(self, log_store: EventLogStore):
+        sub = [
+            {"type": "user", "content": "调研", "uuid": "s-u1"},
+            {
+                "type": "assistant",
+                "error": "rate_limit",
+                "content": [{"type": "text", "text": "API Error: 429"}],
+                "uuid": "s-a1",
+            },
+        ]
+        adapter = _FakeAdapter([{"type": "user", "content": "hi", "uuid": "u1"}], {"tu-ghost": sub})
+        service = EventLogService(log_store, adapter)
+
+        outcome = self._orphan_outcome(await service.list_entries("old-session", None))
+
+        assert outcome["task_status"] == "failed"
+
+    async def test_anchored_subagent_gets_no_inferred_outcome(self, log_store: EventLogStore):
+        adapter = _FakeAdapter(self._main_messages(), {"tu-agent": self._sub_messages()})
+        service = EventLogService(log_store, adapter)
+
+        entries = await service.list_entries("old-session", None)
+
+        assert not [e for e in entries if e.get("subtype") == "subagent_outcome"]
+
+    async def test_compact_summary_at_the_head_of_a_continued_session_is_marked(self, log_store: EventLogStore):
+        adapter = _FakeAdapter(
+            [
+                {"type": "user", "content": "摘要正文", "uuid": "c1", "is_compact_summary": True},
+                {"type": "user", "content": "继续", "uuid": "u1"},
+            ]
+        )
+        service = EventLogService(log_store, adapter)
+
+        entries = await service.list_entries("old-session", None)
+
+        assert [e.get("subtype") for e in entries] == ["compact_summary", None]
 
     async def test_skill_injection_inside_subagent_typed_with_parent(self, log_store: EventLogStore):
         sub = [

@@ -18,9 +18,10 @@ from fastapi import APIRouter, Depends, File, HTTPException, Query, Request, Res
 from pydantic import AfterValidator, BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from lib.api_errors import BadRequestError
-from lib.app_data_dir import app_data_dir
-from lib.backend_assembly.specs import builtin_video_capabilities_for_model
+from arcreel_market_core.video_backend_contract import VideoAudioMode
+from lib.backends.backend_assembly.specs import builtin_video_capabilities_for_model
+from lib.backends.gemini_shared import VERTEX_SCOPES
+from lib.backends.http_status_errors import raise_for_status_redacted
 from lib.config.registry import PROVIDER_REGISTRY
 from lib.config.repository import mask_secret
 from lib.config.resolver import (
@@ -35,12 +36,14 @@ from lib.config.url_utils import normalize_base_url
 from lib.db import async_session_factory, get_async_session
 from lib.db.base import dt_to_iso
 from lib.db.repositories.credential_repository import CredentialRepository
-from lib.gemini_shared import VERTEX_SCOPES
-from lib.http_status_errors import raise_for_status_redacted
-from lib.i18n import Locale, Translator, translate_or
-from lib.video_backends.base import VideoAudioMode
+from lib.generation.video_request_facts import ResolutionOverride, VideoRequestFactsError
+from lib.i18n import translate_or
+from lib.infra.api_errors import BadRequestError, UnprocessableError
+from lib.infra.data_root_layout import DataRootLayout
 from server.dependencies import get_config_service
+from server.i18n import Locale, Translator
 from server.routers._validators import split_video_backend_query
+from server.services.tasks.video_caps import capability_request_facts, duration_constraints_payload
 
 if TYPE_CHECKING:
     from lib.db.models.credential import ProviderCredential
@@ -111,8 +114,8 @@ class ProviderSummary(BaseModel):
     status: str
     media_types: list[str]
     capabilities: list[str]
-    configured_keys: list[str]
-    missing_keys: list[str]
+    # 凭证（界面称「密钥」）条数；没有凭证时为 0。
+    credential_count: int
     models: dict[str, ModelInfoResponse]
 
 
@@ -300,7 +303,7 @@ def _cred_to_response(cred: ProviderCredential) -> CredentialResponse:
         provider=cred.provider,
         name=cred.name,
         api_key_masked=mask_secret(cred.api_key) if cred.api_key else None,
-        credentials_filename=Path(cred.credentials_path).name if cred.credentials_path else None,
+        credentials_filename=Path(credentials_file).name if (credentials_file := cred.credentials_file()) else None,
         base_url=cred.base_url,
         access_key_masked=mask_secret(cred.access_key) if cred.access_key else None,
         secret_key_masked=mask_secret(cred.secret_key) if cred.secret_key else None,
@@ -310,7 +313,7 @@ def _cred_to_response(cred: ProviderCredential) -> CredentialResponse:
 
 
 async def _invalidate_caches(request: Request) -> None:
-    from server.services.generation_context import invalidate_backend_cache
+    from server.services.tasks.generation_context import invalidate_backend_cache
 
     invalidate_backend_cache()
     worker = getattr(request.app.state, "generation_worker", None)
@@ -338,11 +341,11 @@ def _build_field(
     if "placeholder" in meta:
         field["placeholder"] = meta["placeholder"]
 
-    if is_set:
+    if db_entry is not None and is_set:
         if meta["type"] == "secret":
-            field["value_masked"] = db_entry.get("masked", "••••")  # type: ignore[index]
+            field["value_masked"] = db_entry.get("masked", "••••")
         else:
-            field["value"] = db_entry.get("value", "")  # type: ignore[index]
+            field["value"] = db_entry.get("value", "")
     else:
         if meta["type"] == "secret":
             field["value_masked"] = None
@@ -418,8 +421,7 @@ async def list_providers(
                 status=s.status,
                 media_types=s.media_types,
                 capabilities=s.capabilities,
-                configured_keys=s.configured_keys,
-                missing_keys=s.missing_keys,
+                credential_count=s.credential_count,
                 models=models,
             )
         )
@@ -435,23 +437,35 @@ async def get_model_video_capabilities(
 ):
     """无项目上下文的视频模型能力：创建向导里项目尚不存在，按候选模型直接解析。
 
-    与 `/projects/{name}/video-capabilities` 同一条解析链路（`ConfigResolver.video_capabilities_for_model`），
-    只是没有项目可读：`default_duration` / `generation_mode` 等项目偏好为 None，时长联动约束按
-    传入的 `resolution` / `uses_reference_images` 求值（缺省不按分辨率收窄、不走参考图路径）。
+    与 `/projects/{name}/video-capabilities` 同一条桶能力闸和模型能力解析链路，
+    只是没有项目可读：`default_duration` / `generation_mode` 等项目偏好为 None。
+    `duration_constraints` 由候选模型所在桶（`uses_reference_images` 为真即 r2v，否则 i2v）的视频请求
+    事实给出，`resolution` 作为「覆盖分辨率」参与求值（缺省即「自动」：自定义供应商取模型默认档，其余不带分辨率）。
     裸 provider 的补全与格式校验同项目端点。
     """
     provider_id, model_id = split_video_backend_query(video_backend)
     resolver = ConfigResolver(async_session_factory)
+    generation_type = "r2v" if uses_reference_images else "i2v"
+    candidate_project = {f"video_provider_{generation_type}": f"{provider_id}/{model_id}"}
     try:
-        return await resolver.video_capabilities_for_model(
-            provider_id,
-            model_id,
-            None,
-            resolution=resolution,
-            uses_reference_images=uses_reference_images,
+        await resolver.resolve_video_backend(candidate_project, None, generation_type=generation_type)
+        caps = await resolver.video_capabilities_for_model(provider_id, model_id, None, generation_type=generation_type)
+        if (caps["provider_id"], caps["model"]) != (provider_id, model_id):
+            raise BadRequestError("video_capability_reference_unavailable", provider=provider_id, model=model_id)
+        caps["duration_constraints"] = duration_constraints_payload(
+            await capability_request_facts(
+                candidate_project,
+                generation_type=generation_type,
+                config_resolver=resolver,
+                resolution_override=ResolutionOverride(resolution or None),
+            )
         )
+        return caps
     except VideoBucketCapabilityError as exc:
         raise BadRequestError(exc.code, **exc.params) from exc
+    except VideoRequestFactsError as exc:
+        # 视频请求事实的问题码即 errors 目录 key（ValueError 子类，须先于其捕获）
+        raise UnprocessableError(exc.code, **exc.params) from exc
     except ValueError as exc:
         # 异常原文只进日志：str(exc) 混英文技术细节，直接插进翻译文案会让 en/vi 界面混入未译原文
         logger.warning("视频模型 '%s' 能力解析失败: %s", video_backend, exc)
@@ -651,7 +665,7 @@ async def delete_credential(
     _validate_provider(provider_id, _t)
     repo = CredentialRepository(session)
     cred = await _get_credential_or_404(repo, provider_id, cred_id, _t)
-    cred_path = cred.credentials_path  # 在 delete 前保存，避免 ORM 对象过期后无法访问
+    cred_path = cred.credentials_file()  # 在 delete 前保存，避免 ORM 对象过期后无法访问
     await repo.delete(cred_id)
     await session.commit()
     await _invalidate_caches(request)
@@ -712,7 +726,7 @@ async def upload_vertex_credential(
     repo = CredentialRepository(session)
     cred = await repo.create(provider="gemini-vertex", name=name)
 
-    dest = app_data_dir().parent / "vertex_keys" / f"vertex_cred_{cred.id}.json"
+    dest = DataRootLayout.current().vertex_credential_path(cred.id)
     dest.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = dest.with_suffix(".tmp")
     tmp_path.write_bytes(contents)
@@ -730,7 +744,6 @@ async def upload_vertex_credential(
         except OSError:
             logger.warning("无法设置凭证文件权限: %s", dest, exc_info=True)
 
-    await repo.update(cred.id, credentials_path=str(dest))
     await session.commit()
     await _invalidate_caches(request)
 
@@ -751,8 +764,8 @@ def _check_gemini_aistudio(config: dict[str, str], _t: Callable[..., str]) -> Co
 
     api_key = config["api_key"]
     base_url = normalize_base_url(config.get("base_url"))
-    http_options = {"base_url": base_url} if base_url else None
-    client = genai.Client(api_key=api_key, http_options=http_options)  # type: ignore[arg-type]
+    http_options: genai.types.HttpOptionsDict | None = {"base_url": base_url} if base_url else None
+    client = genai.Client(api_key=api_key, http_options=http_options)
 
     pager = client.models.list()
     available = _extract_gemini_models(pager)
@@ -823,7 +836,7 @@ def _extract_gemini_models(pager) -> list[str]:
 
 def _check_ark(config: dict[str, str], _t: Callable[..., str]) -> ConnectivityCheckResponse:
     """通过 tasks.list 验证 Ark API Key。"""
-    from lib.ark_shared import create_ark_client
+    from lib.backends.ark_shared import create_ark_client
 
     client = create_ark_client(api_key=config["api_key"], base_url=config.get("base_url"))
     # 轻量级调用验证连通性，不创建任何资源
@@ -871,8 +884,8 @@ def _check_openai(config: dict[str, str], _t: Callable[..., str]) -> Connectivit
 
 
 def _check_vidu(config: dict[str, str], _t: Callable[..., str]) -> ConnectivityCheckResponse:
-    """Vidu 连通性检查 — HTTP 细节封装在 lib.vidu_shared.test_vidu_connection（fork-only）。"""
-    from lib.vidu_shared import test_vidu_connection
+    """Vidu 连通性检查 — HTTP 细节封装在 lib.backends.vidu_shared.test_vidu_connection（fork-only）。"""
+    from lib.backends.vidu_shared import test_vidu_connection
 
     test_vidu_connection(config)
     return ConnectivityCheckResponse(
@@ -890,7 +903,7 @@ def _check_dashscope(config: dict[str, str], _t: Callable[..., str]) -> Connecti
     """
     from openai import OpenAI
 
-    from lib.dashscope_shared import dashscope_text_base_url
+    from lib.backends.dashscope_shared import dashscope_text_base_url
 
     client = OpenAI(
         api_key=config["api_key"],
@@ -913,7 +926,7 @@ def _check_minimax(config: dict[str, str], _t: Callable[..., str]) -> Connectivi
     """
     from openai import OpenAI
 
-    from lib.minimax_shared import minimax_text_base_url
+    from lib.backends.minimax_shared import minimax_text_base_url
 
     client = OpenAI(
         api_key=config["api_key"],
@@ -940,7 +953,7 @@ def _check_kling(config: dict[str, str], _t: Callable[..., str]) -> Connectivity
 
     import httpx
 
-    from lib.kling_shared import (
+    from lib.backends.kling_shared import (
         KLING_BASE_URL,
         KlingJWTManager,
         kling_auth_mode,

@@ -251,6 +251,31 @@ class TestSdkTranscriptAdapterStorePath:
         assert result[0]["tool_use_result"] == {"questions": [], "answers": {"继续吗?": "继续"}, "annotations": {}}
 
     @pytest.mark.asyncio
+    async def test_read_via_store_carries_compact_summary_flag_from_store_payload(self):
+        """压缩续接摘要的 isCompactSummary 只在 store payload 上，回填后写入点据此打标记。"""
+        mock_msg = MagicMock(spec=["type", "message", "uuid", "parent_tool_use_id"])
+        mock_msg.type = "user"
+        mock_msg.message = {"content": "This session is being continued from a previous conversation..."}
+        mock_msg.uuid = "uuid-compact"
+        mock_msg.parent_tool_use_id = None
+
+        fake_store = MagicMock()
+        fake_store.load = AsyncMock(
+            return_value=[
+                {"type": "user", "uuid": "uuid-compact", "isCompactSummary": True, "message": {"content": "..."}},
+            ]
+        )
+
+        with patch(
+            "server.agent_runtime.sdk_transcript_adapter.get_session_messages_from_store",
+            new=AsyncMock(return_value=[mock_msg]),
+        ):
+            adapter = SdkTranscriptAdapter(store=fake_store)
+            result = await adapter.read_raw_messages("sdk-session", project_cwd="/tmp/proj")
+
+        assert result[0]["is_compact_summary"] is True
+
+    @pytest.mark.asyncio
     async def test_read_via_store_omits_tool_use_result_when_absent(self):
         mock_msg = MagicMock(spec=["type", "message", "uuid", "parent_tool_use_id"])
         mock_msg.type = "user"
@@ -437,6 +462,43 @@ class TestSubagentTimelines:
         adapter = SdkTranscriptAdapter(store=MagicMock())
         assert await adapter.read_subagent_timelines("") == {}
         assert await adapter.read_subagent_timelines(None) == {}
+
+    async def test_reads_the_description_of_the_requested_subagent_calls(self):
+        """压缩前的子代理调用不在主线里，原始载荷仍有调用参数。"""
+        payloads = [
+            {
+                "type": "assistant",
+                "uuid": "uuid-call",
+                "message": {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "text", "text": "派一个子代理"},
+                        {
+                            "type": "tool_use",
+                            "id": "toolu_1",
+                            "name": "Agent",
+                            "input": {"description": "审片\n第 8 集"},
+                        },
+                        {"type": "tool_use", "id": "toolu_2", "name": "Agent", "input": {"description": "不需要"}},
+                        {"type": "tool_use", "id": "toolu_3", "name": "Agent", "input": {"prompt": "没有描述"}},
+                    ],
+                },
+            },
+            {"type": "user", "uuid": "uuid-text", "message": {"role": "user", "content": "纯文本正文"}},
+        ]
+        fake_store = MagicMock()
+        fake_store.load = AsyncMock(return_value=payloads)
+        adapter = SdkTranscriptAdapter(store=fake_store)
+
+        result = await adapter.read_subagent_descriptions(
+            "sdk-session", "/tmp/proj", ["toolu_1", "toolu_3", "toolu_missing"]
+        )
+
+        assert result == {"toolu_1": "审片\n第 8 集"}
+
+    async def test_descriptions_degrade_to_empty_without_store(self):
+        adapter = SdkTranscriptAdapter()
+        assert await adapter.read_subagent_descriptions("sdk-session", "/tmp/proj", ["toolu_1"]) == {}
 
     async def test_list_subagents_error_returns_empty(self):
         fake_store = MagicMock()

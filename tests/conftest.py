@@ -1,16 +1,37 @@
-"""Shared pytest fixtures for the ArcReel test suite."""
+"""Shared pytest fixtures for the ArcReel test suite.
+
+本文件只放 fixture、收集期钩子与会话启动期的定向选择校验，不被任何模块 import；
+替身实现放在 `tests/fakes.py`，测试输入构造器放在 `tests/factories.py`。
+
+DB fixture 一律派生自唯一的 engine 构造点 `make_test_engine`：
+
+- `session_factory` / `async_session` 方言感知，`DATABASE_URL` 指向 PostgreSQL 时走真实 PostgreSQL；
+  `concurrent_session_factory` 同样方言感知，并为 SQLite 提供允许独立连接的 WAL 文件库；
+  `file_session_factory` 恒为文件 SQLite，消费方是标了 `sqlite_only` 的边界用例。
+  四者由 `pytest_collection_modifyitems` 注入 `uses_db`，构成需要数据库的选择集；
+  PostgreSQL 兼容 job 取其中 `uses_db and not sqlite_only` 的部分。
+- `db_engine` / `db_session` / `db_factory`（内存）与 `file_db_factory`（文件）固定走 SQLite、
+  不带 `uses_db`，供不进该选择集的 models 与 repositories 单测使用。
+- 唯一的例外是 `async_session` 的 PostgreSQL 分支：它绑定 CI job 已 `alembic upgrade head` 建好的
+  public schema，隔离原语是外层事务 + SAVEPOINT，与 `make_test_engine` 的 per-test schema +
+  `create_all` 不同，故自建 engine。
+"""
 
 from __future__ import annotations
 
+import asyncio
 import atexit
+import ipaddress
 import os
 import shutil
+import socket
 import sys
 import tempfile
 import uuid as _uuid
-from collections.abc import AsyncGenerator, AsyncIterator
+from collections.abc import AsyncGenerator, AsyncIterator, Callable, Mapping
 from contextlib import asynccontextmanager
 from pathlib import Path
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -22,7 +43,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
 # `lib.db.engine` 的模块级 engine 在 import 期就按 `DATABASE_URL` 绑定，进程内不再重建，
 # 所以覆写必须发生在下方任何会传染到该模块的 import 之前。未显式指定时它落在仓库根的
-# `projects/.arcreel.db`：一份文件被 xdist 的多个 worker 共用，且 schema 只由某个先跑到
+# `projects/arcreel.db`：一份文件被 xdist 的多个 worker 共用，且 schema 只由某个先跑到
 # 的用例顺带建出——用例间因此存在隐式顺序依赖。钉到本进程独占的临时库上，schema 由
 # `shared_db_schema` 显式建立。DATABASE_URL 已由外部给定（postgres-compat job、
 # 逐个用例 monkeypatch 的 alembic 用例）时不介入。
@@ -49,16 +70,90 @@ def _remove_owned_test_db_dir() -> None:
 
 if not os.environ.get("DATABASE_URL", "").strip() or os.environ.get(_OWNED_DB_MARKER) == "1":
     _OWNED_TEST_DB_DIR = tempfile.mkdtemp(prefix="arcreel-test-db-")
-    os.environ["DATABASE_URL"] = f"sqlite+aiosqlite:///{_OWNED_TEST_DB_DIR}/.arcreel.db"
+    os.environ["DATABASE_URL"] = f"sqlite+aiosqlite:///{_OWNED_TEST_DB_DIR}/arcreel.db"
     os.environ[_OWNED_DB_MARKER] = "1"
     # 回收挂在 atexit 而非 fixture teardown 上：`--collect-only`（CI 的分类 marker 闸门）
     # 与收集期中断都只 import conftest、不跑 fixture。
     atexit.register(_remove_owned_test_db_dir)
 
-import lib.generation_queue as generation_queue_module
+# 数据根与 Claude SDK 配置目录同理：默认值是仓库根下的 `projects/` 与用户的 `~/.claude`，
+# 布局迁移会在其上挪目录、改会话目录。收集期 import `server.app` 就会建出 Assistant 服务
+# 单例并按当时的数据根固定下来，所以须在任何 import 之前钉到本进程独占的临时目录；
+# 每个用例再由 `isolated_data_root` 换成各自的空数据根。
+_OWNED_TEST_HOME_DIR = tempfile.mkdtemp(prefix="arcreel-test-home-")
+os.environ["ARCREEL_DATA_DIR"] = str(Path(_OWNED_TEST_HOME_DIR) / "data")
+os.environ["CLAUDE_CONFIG_DIR"] = str(Path(_OWNED_TEST_HOME_DIR) / "claude-config")
+os.environ.pop("AI_ANIME_PROJECTS", None)
+
+
+def _remove_owned_test_home_dir() -> None:
+    """只在创建临时目录的进程里回收（pid 守卫的理由同 ``_remove_owned_test_db_dir``）。"""
+    if os.getpid() == _OWNED_TEST_DB_OWNER_PID:
+        shutil.rmtree(_OWNED_TEST_HOME_DIR, ignore_errors=True)
+
+
+atexit.register(_remove_owned_test_home_dir)
+
+import lib.generation.generation_queue as generation_queue_module
 from lib.db.base import Base
+from lib.db.engine import register_sqlite_functions
+from lib.generation.video_request_facts import VideoRequestFacts, VideoRequestFactsFailure
 from server.agent_runtime.session_manager import SessionManager
 from server.agent_runtime.session_store import SessionMetaStore
+
+
+@pytest.fixture
+def set_admission_video_request_facts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> Callable[[VideoRequestFacts | VideoRequestFactsFailure], None]:
+    """让批量准入消费测试显式提供的视频请求事实。"""
+    from server.services.admission import video_batch_admission
+
+    def configure(facts: VideoRequestFacts | VideoRequestFactsFailure) -> None:
+        monkeypatch.setattr(video_batch_admission, "evaluate_video_request_facts", AsyncMock(return_value=facts))
+
+    return configure
+
+
+VideoRequestFactsResult = VideoRequestFacts | VideoRequestFactsFailure
+
+
+@pytest.fixture
+def set_video_request_facts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> Callable[[VideoRequestFactsResult | Mapping[str, VideoRequestFactsResult]], None]:
+    """让视频能力消费方读取测试构造的事实结果，求值测试仍使用真实解析器。
+
+    传单个结果时所有桶同一份；传按任务类型桶（``"i2v"`` / ``"r2v"``）索引的映射时按桶作答，
+    供两桶配置不同的消费方用例。
+    """
+    from lib.script import script_generator
+    from lib.script.reference_video import request_projection
+    from server.services.admission import cost_estimation
+    from server.services.tasks import video_caps
+
+    def configure(facts: VideoRequestFactsResult | Mapping[str, VideoRequestFactsResult]) -> None:
+        if isinstance(facts, Mapping):
+            by_bucket = dict(facts)
+
+            async def evaluate(_project, *, generation_type, **_kwargs):
+                return by_bucket[generation_type]
+
+            fake = AsyncMock(side_effect=evaluate)
+        else:
+            fake = AsyncMock(return_value=facts)
+        for consumer in (script_generator, request_projection, cost_estimation, video_caps):
+            monkeypatch.setattr(consumer, "evaluate_video_request_facts", fake)
+
+    return configure
+
+
+@pytest.fixture
+def video_request_facts(set_video_request_facts) -> None:
+    """为无关时长分支的消费方用例提供确定的 i2v 档位。"""
+    from tests.factories import make_video_request_facts
+
+    set_video_request_facts(make_video_request_facts(route="reference_video", generation_type="i2v"))
 
 
 def _discard_pooled_connections_in_forked_child() -> None:
@@ -94,19 +189,26 @@ def discard_pooled_connections_after_fork() -> None:
 
 
 @pytest.fixture(autouse=True)
-def reset_app_data_dir_cache():
-    """``app_data_dir()`` uses ``functools.cache`` for production; reset it between
-    tests so per-test monkeypatching of ARCREEL_DATA_DIR / AI_ANIME_PROJECTS takes
-    effect immediately."""
-    from lib.app_data_dir import reset_for_tests
+def isolated_data_root(tmp_path_factory: pytest.TempPathFactory, monkeypatch: pytest.MonkeyPatch):
+    """每个用例默认使用一个空的临时数据根。
 
+    ``app_data_dir()`` 与 ``get_project_manager()`` 在进程内缓存，用例前后都清掉，
+    用例自己 setenv ``ARCREEL_DATA_DIR`` 后首次调用即按新值解析。会 import 应用模块的
+    autouse fixture 须声明依赖本 fixture，其间触发的解析才落在临时根上。
+    """
+    from lib.infra.app_data_dir import reset_for_tests
+    from lib.project.project_manager import reset_project_manager_for_tests
+
+    monkeypatch.setenv("ARCREEL_DATA_DIR", str(tmp_path_factory.mktemp("data-root")))
     reset_for_tests()
+    reset_project_manager_for_tests()
     yield
     reset_for_tests()
+    reset_project_manager_for_tests()
 
 
 @pytest.fixture(autouse=True)
-def stub_sandbox_check(monkeypatch, request):
+def stub_sandbox_check(isolated_data_root, monkeypatch, request):
     """Mock ``check_sandbox_available`` 返回 True，避免测试机不满足真实 bwrap probe。
 
     GitHub Actions Ubuntu 24.04 runner 上 ``apparmor_restrict_unprivileged_userns=1``
@@ -119,6 +221,35 @@ def stub_sandbox_check(monkeypatch, request):
     if request.path.name == "test_startup_assertions.py":
         return
     monkeypatch.setattr("server.app.check_sandbox_available", lambda: True)
+
+
+#: 测试内主机名统一解析到的地址（TEST-NET-3，公网段、不可路由）。
+_OFFLINE_DNS_ADDRESS = "203.0.113.10"
+
+
+@pytest.fixture(autouse=True)
+def offline_dns(monkeypatch):
+    """事件循环的 ``getaddrinfo`` 对主机名一律回 ``_OFFLINE_DNS_ADDRESS``，不发真实 DNS 查询。
+
+    产物下载入口在每次请求前解析目标主机；出站流量由 respx 在 transport 层拦截，解析这一步
+    却会落到本机解析器上。IP 字面量与 ``localhost``（本地数据库、测试服务器）仍走真实解析。
+    """
+    real_getaddrinfo = asyncio.base_events.BaseEventLoop.getaddrinfo
+
+    async def getaddrinfo(self, host, port, *args, **kwargs):
+        if host is None or host == "localhost" or _is_ip_literal(host):
+            return await real_getaddrinfo(self, host, port, *args, **kwargs)
+        return [(socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, "", (_OFFLINE_DNS_ADDRESS, port or 0))]
+
+    monkeypatch.setattr(asyncio.base_events.BaseEventLoop, "getaddrinfo", getaddrinfo)
+
+
+def _is_ip_literal(host: str | bytes) -> bool:
+    try:
+        ipaddress.ip_address(host.decode() if isinstance(host, bytes) else host)
+    except ValueError:
+        return False
+    return True
 
 
 @pytest.fixture(scope="session", autouse=True)
@@ -216,7 +347,7 @@ def _register_models() -> None:
     不这么做时建表范围取决于被测模块的 import 链，同一 fixture 在不同文件下建出的
     schema 不同。
     """
-    from lib.agent_session_store.models import register_models as register_agent_session_models
+    from lib.agent.agent_session_store.models import register_models as register_agent_session_models
     from lib.db.models import register_models as register_db_models
 
     register_agent_session_models()
@@ -225,7 +356,7 @@ def _register_models() -> None:
 
 @asynccontextmanager
 async def make_test_engine(*, dialect_aware: bool = True, file_path: Path | None = None) -> AsyncGenerator[AsyncEngine]:
-    """DB fixture 的 engine 构造点，唯一例外是 `async_session` 的 PG 分支。
+    """DB fixture 的 engine 构造点，唯一例外是 `async_session` 的 PostgreSQL 分支。
 
     那条分支绑定 CI job 已 `alembic upgrade head` 建好的 public schema，隔离原语是外层
     事务 + SAVEPOINT，与这里的 per-test schema + `create_all` 不同，故自建 engine。
@@ -262,15 +393,16 @@ async def make_test_engine(*, dialect_aware: bool = True, file_path: Path | None
     else:
         engine = create_async_engine(f"sqlite+aiosqlite:///{file_path}", poolclass=pool.NullPool)
 
-        # 由 SQLAlchemy 的 event.listens_for 注册，模块内无其它引用；basedpyright 把函数作用域内的
-        # 符号一律判为私有，本处的 reportUnusedFunction 是工具误报。
-        @event.listens_for(engine.sync_engine, "connect")
-        def _set_sqlite_pragma(dbapi_conn, _record):  # pyright: ignore[reportUnusedFunction]
-            cursor = dbapi_conn.cursor()
-            cursor.execute("PRAGMA journal_mode=WAL")
-            cursor.execute("PRAGMA busy_timeout=30000")
-            cursor.execute("PRAGMA foreign_keys=OFF")
-            cursor.close()
+    @event.listens_for(engine.sync_engine, "connect")
+    def _set_sqlite_pragma(dbapi_conn, _record):
+        register_sqlite_functions(dbapi_conn)
+        if file_path is None:
+            return
+        cursor = dbapi_conn.cursor()
+        cursor.execute("PRAGMA journal_mode=WAL")
+        cursor.execute("PRAGMA busy_timeout=30000")
+        cursor.execute("PRAGMA foreign_keys=OFF")
+        cursor.close()
 
     async with engine.begin() as conn:
         _register_models()
@@ -311,6 +443,41 @@ async def file_db_factory(tmp_path: Path) -> AsyncIterator[async_sessionmaker[As
 async def db_factory(db_engine: AsyncEngine) -> async_sessionmaker[AsyncSession]:
     """``db_engine`` 上的 session factory。"""
     return async_sessionmaker(db_engine, expire_on_commit=False)
+
+
+@pytest.fixture
+async def custom_providers_app_session_factory(db_engine: AsyncEngine) -> async_sessionmaker[AsyncSession]:
+    """``custom_providers_app`` 绑定的 session factory；用例也直接用它预置端点与模型行。"""
+    return async_sessionmaker(db_engine, expire_on_commit=False)
+
+
+@pytest.fixture
+def custom_providers_app(custom_providers_app_session_factory):
+    """只挂自定义供应商路由、绑内存库、以管理员身份免鉴权的 FastAPI 应用。
+
+    三个测试文件（协议无关的 CRUD、能力覆盖、ComfyUI 协议）按行为域分文件，共用的是同一个
+    被测应用。import 放在函数体内：根 conftest 由整个测试会话加载，不该为三个文件把 server
+    包拉进每一次收集。
+    """
+    from fastapi import FastAPI
+
+    from lib.db import get_async_session
+    from server.auth import CurrentUserInfo, get_current_user
+    from server.error_handlers import register_error_handlers
+    from server.routers import custom_providers
+    from tests.auth_deps import AUTH_DEPENDENCIES
+
+    app = FastAPI()
+
+    async def _override_session():
+        async with custom_providers_app_session_factory() as db_session:
+            yield db_session
+
+    app.dependency_overrides[get_async_session] = _override_session
+    app.dependency_overrides[get_current_user] = lambda: CurrentUserInfo(id="test", sub="test", role="admin")
+    app.include_router(custom_providers.router, prefix="/api/v1", dependencies=AUTH_DEPENDENCIES)
+    register_error_handlers(app)
+    return app
 
 
 @pytest.fixture
@@ -446,6 +613,25 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
                 break
 
     _enforce_classification_markers(items)
+    _skip_local_port_tests_without_bind_permission(items)
+
+
+def _skip_local_port_tests_without_bind_permission(items: list[pytest.Item]) -> None:
+    """环境禁止绑定 127.0.0.1 时，把 `local_port` 用例标成带原因的 skip。
+
+    Agent 沙箱可能拒绝绑定本地端口；这类用例在那里只会以 `PermissionError` 失败，
+    跳过并注明原因，提示到允许绑定端口的环境里再跑一次。
+    """
+    port_items = [item for item in items if item.get_closest_marker("local_port") is not None]
+    if not port_items:
+        return
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+            probe.bind(("127.0.0.1", 0))
+    except PermissionError:
+        skip = pytest.mark.skip(reason="当前环境禁止绑定 127.0.0.1 上的端口；在允许绑定本地端口的环境中运行此用例")
+        for item in port_items:
+            item.add_marker(skip)
 
 
 def _enforce_classification_markers(items: list[pytest.Item]) -> None:
@@ -568,3 +754,35 @@ def poll_clock():
 
     with bounded_poll_clock():
         yield
+
+
+# ---------------------------------------------------------------------------
+# Edit timeline projects (final cut and Jianying draft tests)
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def timeline_project(tmp_path: Path):
+    """参考生视频模式的项目 ``demo``：第 1 集含 E1U1、E1U2 两个视频单元，尚无视频；返回其 ProjectManager。"""
+    from lib.project.project_manager import ProjectManager
+
+    manager = ProjectManager(tmp_path / "projects")
+    manager.create_project("demo")
+    manager.create_project_metadata("demo", "Demo", "Anime", "narration")
+    manager.update_project("demo", lambda project: project.update({"generation_mode": "reference_video"}))
+    manager.save_script(
+        "demo",
+        {
+            "episode": 1,
+            "title": "第一集",
+            "content_mode": "narration",
+            "generation_mode": "reference_video",
+            "summary": "摘要",
+            "novel": {"title": "小说", "chapter": "第一章"},
+            "video_units": [
+                {"unit_id": unit_id, "text": f"镜头 {unit_id}", "duration_seconds": 4} for unit_id in ("E1U1", "E1U2")
+            ],
+        },
+        "episode_1.json",
+    )
+    return manager

@@ -5,14 +5,14 @@
  * 就是编译期错误。名字漂移由类型拦，元素消失由这些用例拦 —— 两头都不靠人肉巡检。
  */
 
-import { render, screen, waitFor } from "@testing-library/react";
+import { act, render, screen, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { Router } from "wouter";
 import { memoryLocation } from "wouter/memory-location";
 import i18n from "@/i18n";
 import { API } from "@/api";
 import { GlobalHeader } from "@/components/layout/GlobalHeader";
-import { OverviewCanvas } from "@/components/canvas/OverviewCanvas";
+import { OverviewCanvas } from "@/components/canvas/overview/OverviewCanvas";
 import { CharactersPage } from "@/components/canvas/lorebook/CharactersPage";
 import { TimelineCanvas } from "@/components/canvas/timeline/TimelineCanvas";
 import { ProjectsPage } from "@/components/pages/ProjectsPage";
@@ -38,16 +38,11 @@ vi.mock("@/components/pages/CreateProjectModal", () => ({
 
 // 顶栏与分镜画布的重子组件与锚点无关，替身挡掉它们各自的数据依赖。
 vi.mock("@/components/usage/UsageHeaderEntry", () => ({ UsageHeaderEntry: () => null }));
-vi.mock("@/components/layout/WorkspaceNotificationsDrawer", () => ({ WorkspaceNotificationsDrawer: () => null }));
 vi.mock("@/components/canvas/timeline/ScriptReviewGate", async () => {
   const { scriptReviewGateMock } = await import("@/__mocks__/ScriptReviewGate");
   return scriptReviewGateMock();
 });
 vi.mock("@/components/canvas/timeline/ShotSplitView", () => ({ ShotSplitView: () => null }));
-vi.mock("@/components/canvas/timeline/EpisodeHeader", async () => {
-  const { episodeHeaderMock } = await import("@/__mocks__/EpisodeHeader");
-  return episodeHeaderMock();
-});
 
 function renderLobby() {
   const { hook } = memoryLocation({ path: "/app/projects" });
@@ -103,9 +98,7 @@ const RENDERERS: Record<OnboardingAnchor, () => void> = {
       <CharactersPage
         projectName={DEMO_PROJECT_NAME}
         characters={buildDemoProjectData(demoT).characters ?? {}}
-        onSaveCharacter={vi.fn()}
         onGenerateCharacter={vi.fn()}
-        onAddCharacter={vi.fn()}
         readOnly
       />,
     );
@@ -113,6 +106,8 @@ const RENDERERS: Record<OnboardingAnchor, () => void> = {
   [ONBOARDING_ANCHORS.workbenchTimeline]: () => {
     render(
       <TimelineCanvas
+        view="board"
+        onViewChange={vi.fn()}
         projectName={DEMO_PROJECT_NAME}
         episode={DEMO_SCRIPTED_EPISODE}
         hasDraft
@@ -150,6 +145,20 @@ describe("onboarding anchors", () => {
 
     await waitFor(() => expect(API.listProjects).toHaveBeenCalled());
     expect(document.querySelector(anchorSelector(ONBOARDING_ANCHORS.lobbyDemoCard))).toBeNull();
+  });
+
+  it("adds a sample-project section above the empty lobby during the tour and removes only that section afterwards", async () => {
+    useOnboardingStore.setState({ active: true });
+    renderLobby();
+
+    const section = await screen.findByRole("region", { name: "示例项目" });
+    expect(section).toHaveTextContent("仅在引导期间显示");
+    expect(screen.getByText("还没有项目")).toBeInTheDocument();
+
+    act(() => useOnboardingStore.setState({ active: false }));
+
+    expect(screen.queryByRole("region", { name: "示例项目" })).not.toBeInTheDocument();
+    expect(screen.getByText("还没有项目")).toBeInTheDocument();
   });
 
   it("keeps the demo card out of the user's real project list", async () => {

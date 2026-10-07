@@ -12,6 +12,12 @@ import type {
   ImportConflictPolicy,
   ImportProjectResponse,
   ExportDiagnostics,
+  FinalCutStatus,
+  JianyingDraftStatus,
+  JianyingVersion,
+  RenderOptions,
+  RenderSubmission,
+  SubtitleMode,
   ImportFailureDiagnostics,
   EpisodeScript,
   TaskItem,
@@ -20,7 +26,6 @@ import type {
   ImagePayload,
   EntriesResponse,
   TimelineEntry,
-  FailureObservation,
   SkillInfo,
   ProjectOverview,
   ProjectChangeBatchPayload,
@@ -28,8 +33,11 @@ import type {
   ProjectDeletedPayload,
   GetSystemConfigResponse,
   GetSystemVersionResponse,
+  NarrationDefaultsResponse,
+  TtsModelCapabilitiesResponse,
   PromptTemplateDetail,
   PromptTemplateListResponse,
+  PromptTemplatePartial,
   ModelCandidatesResponse,
   OnboardingStatus,
   SystemConfigPatch,
@@ -43,13 +51,23 @@ import type {
   UsageRecordPage,
   UsageSummary,
   CustomProviderInfo,
-  CustomProviderModelInfo,
   CustomProviderCreateRequest,
   CustomProviderFullUpdateRequest,
-  CustomProviderModelInput,
-  DiscoveredModel,
+  DiscoverModelsResponse,
   EndpointDescriptor,
+  ComfyuiInferResponse,
+  ComfyuiMediaType,
   CustomEndpointInfo,
+  MarketEntryAggregate,
+  MarketSubmission,
+  MarketSubmissionDiagnostic,
+  MarketSubmissionDraft,
+  MarketEntryListResponse,
+  MarketEntryDetail,
+  MarketEntryInstallation,
+  OfficialServiceState,
+  MarketSourceInfo,
+  MarketSourceListResponse,
   EndpointDefinition,
   EndpointValidateResponse,
   EndpointTestParameters,
@@ -60,40 +78,87 @@ import type {
   EndpointTestStage,
   TrialRunInfo,
   TrialRunModelRef,
-  CustomProviderCredentials,
   AnthropicDiscoverRequest,
   AnthropicDiscoverResponse,
   CostEstimateResponse,
+  ReferenceUnitCapability,
+  ReferenceUnitCapabilityMap,
   ReferenceVideoUnit,
-  TransitionType,
   AdShot,
+  DramaScene,
+  NarrationSegment,
   ReferenceDurationPrecheck,
-  ReferenceProjectionAdmission,
-  NarratedVideoDurationAdmission,
   ReferenceGenerationRequestOptions,
   ReferenceBatchAdmission,
   ReferenceBatchGenerateRequest,
-  ReferenceRequestOptions,
   ScriptPreview,
+  ReferenceUnitPromptPreview,
   ItemPromptPreview,
+  RenderedPromptPreview,
   ScriptReviewState,
-  ScriptPlanConversionPreview,
-  ScriptPlanConversionReceipt,
+  DraftDocType,
+  EpisodeDraftSummary,
+  EpisodeDraftView,
+  SaveEpisodeDraftResult,
+  AuthorPromptsRequest,
+  AuthorPromptsResponse,
+  PlanScriptRequest,
+  PlanScriptResponse,
+  GenerateAdScriptRequest,
+  DraftRepairResponse,
   DramaNormalizedScript,
   NarrationScriptPlanDraft,
   ReferenceScriptPlanDraft,
   VideoCapabilities,
+  EpisodeItemRef,
 } from "@/types";
-import type { GenerationRoute } from "@/utils/generation-mode";
 import type { GridCapability, GridGeneration } from "@/types/grid";
 import type {
   PresentationReadModel,
   PresentationRequestOptions,
   PresentationResourceType,
 } from "@/types/presentation";
-import type { Asset, AssetType, AssetCreatePayload, AssetUpdatePayload } from "@/types/asset";
+import type { Asset, AssetType, AssetCreatePayload, AssetListPage, AssetUpdatePayload } from "@/types/asset";
 import type { AgentMemoryOverview, AgentMemoryScope } from "@/types/agent-memory";
-import type { WorkflowPlan, WorkflowPlanRequest } from "@/types/workflow";
+import type { EpisodeNextStep, WorkflowPlan, WorkflowPlanRequest, WorkflowStatus } from "@/types/workflow";
+import type {
+  EditTimelinePreviewMedia,
+  EditTimelineReadout,
+  EditTimelineSummary,
+  EpisodeEditOverview,
+  ProjectBgm,
+  TimelineNarration,
+} from "@/types/edit-timeline";
+import type {
+  AdoptSourceFileTarget,
+  CreateEpisodeBody,
+  EpisodeDeletionResponse,
+  EpisodePlanningResponse,
+  PlanningGap,
+  EpisodeSourceWriteResult,
+  EpisodesView,
+  ManualSplitAction,
+  ManualSplitResponse,
+  ReplanAdoptionResponse,
+  ReplanPreview,
+  StopEpisodePlanningResponse,
+  SourceFileChangeResponse,
+  SourceKind,
+  SourceKindChangeResult,
+} from "@/types/episodes-view";
+import type {
+  AssetRegenerationImpact,
+  AssetSheetBatchPreview,
+  AssetSheetBatchScope,
+  AssetSheetBatchSubmitted,
+  AssetSheetStatusRow,
+  AssetSheetType,
+} from "@/types/asset-sheet";
+import type {
+  StoryboardBatchKind,
+  StoryboardBatchPreview,
+  StoryboardBatchSubmitted,
+} from "@/types/storyboard-batch";
 import type {
   AgentCredential,
   CreateAgentCredentialRequest,
@@ -102,15 +167,72 @@ import type {
   TestConnectionResponse,
   UpdateAgentCredentialRequest,
 } from "@/types/agent-credential";
-import { getToken, clearToken } from "@/utils/auth";
-import { openSseStream, type SseStreamError, type SseStreamHandle } from "@/utils/sse-stream";
-import { isDemoProject } from "@/onboarding/demo-project";
-import i18n from "./i18n";
+import i18n from "@/i18n";
+import { openSseStream, type SseStreamHandle } from "@/utils/sse-stream";
+import {
+  API_BASE,
+  handleUnauthorized,
+  parseSseJson,
+  requestJson,
+  sseErrorHandler,
+  sseHeaders,
+  throwIfNotOk,
+  withAuth,
+} from "./api/transport";
+import {
+  ConflictError,
+  type ImportErrorPayload,
+  type ScriptEditResult,
+} from "./api/errors";
+import type {
+  AgentProfileStatus,
+  AssetDeletionPreview,
+  AssetMergeResult,
+  AssetRenameResult,
+  AssistantEntriesStreamOptions,
+  CreateProjectPayload,
+  EpisodeScriptSnapshot,
+  MergeableAssetType,
+  ProjectAssetType,
+  ProjectEventStreamOptions,
+  ScriptEditCommand,
+  ShotUploadResult,
+  SuccessResponse,
+  TaskListFilters,
+  UsageRecordsQuery,
+  UsageSummaryQuery,
+  VersionInfo,
+  VideoCapabilitiesQuery,
+} from "./api/types";
 
-// ==================== Helper types ====================
+export {
+  AgentFailureError,
+  ApiRequestError,
+  ConflictError,
+  ReadOnlyModeError,
+  ReferenceProjectionError,
+  ScriptEditCommandError,
+  SpeechAdmissionError,
+  type ErrorResponse,
+} from "./api/errors";
+export type {
+  AgentProfileStatus,
+  AssetDeletionPreview,
+  AssetMergeEpisodeImpact,
+  AssetMergeResult,
+  AssetRenameResult,
+  LoginResponse,
+  MergeableAssetType,
+  ProjectAssetType,
+  ProjectEventStreamOptions,
+  UsageRecordsQuery,
+  UsageSummaryQuery,
+  VersionInfo,
+  VideoCapabilitiesQuery,
+} from "./api/types";
+export { setApiReadOnly } from "./api/transport";
 
-/** 项目内四类资产（与后端 ASSET_SPECS 的 asset_type 对齐）。 */
-export type ProjectAssetType = "character" | "scene" | "prop" | "product";
+// ==================== Endpoint helpers ====================
 
 /** asset_type → REST 路径段（与后端 spec.subdir 对齐）。 */
 const ASSET_TYPE_PATH: Record<ProjectAssetType, string> = {
@@ -120,7 +242,7 @@ const ASSET_TYPE_PATH: Record<ProjectAssetType, string> = {
   product: "products",
 };
 
-/** 角色衍生资产图在版本与图片编辑端点上的资源类型名（与后端 `lib/resource_paths` 一致）。 */
+/** 角色衍生资产图在版本与图片编辑端点上的资源类型名（与后端 `lib/project/resource_paths` 一致）。 */
 export const CHARACTER_DERIVATIVE_RESOURCE_TYPE = "character_derivatives";
 
 /** 衍生的复合资源 id：本体名与衍生名各占一段，与后端的落盘、队列与版本口径一致。 */
@@ -146,18 +268,6 @@ function versionsResourcePath(projectName: string, resourceType: string, resourc
   return `${base}/${encodeURIComponent(resourceType)}/${encodeURIComponent(resourceId)}`;
 }
 
-function referenceRequestQuery(
-  options: ReferenceRequestOptions,
-  initial?: Record<string, string>,
-): string {
-  const query = new URLSearchParams(initial);
-  if (options.narration_delivery) {
-    query.set("narration_delivery", options.narration_delivery);
-  }
-  const serialized = query.toString();
-  return serialized ? `?${serialized}` : "";
-}
-
 function presentationEndpoint(
   projectName: string,
   resourceType: PresentationResourceType,
@@ -169,325 +279,6 @@ function presentationEndpoint(
   if (options.videoVersion !== undefined) query.set("video_version", String(options.videoVersion));
   if (options.audioVersion !== undefined) query.set("audio_version", String(options.audioVersion));
   return `/projects/${encodeURIComponent(projectName)}/presentations/${resourceType}/${encodeURIComponent(resourceId)}${suffix}?${query.toString()}`;
-}
-
-/** 资产级联重命名的影响报告（dry_run 预览与执行同一结构）。 */
-export interface AssetRenameResult {
-  success: boolean;
-  dry_run: boolean;
-  old_name: string;
-  new_name: string;
-  episodes: number;
-  references: number;
-  files: number;
-}
-
-/** Login response from POST /auth/token (mirrors backend TokenResponse). */
-export interface LoginResponse {
-  access_token: string;
-  token_type: string;
-}
-
-/** Standard error response body from backend (mirrors FastAPI HTTPException detail). */
-export interface ErrorResponse {
-  /** 后端附加的诊断或修复信息；调用方可按请求语境解析，永不并进 detail 摘要。 */
-  diagnostic?: unknown;
-  detail:
-    | string
-    | { msg?: string }[]
-    | AgentFailureDetail
-    | SpeechAdmission
-    | ScriptEditResult
-    | ReferenceProjectionAdmission
-    | NarratedVideoDurationAdmission;
-}
-
-export interface SpeechAdmissionLocation {
-  path: (string | number)[];
-  line: number | null;
-}
-
-export interface SpeechAdmissionProblem {
-  code: "mixed_speech" | "needs_replan" | "parse_failed" | "empty_speaker";
-  unit_id: string;
-  locations: SpeechAdmissionLocation[];
-  reason: string;
-  action: string;
-}
-
-export interface SpeechAdmission {
-  allowed: false;
-  unit_id: string;
-  mode: null;
-  problems: SpeechAdmissionProblem[];
-}
-
-export type ScriptEditOperation =
-  | { op: "update"; id: string; fields: Record<string, unknown> }
-  | { op: "insert_after"; after_id: string | null; item: Record<string, unknown> }
-  | { op: "move_after"; id: string; after_id: string | null }
-  | { op: "remove"; id: string };
-
-export interface ScriptEditCommand {
-  script?: string;
-  episode?: number;
-  expected_revision: string;
-  operations: ScriptEditOperation[];
-}
-
-export interface ScriptEditProblem {
-  code: string;
-  operation_index: number | null;
-  unit_id: string | null;
-  locations: SpeechAdmissionLocation[];
-  reason: string;
-  next_action: string;
-}
-
-export interface ScriptEditResult {
-  success: boolean;
-  script: string;
-  episode: number | null;
-  before_revision: string;
-  revision: string;
-  affected_ids: string[];
-  problems: ScriptEditProblem[];
-}
-
-export class ScriptEditCommandError extends Error {
-  readonly code = "script_edit_rejected" as const;
-
-  constructor(public readonly result: ScriptEditResult) {
-    super(formatScriptEditResult(result));
-    this.name = "ScriptEditCommandError";
-  }
-}
-
-export interface EpisodeScriptSnapshot {
-  script: EpisodeScript;
-  revision: string;
-}
-
-/** Preserves the structured speech blocker for UI actions and diagnostics. */
-export class SpeechAdmissionError extends Error {
-  readonly code = "speech_admission_blocked" as const;
-
-  constructor(public readonly admission: SpeechAdmission) {
-    super(formatSpeechAdmission(admission));
-    this.name = "SpeechAdmissionError";
-  }
-}
-
-/** Preserves reference request blockers so the UI can show a repair action. */
-/**
- * 请求失败的通用错误：`message` 是后端给出的产品语言摘要，可直接展示给使用者；
- * `diagnostic` 是可选的诊断或修复信息，由调用方按请求语境解析，不拼进 `message`。
- */
-export class ApiRequestError extends Error {
-  constructor(
-    message: string,
-    public readonly diagnostic?: unknown,
-    /** HTTP 状态码；调用方据此区分「资源已不存在」与瞬时网络/服务错误。 */
-    public readonly status?: number,
-  ) {
-    super(message);
-    this.name = "ApiRequestError";
-  }
-}
-
-export class ReferenceProjectionError extends Error {
-  readonly code = "reference_request_projection_blocked" as const;
-
-  constructor(public readonly projection: ReferenceProjectionAdmission) {
-    const firstBlocking = projection.problems.find(({ blocking }) => blocking);
-    super(firstBlocking?.message || firstBlocking?.code || "reference_request_projection_blocked");
-    this.name = "ReferenceProjectionError";
-  }
-}
-
-/** Preserves current TTS/duration blockers so callers can perform an exact-tier retry. */
-export class NarratedVideoDurationError extends Error {
-  readonly code = "narrated_video_duration_blocked" as const;
-
-  constructor(public readonly admission: NarratedVideoDurationAdmission) {
-    const firstBlocking = admission.problems.find(({ blocking }) => blocking);
-    super(firstBlocking?.message || firstBlocking?.code || "narrated_video_duration_blocked");
-    this.name = "NarratedVideoDurationError";
-  }
-}
-
-/** Structured detail returned when the local Agent process cannot start. */
-export interface AgentFailureDetail {
-  code: "agent_startup_failed";
-  message: string;
-  failure: FailureObservation;
-}
-
-/** Keeps the redacted failure observation attached while remaining a normal Error. */
-export class AgentFailureError extends Error {
-  readonly code = "agent_startup_failed" as const;
-
-  constructor(
-    message: string,
-    public readonly failure: FailureObservation,
-  ) {
-    super(message);
-    this.name = "AgentFailureError";
-  }
-}
-
-/**
- * Error thrown when uploading a source file conflicts with an existing file
- * (HTTP 409). Carries the existing filename and a server-suggested alternative
- * so callers can prompt the user to retry with `on_conflict=rename|replace`.
- */
-export class ConflictError extends Error {
-  constructor(
-    public readonly existing: string,
-    public readonly suggestedName: string,
-    message: string
-  ) {
-    super(message);
-    this.name = "ConflictError";
-  }
-}
-
-/** Error payload from the import project endpoint (extends ErrorResponse with import-specific fields). */
-interface ImportErrorPayload {
-  detail?: string | { msg?: string }[];
-  errors?: string[];
-  warnings?: string[];
-  conflict_project_name?: string;
-  diagnostics?: unknown;
-}
-
-/** Version metadata returned by the versions API. */
-export interface VersionInfo {
-  version: number;
-  filename: string;
-  created_at: string;
-  file_size: number;
-  is_current: boolean;
-  /** Whether this history record carries verified provenance for restore. */
-  restorable?: boolean;
-  /** Whether the shared presentation reader can preview/export this video version. */
-  presentation_available?: boolean;
-  file_url?: string;
-  prompt?: string;
-  restored_from?: number;
-  /** 版本来源标记；"manual_upload" 表示用户手动上传 */
-  source?: string;
-}
-
-/** 分镜/视频单元媒体上传的统一响应。 */
-export interface ShotUploadResult {
-  success: boolean;
-  path: string;
-  version: number;
-  asset_fingerprints: Record<string, number>;
-}
-
-export interface ProjectEventStreamOptions {
-  projectName: string;
-  /** 每次建连（含断线重建）后服务端都会先发一次 snapshot。 */
-  onSnapshot?: (payload: ProjectEventSnapshotPayload) => void;
-  onChanges?: (payload: ProjectChangeBatchPayload) => void;
-  /** 项目目录被删除后收到一次，随后服务端正常关流；订阅方应在此关闭句柄以停止自动重建。 */
-  onProjectDeleted?: (payload: ProjectDeletedPayload) => void;
-  /** 连接失败或中断；`retryable` 为 true 时客户端随后自动重建。 */
-  onError?: (error: SseStreamError) => void;
-}
-
-export interface AssistantEntriesStreamOptions {
-  projectName: string;
-  sessionId: string;
-  /** 冷订阅游标（seq）；断线重建的续传由 `Last-Event-ID` 承担。 */
-  after?: number;
-  onEvent: (event: string, payload: Record<string, unknown>) => void;
-  onError?: (error: SseStreamError) => void;
-}
-
-/** Filters for {@link API.listTasks} and {@link API.listProjectTasks}. */
-export interface TaskListFilters {
-  projectName?: string;
-  status?: string;
-  taskType?: string;
-  source?: string;
-  page?: number;
-  pageSize?: number;
-}
-
-/** {@link API.getUsageRecords} 的筛选；数组维度在查询串里逗号分隔。 */
-export interface UsageRecordsQuery {
-  /** 空串筛选端点试跑记录，`undefined` 表示不按项目筛。 */
-  projectName?: string;
-  providers?: readonly string[];
-  models?: readonly string[];
-  mediaTypes?: readonly string[];
-  statuses?: readonly string[];
-  segmentIds?: readonly string[];
-  /** ISO 8601 时刻，半开区间 [since, until)，作用于 started_at。 */
-  since?: string;
-  until?: string;
-  limit?: number;
-  /** 上一页返回的不透明游标。 */
-  cursor?: string;
-}
-
-/** {@link API.getUsageSummary} 的筛选；不收状态，pending 不进聚合。 */
-export interface UsageSummaryQuery {
-  /** 空串筛选端点试跑记录，`undefined` 表示不按项目筛。 */
-  projectName?: string;
-  provider?: string;
-  model?: string;
-  mediaType?: string;
-  since?: string;
-  until?: string;
-  /** IANA 时区名，按此切天；缺省 UTC。 */
-  tz?: string;
-}
-
-/** Generic success response used by many endpoints. */
-export interface SuccessResponse {
-  success: boolean;
-  message?: string;
-}
-
-export interface AgentProfileStatus {
-  customized: boolean;
-  customized_files: string[];
-}
-
-/** Payload for {@link API.createProject}. */
-export interface CreateProjectPayload {
-  title: string;
-  name?: string;
-  content_mode?: "narration" | "drama" | "ad";
-  /** 源文件性质：novel（默认）/ screenplay。仅 drama 暴露，创建即定、不可变。 */
-  source_kind?: "novel" | "screenplay";
-  aspect_ratio?: "9:16" | "16:9";
-  /** 生成模式，创建时必填二选一、无默认值（后端缺失即 422）。 */
-  generation_mode: GenerationRoute;
-  /** 多宫格分镜装配开关，可随创建写入；仅分镜图生视频有意义。 */
-  grid_storyboard?: boolean;
-  /** 口播语速估算（阅读单位 / 秒）；留空即按项目语言的默认速度估算。 */
-  speech_rate_units_per_second?: number | null;
-  default_duration?: number | null;
-  /** 单集目标时长（秒）；未设即不传。ad 项目服务端拒绝该字段。 */
-  episode_target_duration?: number | null;
-  /** 仅 ad：目标总时长（秒），UI 四档 15/30/60/90。 */
-  target_duration?: number;
-  /** 仅 ad：创作诉求短文本（可空）。 */
-  brief?: string | null;
-  style_template_id?: string | null;
-  video_backend?: string | null;
-  image_backend?: string | null;
-  /** 项目默认图片模型。创建向导只暴露默认层（docs/adr/0054），任务类型桶留给项目设置页。 */
-  default_image_backend?: string | null;
-  text_backend_simple?: string | null;
-  text_backend_complex?: string | null;
-  default_text_backend?: string | null;
-  model_settings?: Record<string, { resolution?: string | null }>;
 }
 
 function normalizeDiagnosticsBucket(value: unknown): { code: string; message: string; location?: string }[] {
@@ -527,353 +318,6 @@ function normalizeExportDiagnostics(value: unknown): ExportDiagnostics {
   };
 }
 
-// ==================== API class ====================
-
-const API_BASE = "/api/v1";
-
-/**
- * 从后端 detail 中取一句可读的说明。
- *
- * 后端把 `{ code, message, ... }` 这样的信封当 detail 抛出的场合（如批量入队中途失败后的
- * 撤销结果），只按字符串与数组取字会把已翻译的说明整段丢掉，用户只收到一句「请求失败」。
- */
-function messageFromDetail(detail: unknown, fallback: string): string {
-  if (typeof detail === "string") return detail || fallback;
-  if (Array.isArray(detail) && detail.length > 0) {
-    return (
-      detail
-        .map((e) => (typeof e === "string" ? e : (e as { msg?: string } | null)?.msg))
-        .filter(Boolean)
-        .join("; ") || fallback
-    );
-  }
-  if (detail && typeof detail === "object") {
-    const message = (detail as { message?: unknown }).message;
-    if (typeof message === "string" && message) return message;
-  }
-  return fallback;
-}
-
-/**
- * 检查 fetch 响应状态，抛出包含后端错误信息的 Error。
- * 用于不经过 API.request() 的自定义 fetch 调用。
- */
-async function throwIfNotOk(response: Response, fallbackMsg: string): Promise<void> {
-  if (!response.ok) {
-    handleUnauthorized(response);
-    const error = await response
-      .json()
-      .catch(() => ({ detail: response.statusText })) as ErrorResponse;
-    const detail = error.detail;
-    if (isReferenceProjectionAdmission(detail)) {
-      throw new ReferenceProjectionError(detail);
-    }
-    if (isNarratedVideoDurationAdmission(detail)) {
-      throw new NarratedVideoDurationError(detail);
-    }
-    if (isSpeechAdmission(detail)) {
-      throw new SpeechAdmissionError(detail);
-    }
-    throw new ApiRequestError(messageFromDetail(detail, fallbackMsg), error.diagnostic, response.status);
-  }
-}
-
-function handleUnauthorized(response: Response): void {
-  if (response.status !== 401) return;
-  redirectToLogin();
-  throw new Error("认证已过期，请重新登录");
-}
-
-function redirectToLogin(): void {
-  clearToken();
-  // 携带当前所在的站内地址，登录成功后回跳；仅对 /app/ 下的页面附加 from，
-  // 避免把登录页自身等非应用路径写进回跳参数。
-  const current = `${globalThis.location.pathname}${globalThis.location.search}${globalThis.location.hash}`;
-  globalThis.location.href = current.startsWith("/app/")
-    ? `/login?from=${encodeURIComponent(current)}`
-    : "/login";
-}
-
-function isAgentFailureDetail(value: unknown): value is AgentFailureDetail {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
-  const detail = value as Record<string, unknown>;
-  return (
-    detail.code === "agent_startup_failed"
-    && typeof detail.message === "string"
-    && Boolean(detail.failure)
-    && typeof detail.failure === "object"
-    && !Array.isArray(detail.failure)
-  );
-}
-
-function isSpeechAdmission(value: unknown): value is SpeechAdmission {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
-  const detail = value as Record<string, unknown>;
-  return (
-    detail.allowed === false
-    && typeof detail.unit_id === "string"
-    && detail.mode === null
-    && Array.isArray(detail.problems)
-    && detail.problems.length > 0
-    && detail.problems.every((problem) => {
-      if (!problem || typeof problem !== "object" || Array.isArray(problem)) return false;
-      const entry = problem as Record<string, unknown>;
-      return (
-        ["mixed_speech", "needs_replan", "parse_failed", "empty_speaker"].includes(String(entry.code))
-        && typeof entry.unit_id === "string"
-        && Array.isArray(entry.locations)
-        && entry.locations.every((location) => {
-          if (!location || typeof location !== "object" || Array.isArray(location)) return false;
-          const field = location as Record<string, unknown>;
-          return (
-            Array.isArray(field.path)
-            && field.path.every((part) => typeof part === "string" || typeof part === "number")
-            && (field.line === null || typeof field.line === "number")
-          );
-        })
-        && typeof entry.reason === "string"
-        && typeof entry.action === "string"
-      );
-    })
-  );
-}
-
-function isScriptEditResult(value: unknown): value is ScriptEditResult {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
-  const result = value as Record<string, unknown>;
-  return (
-    result.success === false
-    && typeof result.script === "string"
-    && typeof result.revision === "string"
-    && Array.isArray(result.problems)
-    && result.problems.length > 0
-  );
-}
-
-function isReferenceProjectionAdmission(value: unknown): value is ReferenceProjectionAdmission {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
-  const detail = value as Record<string, unknown>;
-  return (
-    detail.allowed === false
-    && detail.kind === "reference_request_projection"
-    && typeof detail.unit_id === "string"
-    && Array.isArray(detail.problems)
-    && detail.problems.length > 0
-    && detail.problems.every((problem) => {
-      if (!problem || typeof problem !== "object" || Array.isArray(problem)) return false;
-      const entry = problem as Record<string, unknown>;
-      return (
-        typeof entry.code === "string"
-        && typeof entry.blocking === "boolean"
-        && typeof entry.unit_id === "string"
-        && Array.isArray(entry.locations)
-        && entry.locations.every((location) => {
-          if (!location || typeof location !== "object" || Array.isArray(location)) return false;
-          const field = location as Record<string, unknown>;
-          return (
-            Array.isArray(field.path)
-            && field.path.every((part) => typeof part === "string" || typeof part === "number")
-            && (field.line === null || typeof field.line === "number")
-          );
-        })
-        && Boolean(entry.params)
-        && typeof entry.params === "object"
-        && !Array.isArray(entry.params)
-        && typeof entry.action === "string"
-        && (entry.message === undefined || typeof entry.message === "string")
-      );
-    })
-  );
-}
-
-function isNarratedVideoDurationAdmission(value: unknown): value is NarratedVideoDurationAdmission {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
-  const detail = value as Record<string, unknown>;
-  return (
-    detail.allowed === false
-    && detail.kind === "narrated_video_duration"
-    && typeof detail.unit_id === "string"
-    && typeof detail.narration_delivery === "object"
-    && detail.narration_delivery !== null
-    && !Array.isArray(detail.narration_delivery)
-    && typeof detail.planned_duration === "number"
-    && typeof detail.duration_input === "number"
-    && (detail.request_duration === null || typeof detail.request_duration === "number")
-    && (
-      detail.adjustment === null
-      || detail.adjustment === "exact"
-      || detail.adjustment === "up"
-      || detail.adjustment === "down"
-    )
-    && Array.isArray(detail.problems)
-    && detail.problems.length > 0
-    && detail.problems.every((problem) => {
-      if (!problem || typeof problem !== "object" || Array.isArray(problem)) return false;
-      const entry = problem as Record<string, unknown>;
-      return (
-        typeof entry.code === "string"
-        && typeof entry.blocking === "boolean"
-        && typeof entry.unit_id === "string"
-        && Array.isArray(entry.locations)
-        && Boolean(entry.params)
-        && typeof entry.params === "object"
-        && !Array.isArray(entry.params)
-        && typeof entry.action === "string"
-        && (entry.message === undefined || typeof entry.message === "string")
-      );
-    })
-  );
-}
-
-function formatSpeechAdmission(admission: SpeechAdmission): string {
-  const problem = admission.problems.find(({ code }) => code !== "needs_replan") ?? admission.problems[0];
-  const location = problem.locations
-    .map(({ path, line }) => `${path.join(".")}${line === null ? "" : `:${line + 1}`}`)
-    .join(", ");
-  const key = {
-    mixed_speech: "speech_admission_mixed_speech",
-    needs_replan: "speech_admission_needs_replan",
-    parse_failed: "speech_admission_parse_failed",
-    empty_speaker: "speech_admission_empty_speaker",
-  }[problem.code];
-  return i18n.t(`dashboard:${key}`, { unitId: problem.unit_id, location });
-}
-
-function formatScriptEditResult(result: ScriptEditResult): string {
-  const first = result.problems[0];
-  if (!first) return i18n.t("dashboard:script_edit_rejected");
-  const speechCodes: SpeechAdmissionProblem["code"][] = [
-    "mixed_speech",
-    "needs_replan",
-    "parse_failed",
-    "empty_speaker",
-  ];
-  if (speechCodes.includes(first.code as SpeechAdmissionProblem["code"]) && first.unit_id !== null) {
-    const unitId = first.unit_id;
-    const problems = result.problems
-      .filter(({ code, unit_id }) => (
-        unit_id === unitId && speechCodes.includes(code as SpeechAdmissionProblem["code"])
-      ))
-      .map((problem) => ({
-        code: problem.code as SpeechAdmissionProblem["code"],
-        unit_id: problem.unit_id ?? unitId,
-        locations: problem.locations,
-        reason: problem.reason,
-        action: problem.next_action,
-      }));
-    return formatSpeechAdmission({ allowed: false, unit_id: unitId, mode: null, problems });
-  }
-  const key = {
-    revision_conflict: "script_edit_revision_conflict",
-    operation_invalid: "script_edit_operation_invalid",
-    schema_invalid: "script_edit_schema_invalid",
-    references_invalid: "script_edit_references_invalid",
-    manifest_invalid: "script_edit_manifest_invalid",
-    commit_failed: "script_edit_commit_failed",
-  }[first.code] ?? "script_edit_rejected";
-  return i18n.t(`dashboard:${key}`);
-}
-
-/** 为 fetch options 注入 Authorization header */
-let apiReadOnly = false;
-
-/**
- * 进入 / 离开只读态（引导演示工作台）。只读期间任何非 GET / HEAD 请求会在发出前被拒绝。
- *
- * 演示工作台是用真组件渲染假数据，写操作的入口都已经不渲染；这道闸门是结构性兜底 ——
- * 漏掉一个入口时会得到一个明确的异常，而不是一条真写进用户项目的请求。
- */
-export function setApiReadOnly(readOnly: boolean): void {
-  apiReadOnly = readOnly;
-}
-
-export class ReadOnlyModeError extends Error {
-  constructor(method: string) {
-    super(`Blocked ${method} request: the workspace is in read-only demo mode`);
-    this.name = "ReadOnlyModeError";
-  }
-}
-
-// 静态归档导入端点，不是「项目名恰好叫 import」——项目名允许字母数字中划线，
-// `import` 本身是合法项目名（ProjectManager.normalize_project_name 不排除它），
-// 按精确路径匹配而非按名称黑名单，避免把 `/projects/import/...`（真实项目名为
-// import 的写请求）一并误判成不带项目归属
-const RESERVED_PROJECT_ENDPOINTS = new Set(["/projects/import"]);
-
-// 不带项目归属、但本身不写入任何项目数据的系统级端点：闸门默认拦截所有无项目归属的
-// 写请求（全局资产库、供应商凭证等），这里是唯一的窄豁免。引导 tour 退出时会在仍处于
-// 演示路由（apiReadOnly 尚未复位）期间写这一条「已看过」标记，它只影响当前用户的引导
-// 状态，不属于闸门要防的「误写演示态/其他项目数据」范畴。
-const READ_ONLY_GATE_EXEMPT_ENDPOINTS = new Set(["/onboarding/seen"]);
-
-/** 从形如 `/projects/{name}` 或 `/projects/{name}/...` 的 endpoint 中取出项目名；非项目路径或静态保留端点返回 null */
-function extractProjectName(endpoint: string): string | null {
-  if (RESERVED_PROJECT_ENDPOINTS.has(endpoint)) return null;
-  const match = /^\/projects\/([^/?]+)/.exec(endpoint);
-  if (!match) return null;
-  return decodeURIComponent(match[1]);
-}
-
-/**
- * 只读闸门是否应拦截这次请求。指向某个具体真实项目的写请求放行 ——
- * 演示态可能在该请求发出前才切入，但它拦不住已经从真实项目发起的操作；
- * 指向演示项目本身或不带项目归属的请求（全局资产库等）仍按闸门原意拦截，
- * 窄豁免名单中的系统端点除外。
- */
-function isReadOnlyGateBlocking(endpoint: string): boolean {
-  if (!apiReadOnly) return false;
-  if (READ_ONLY_GATE_EXEMPT_ENDPOINTS.has(endpoint)) return false;
-  const projectName = extractProjectName(endpoint);
-  return projectName === null || isDemoProject(projectName);
-}
-
-function withAuth(endpoint: string, options: RequestInit = {}): RequestInit {
-  const method = (options.method ?? "GET").toUpperCase();
-  if (method !== "GET" && method !== "HEAD" && isReadOnlyGateBlocking(endpoint)) {
-    throw new ReadOnlyModeError(method);
-  }
-  const token = getToken();
-  const headers = new Headers(options.headers);
-  if (token) {
-    headers.set("Authorization", `Bearer ${token}`);
-  }
-  // Add Accept-Language header based on current i18n language
-  headers.set("Accept-Language", i18n.language || "zh");
-  return { ...options, headers };
-}
-
-/** SSE 建连请求头：与 {@link withAuth} 同一套凭证与语言，每次重建前重新取。 */
-function sseHeaders(): HeadersInit {
-  const headers: Record<string, string> = { "Accept-Language": i18n.language || "zh" };
-  const token = getToken();
-  if (token) {
-    headers.Authorization = `Bearer ${token}`;
-  }
-  return headers;
-}
-
-function parseSseJson(data: string, label: string): Record<string, unknown> | null {
-  try {
-    const parsed: unknown = JSON.parse(data || "{}");
-    return parsed && typeof parsed === "object" && !Array.isArray(parsed)
-      ? (parsed as Record<string, unknown>)
-      : null;
-  } catch (err) {
-    console.error(`解析${label} SSE 数据失败:`, err, data);
-    return null;
-  }
-}
-
-/** 事件流被服务端以 401 拒绝时与普通请求同样处理：清凭证并回登录页。 */
-function sseErrorHandler(onError?: (error: SseStreamError) => void) {
-  return (error: SseStreamError) => {
-    if (error.status === 401) {
-      redirectToLogin();
-    }
-    onError?.(error);
-  };
-}
-
 function endpointTestRequest(
   body: unknown,
   assets: EndpointTestAssets = {},
@@ -887,14 +331,6 @@ function endpointTestRequest(
   form.append("payload", JSON.stringify(body));
   for (const [source, file] of files) form.append(source, file);
   return { method: "POST", headers: {}, body: form, signal };
-}
-
-export interface VideoCapabilitiesQuery {
-  signal?: AbortSignal;
-  videoBackend?: string;
-  /** undefined = 服务端按项目已保存档位；null = 显式「自动」（发空串）；字符串 = 按该档位。 */
-  resolution?: string | null;
-  usesReferenceImages?: boolean;
 }
 
 function videoCapabilitiesQuery(options: VideoCapabilitiesQuery): string {
@@ -914,6 +350,8 @@ function agentMemoryBase(scope: AgentMemoryScope): string {
     : `/projects/${encodeURIComponent(scope.projectName)}/agent-memory`;
 }
 
+// ==================== API class ====================
+
 class API {
   /**
    * 通用请求方法
@@ -922,52 +360,13 @@ class API {
     endpoint: string,
     options: RequestInit = {}
   ): Promise<T> {
-    const url = `${API_BASE}${endpoint}`;
-    const defaultOptions: RequestInit = {
-      headers: {
-        "Content-Type": "application/json",
-      },
-    };
-
-    const response = await fetch(url, withAuth(endpoint, { ...defaultOptions, ...options }));
-
-    if (!response.ok) {
-      handleUnauthorized(response);
-      const payload = await response
-        .json()
-        .catch(() => ({ detail: response.statusText })) as unknown;
-      if (isScriptEditResult(payload)) {
-        throw new ScriptEditCommandError(payload);
-      }
-      const error = payload as ErrorResponse;
-      if (isScriptEditResult(error.detail)) {
-        throw new ScriptEditCommandError(error.detail);
-      }
-      if (isAgentFailureDetail(error.detail)) {
-        throw new AgentFailureError(error.detail.message, error.detail.failure);
-      }
-      if (isReferenceProjectionAdmission(error.detail)) {
-        throw new ReferenceProjectionError(error.detail);
-      }
-      if (isNarratedVideoDurationAdmission(error.detail)) {
-        throw new NarratedVideoDurationError(error.detail);
-      }
-      if (isSpeechAdmission(error.detail)) {
-        throw new SpeechAdmissionError(error.detail);
-      }
-      throw new ApiRequestError(messageFromDetail(error.detail, "请求失败"), error.diagnostic, response.status);
-    }
-
-    if (response.status === 204) {
-      return undefined as T;
-    }
-    return response.json() as Promise<T>;
+    return requestJson<T>(endpoint, options);
   }
 
   // ==================== 系统配置 ====================
 
-  static async getSystemConfig(): Promise<GetSystemConfigResponse> {
-    return this.request("/system/config");
+  static async getSystemConfig(options: { signal?: AbortSignal } = {}): Promise<GetSystemConfigResponse> {
+    return this.request("/system/config", { signal: options.signal });
   }
 
   /**
@@ -978,6 +377,23 @@ class API {
     options: { signal?: AbortSignal } = {}
   ): Promise<ModelCandidatesResponse> {
     return this.request("/system/config/model-candidates", { signal: options.signal });
+  }
+
+  /** 新建 TTS 项目的预填值（全局默认的 TTS 模型、音色与语速）。 */
+  static async getNarrationDefaults(
+    options: { signal?: AbortSignal } = {},
+  ): Promise<NarrationDefaultsResponse> {
+    return this.request("/system/narration-defaults", { signal: options.signal });
+  }
+
+  /** 所选 TTS 模型（provider/model）的能力，目前只回答是否支持配音语速。 */
+  static async getTtsModelCapabilities(
+    backend: string,
+    options: { signal?: AbortSignal } = {},
+  ): Promise<TtsModelCapabilitiesResponse> {
+    return this.request(`/system/tts-model-capabilities?backend=${encodeURIComponent(backend)}`, {
+      signal: options.signal,
+    });
   }
 
   static async getSystemVersion(): Promise<GetSystemVersionResponse> {
@@ -999,6 +415,15 @@ class API {
   ): Promise<PromptTemplateDetail> {
     const path = templateId.split("/").map(encodeURIComponent).join("/");
     return this.request(`/prompt-templates/${path}`, { signal: options.signal });
+  }
+
+  /** 片段名同样按 `/` 分层，编码方式与模版 id 一致。 */
+  static async getPromptPartial(
+    name: string,
+    options: { signal?: AbortSignal } = {}
+  ): Promise<PromptTemplatePartial> {
+    const path = name.split("/").map(encodeURIComponent).join("/");
+    return this.request(`/prompt-templates/partials/${path}`, { signal: options.signal });
   }
 
   // ==================== 首次使用引导 ====================
@@ -1035,11 +460,10 @@ class API {
     });
   }
 
-
   // ==================== 项目管理 ====================
 
-  static async listProjects(): Promise<{ projects: ProjectSummary[] }> {
-    return this.request("/projects");
+  static async listProjects(options: { signal?: AbortSignal } = {}): Promise<{ projects: ProjectSummary[] }> {
+    return this.request("/projects", { signal: options.signal });
   }
 
   static async createProject(
@@ -1067,7 +491,7 @@ class API {
     updates: Partial<ProjectData> & { clear_style_image?: boolean }
   ): Promise<{ success: boolean; project: ProjectData }> {
     if ("content_mode" in updates) {
-      throw new Error("项目创建后不支持修改 content_mode");
+      throw new Error(i18n.t("errors:content_mode_immutable"));
     }
     return this.request(`/projects/${encodeURIComponent(name)}`, {
       method: "PATCH",
@@ -1075,8 +499,11 @@ class API {
     });
   }
 
-  static async getAgentProfileStatus(name: string): Promise<AgentProfileStatus> {
-    return this.request(`/projects/${encodeURIComponent(name)}/agent-profile`);
+  static async getAgentProfileStatus(
+    name: string,
+    options: { signal?: AbortSignal } = {}
+  ): Promise<AgentProfileStatus> {
+    return this.request(`/projects/${encodeURIComponent(name)}/agent-profile`, { signal: options.signal });
   }
 
   static async resetAgentProfile(name: string): Promise<AgentProfileStatus> {
@@ -1106,7 +533,7 @@ class API {
   ): Promise<string> {
     const url = `${agentMemoryBase(scope)}/files/${encodeURIComponent(filename)}`;
     const response = await fetch(`${API_BASE}${url}`, withAuth(url, { signal: options.signal }));
-    await throwIfNotOk(response, "获取记忆文件失败");
+    await throwIfNotOk(response, i18n.t("errors:memory_file_load_failed"));
     return response.text();
   }
 
@@ -1125,7 +552,7 @@ class API {
         body: content,
       })
     );
-    await throwIfNotOk(response, "保存记忆文件失败");
+    await throwIfNotOk(response, i18n.t("errors:memory_file_save_failed"));
     return response.json() as Promise<{ name: string }>;
   }
 
@@ -1203,16 +630,87 @@ class API {
     return `${API_BASE}/projects/${encodeURIComponent(projectName)}/export?download_token=${encodeURIComponent(downloadToken)}&scope=${encodeURIComponent(scope)}`;
   }
 
-  /** 构造剪映草稿下载 URL */
+  // ==================== 剪辑时间线与出片 ====================
+
+  /** 按当前脚本机械新建一条剪辑时间线（整段使用、全部硬切）；显示名在集内重名时 409，本集没有可用视频时 422。 */
+  static async createEditTimeline(projectName: string, episode: number, name: string): Promise<EditTimelineReadout> {
+    return this.request(`/projects/${encodeURIComponent(projectName)}/episodes/${episode}/edit-timelines`, {
+      method: "POST",
+      body: JSON.stringify({ from: "script", name }),
+    });
+  }
+
+  private static editTimelinePath(projectName: string, timelineId: string): string {
+    return `/projects/${encodeURIComponent(projectName)}/edit-timelines/${encodeURIComponent(timelineId)}`;
+  }
+
+  /** 成片现状；旁白版本省略时按项目默认，字幕省略时烧入。 */
+  static async getFinalCutStatus(
+    projectName: string,
+    timelineId: string,
+    options: { narration?: TimelineNarration; subtitles?: SubtitleMode; signal?: AbortSignal } = {}
+  ): Promise<FinalCutStatus> {
+    const query = new URLSearchParams();
+    if (options.narration) query.set("narration", options.narration);
+    if (options.subtitles) query.set("subtitles", options.subtitles);
+    const suffix = query.toString() ? `?${query.toString()}` : "";
+    return this.request(`${this.editTimelinePath(projectName, timelineId)}/final-cut${suffix}`, {
+      signal: options.signal,
+    });
+  }
+
+  /** 入队渲染成片（最新修订）。组件经 actions/render 调用。 */
+  static async renderFinalCut(
+    projectName: string,
+    timelineId: string,
+    options: Partial<RenderOptions> = {}
+  ): Promise<RenderSubmission> {
+    return this.request(`${this.editTimelinePath(projectName, timelineId)}/final-cut`, {
+      method: "POST",
+      body: JSON.stringify(options),
+    });
+  }
+
+  /** 剪映草稿现状；旁白版本省略时按项目默认。 */
+  static async getJianyingDraftStatus(
+    projectName: string,
+    timelineId: string,
+    options: { narration?: TimelineNarration; signal?: AbortSignal } = {}
+  ): Promise<JianyingDraftStatus> {
+    const suffix = options.narration ? `?${new URLSearchParams({ narration: options.narration }).toString()}` : "";
+    return this.request(`${this.editTimelinePath(projectName, timelineId)}/jianying-draft${suffix}`, {
+      signal: options.signal,
+    });
+  }
+
+  /** 入队导出剪映草稿（最新修订，旁白版本省略时按项目默认）。组件经 actions/render 调用。 */
+  static async exportJianyingDraft(
+    projectName: string,
+    timelineId: string,
+    options: { narration?: TimelineNarration } = {}
+  ): Promise<RenderSubmission> {
+    return this.request(`${this.editTimelinePath(projectName, timelineId)}/jianying-draft`, {
+      method: "POST",
+      body: JSON.stringify(options),
+    });
+  }
+
+  /** 已登记剪映草稿的下载地址：本机草稿目录与剪映版本在下载时代入。 */
   static getJianyingDraftDownloadUrl(
     projectName: string,
-    episode: number,
+    timelineId: string,
     draftPath: string,
     downloadToken: string,
-    jianyingVersion: string = "6",
-    narrationDelivery: "post_production" | "use_tts" = "post_production",
+    jianyingVersion: JianyingVersion,
+    narration?: TimelineNarration
   ): string {
-    return `${API_BASE}/projects/${encodeURIComponent(projectName)}/export/jianying-draft?episode=${encodeURIComponent(episode)}&draft_path=${encodeURIComponent(draftPath)}&download_token=${encodeURIComponent(downloadToken)}&jianying_version=${encodeURIComponent(jianyingVersion)}&narration_delivery=${encodeURIComponent(narrationDelivery)}`;
+    const query = new URLSearchParams({
+      draft_path: draftPath,
+      download_token: downloadToken,
+      jianying_version: jianyingVersion,
+      ...(narration ? { narration } : {}),
+    });
+    return `${API_BASE}${this.editTimelinePath(projectName, timelineId)}/jianying-draft/download?${query.toString()}`;
   }
 
   static async getPresentation(
@@ -1239,6 +737,67 @@ class API {
     return { blob: await response.blob(), filename };
   }
 
+  /** 一集的剪辑时间线列表，按创建顺序排列。 */
+  static async listEditTimelines(
+    projectName: string,
+    episode: number,
+    options: { signal?: AbortSignal } = {},
+  ): Promise<{ timelines: EditTimelineSummary[] }> {
+    return this.request(
+      `/projects/${encodeURIComponent(projectName)}/edit-timelines?episode=${episode}`,
+      { signal: options.signal },
+    );
+  }
+
+  /** 剪辑时间线最新修订的读取结果。 */
+  static async getEditTimeline(
+    projectName: string,
+    timelineId: string,
+    options: { signal?: AbortSignal } = {},
+  ): Promise<EditTimelineReadout> {
+    return this.request(
+      this.editTimelinePath(projectName, timelineId),
+      { signal: options.signal },
+    );
+  }
+
+  /** 重命名剪辑时间线：只改显示名，不产生修订。 */
+  static async renameEditTimeline(
+    projectName: string,
+    timelineId: string,
+    name: string,
+  ): Promise<EditTimelineSummary> {
+    return this.request(
+      this.editTimelinePath(projectName, timelineId),
+      { method: "PATCH", body: JSON.stringify({ name }) },
+    );
+  }
+
+  /** 删除剪辑时间线及其成片与剪映草稿；仍有渲染任务在排队或执行时服务端拒绝。 */
+  static async deleteEditTimeline(projectName: string, timelineId: string): Promise<void> {
+    await this.request(
+      this.editTimelinePath(projectName, timelineId),
+      { method: "DELETE" },
+    );
+  }
+
+  /** 剪辑时间线最新修订的预览素材层：各视频单元的旁白配音与字幕条目。 */
+  static async getEditTimelinePreviewMedia(
+    projectName: string,
+    timelineId: string,
+    options: { signal?: AbortSignal } = {},
+  ): Promise<EditTimelinePreviewMedia> {
+    return this.request(
+      `${this.editTimelinePath(projectName, timelineId)}/preview-media`,
+      { signal: options.signal },
+    );
+  }
+
+  /** 上传一首 BGM：服务端实测响度并登记为项目级素材，各集的剪辑时间线都能用。 */
+  static async uploadBgm(projectName: string, file: File): Promise<{ success: boolean; bgm: ProjectBgm }> {
+    return API.postFileUpload(`/projects/${encodeURIComponent(projectName)}/upload/bgm`, file);
+  }
+
   static async importProject(
     file: File,
     conflictPolicy: ImportConflictPolicy = "prompt"
@@ -1261,9 +820,8 @@ class API {
       const payload = await response
         .json()
         .catch(() => ({ detail: response.statusText, errors: [], warnings: [] })) as ImportErrorPayload;
-      const error = new Error(
-        typeof payload.detail === "string" ? payload.detail : "导入失败"
-      ) as Error & {
+      const detail = typeof payload.detail === "string" ? payload.detail : i18n.t("errors:import_failed");
+      const error = new Error(detail) as Error & {
         status?: number;
         detail?: string;
         errors?: string[];
@@ -1272,7 +830,7 @@ class API {
         diagnostics?: ImportFailureDiagnostics;
       };
       error.status = response.status;
-      error.detail = typeof payload.detail === "string" ? payload.detail : "导入失败";
+      error.detail = detail;
       error.errors = Array.isArray(payload.errors) ? payload.errors : [];
       error.warnings = Array.isArray(payload.warnings) ? payload.warnings : [];
       if (typeof payload.conflict_project_name === "string") {
@@ -1323,18 +881,6 @@ class API {
       {
         method: "PATCH",
         body: JSON.stringify(updates),
-      }
-    );
-  }
-
-  static async deleteCharacter(
-    projectName: string,
-    charName: string
-  ): Promise<SuccessResponse> {
-    return this.request(
-      `/projects/${encodeURIComponent(projectName)}/characters/${encodeURIComponent(charName)}`,
-      {
-        method: "DELETE",
       }
     );
   }
@@ -1430,6 +976,81 @@ class API {
     );
   }
 
+  // ==================== 资产图状态与批量生成 ====================
+
+  /** 项目里每张资产图（含衍生）按产物清单判定的状态与是否缺描述。 */
+  static async getAssetSheetStatus(
+    projectName: string,
+    options?: { signal?: AbortSignal }
+  ): Promise<{ assets: AssetSheetStatusRow[] }> {
+    return this.request(`/projects/${encodeURIComponent(projectName)}/asset-sheets/status`, {
+      signal: options?.signal,
+    });
+  }
+
+  /** 规划一批但不建任务：要生成的名单、跳过项与能算出时的预估费用。 */
+  static async previewAssetSheetBatch(
+    projectName: string,
+    scope: AssetSheetBatchScope,
+    options?: { signal?: AbortSignal }
+  ): Promise<AssetSheetBatchPreview> {
+    return this.request(`/projects/${encodeURIComponent(projectName)}/asset-sheets/batch/preview`, {
+      method: "POST",
+      body: JSON.stringify(scope),
+      signal: options?.signal,
+    });
+  }
+
+  /** 提交一批，立即返回成员任务；整批终态由调用方按任务跟踪。 */
+  static async submitAssetSheetBatch(
+    projectName: string,
+    scope: AssetSheetBatchScope
+  ): Promise<AssetSheetBatchSubmitted> {
+    return this.request(`/projects/${encodeURIComponent(projectName)}/asset-sheets/batch`, {
+      method: "POST",
+      body: JSON.stringify(scope),
+    });
+  }
+
+  /** 规划一集的分镜图或分镜视频批量但不建任务：名单、跳过项与能算出时的预估费用。 */
+  static async previewStoryboardBatch(
+    projectName: string,
+    episode: number,
+    kind: StoryboardBatchKind,
+    options: { signal?: AbortSignal } = {}
+  ): Promise<StoryboardBatchPreview> {
+    return this.request(
+      `/projects/${encodeURIComponent(projectName)}/episodes/${episode}/${kind}/batch/preview`,
+      { method: "POST", signal: options.signal }
+    );
+  }
+
+  /** 提交一集的分镜图或分镜视频批量；分镜视频整批准入未通过时不建任务，返回结论。 */
+  static async submitStoryboardBatch(
+    projectName: string,
+    episode: number,
+    kind: StoryboardBatchKind
+  ): Promise<StoryboardBatchSubmitted> {
+    return this.request(`/projects/${encodeURIComponent(projectName)}/episodes/${episode}/${kind}/batch`, {
+      method: "POST",
+    });
+  }
+
+  /** 重生这张资产图会让多少件现行产物转为过期。 */
+  static async getAssetRegenerationImpact(
+    projectName: string,
+    assetType: AssetSheetType,
+    name: string,
+    derivativeName?: string,
+    options?: { signal?: AbortSignal },
+  ): Promise<AssetRegenerationImpact> {
+    const query = derivativeName ? `?${new URLSearchParams({ derivative_name: derivativeName })}` : "";
+    return this.request(
+      `/projects/${encodeURIComponent(projectName)}/asset-sheets/${assetType}/${encodeURIComponent(name)}/regeneration-impact${query}`,
+      { signal: options?.signal },
+    );
+  }
+
   // ==================== 项目场景管理 ====================
 
   static async addProjectScene(
@@ -1456,18 +1077,6 @@ class API {
       {
         method: "PATCH",
         body: JSON.stringify(updates),
-      }
-    );
-  }
-
-  static async deleteProjectScene(
-    projectName: string,
-    sceneName: string
-  ): Promise<SuccessResponse> {
-    return this.request(
-      `/projects/${encodeURIComponent(projectName)}/scenes/${encodeURIComponent(sceneName)}`,
-      {
-        method: "DELETE",
       }
     );
   }
@@ -1502,31 +1111,25 @@ class API {
     );
   }
 
-  static async deleteProjectProp(
-    projectName: string,
-    propName: string
-  ): Promise<SuccessResponse> {
-    return this.request(
-      `/projects/${encodeURIComponent(projectName)}/props/${encodeURIComponent(propName)}`,
-      {
-        method: "DELETE",
-      }
-    );
-  }
-
   // ==================== 项目商品管理 ====================
 
   static async addProjectProduct(
     projectName: string,
     name: string,
     description: string,
-    brand?: string
+    brand?: string,
+    sellingPoints?: string[]
   ): Promise<SuccessResponse> {
     return this.request(
       `/projects/${encodeURIComponent(projectName)}/products`,
       {
         method: "POST",
-        body: JSON.stringify(brand ? { name, description, brand } : { name, description }),
+        body: JSON.stringify({
+          name,
+          description,
+          ...(brand ? { brand } : {}),
+          ...(sellingPoints?.length ? { selling_points: sellingPoints } : {}),
+        }),
       }
     );
   }
@@ -1541,18 +1144,6 @@ class API {
       {
         method: "PATCH",
         body: JSON.stringify(updates),
-      }
-    );
-  }
-
-  static async deleteProjectProduct(
-    projectName: string,
-    productName: string
-  ): Promise<SuccessResponse> {
-    return this.request(
-      `/projects/${encodeURIComponent(projectName)}/products/${encodeURIComponent(productName)}`,
-      {
-        method: "DELETE",
       }
     );
   }
@@ -1577,6 +1168,58 @@ class API {
         body: JSON.stringify({ new_name: newName, dry_run: options.dryRun ?? false }),
         signal: options.signal,
       }
+    );
+  }
+
+  /**
+   * 把项目内资产并入同类型的 `target`（只开放角色、场景、道具）。`dryRun: true` 只返回按集列出的
+   * 影响预览，预览与执行共用后端同一次扫描，确认框数字与实际执行一致。
+   */
+  static async mergeProjectAsset(
+    projectName: string,
+    assetType: MergeableAssetType,
+    name: string,
+    target: string,
+    options: { asDerivative?: boolean; dryRun?: boolean; signal?: AbortSignal } = {}
+  ): Promise<AssetMergeResult> {
+    return this.request(
+      `/projects/${encodeURIComponent(projectName)}/${ASSET_TYPE_PATH[assetType]}/${encodeURIComponent(name)}/merge`,
+      {
+        method: "POST",
+        body: JSON.stringify({
+          target,
+          as_derivative: options.asDerivative ?? false,
+          dry_run: options.dryRun ?? false,
+        }),
+        signal: options.signal,
+      }
+    );
+  }
+
+  /**
+   * 删除项目内资产前的引用预览：脚本与草稿里有多少处引用会在删除后悬空，按集列出。只读，
+   * 与重命名同一套扫描。删除本身不改写这些引用，也不因有引用而拒绝。
+   */
+  static async previewProjectAssetDeletion(
+    projectName: string,
+    assetType: ProjectAssetType,
+    name: string,
+    options: { signal?: AbortSignal } = {}
+  ): Promise<AssetDeletionPreview> {
+    return this.request(
+      `/projects/${encodeURIComponent(projectName)}/${ASSET_TYPE_PATH[assetType]}/${encodeURIComponent(name)}?dry_run=true`,
+      { method: "DELETE", signal: options.signal }
+    );
+  }
+
+  static async deleteProjectAsset(
+    projectName: string,
+    assetType: ProjectAssetType,
+    name: string
+  ): Promise<SuccessResponse> {
+    return this.request(
+      `/projects/${encodeURIComponent(projectName)}/${ASSET_TYPE_PATH[assetType]}/${encodeURIComponent(name)}`,
+      { method: "DELETE" }
     );
   }
 
@@ -1617,11 +1260,28 @@ class API {
     );
   }
 
+  /** 预览当前资产描述草稿，不保存；衍生按本体与衍生名共同定位。 */
+  static async previewAssetPrompt(
+    projectName: string,
+    assetType: ProjectAssetType,
+    name: string,
+    description: string,
+    options?: { signal?: AbortSignal; derivativeName?: string },
+  ): Promise<RenderedPromptPreview> {
+    const derivativePath = options?.derivativeName === undefined
+      ? ""
+      : `/derivatives/${encodeURIComponent(options.derivativeName)}`;
+    return this.request(
+      `/projects/${encodeURIComponent(projectName)}/${ASSET_TYPE_PATH[assetType]}/${encodeURIComponent(name)}${derivativePath}/prompt-preview`,
+      { method: "POST", body: JSON.stringify({ description }), signal: options?.signal },
+    );
+  }
+
   /**
    * 条目最终提示词预览：分镜图与视频各一份，逐字等于执行期发给模型的文本。
    *
    * 只读——不向供应商发请求、不产生费用。读的是**已保存**的剧本内容，草稿未保存时
-   * 预览仍是上一次保存的结果。不可用原因由后端按请求语言渲染，前端不再二次翻译。
+   * 预览仍是上一次保存的结果。不可用原因由后端按请求语言渲染，前端不二次翻译。
    */
   static async previewScriptItemPrompts(
     projectName: string,
@@ -1647,6 +1307,27 @@ class API {
       {
         method: "PATCH",
         body: JSON.stringify(updates),
+      }
+    );
+  }
+
+  /**
+   * 集页填写或改写本集原文。无原文的集保存后转为自带原文的集；切自整本源文的集返回 409。
+   * `sourceKind` 只对剧情演绎项目生效，缺省时保留已有类型。改类型会让本集已有的脚本规划判 stale 时，
+   * 不带 `confirm` 不写入，返回 `needs_confirmation` 与受影响的集。
+   */
+  static async updateEpisodeSource(
+    projectName: string,
+    episode: number,
+    text: string,
+    sourceKind?: SourceKind,
+    confirm = false
+  ): Promise<EpisodeSourceWriteResult> {
+    return this.request(
+      `/projects/${encodeURIComponent(projectName)}/episodes/${episode}/source`,
+      {
+        method: "PUT",
+        body: JSON.stringify(sourceKind ? { text, source_kind: sourceKind, confirm } : { text, confirm }),
       }
     );
   }
@@ -1687,41 +1368,170 @@ class API {
     );
   }
 
-  /** 用户显式确认 script_plan 内容，放行 prompt_authoring 视觉生成。 */
-  static async confirmScriptReview(
+  /**
+   * 提示词编写（「AI 编写 / AI 重写」），与 Agent 的 generate_episode_script 同一服务命令；提交即返生成批次。
+   * 显式重写会覆盖已有内容而未带有效 `overwrite_revision` 时 409，`diagnostic.prompt_overwrite` 带丢失清单。
+   * 附加指令随请求按集保存。
+   */
+  static async authorPrompts(
     projectName: string,
-    episode: number
-  ): Promise<ScriptReviewState> {
+    episode: number,
+    body: AuthorPromptsRequest
+  ): Promise<AuthorPromptsResponse> {
     return this.request(
-      `/projects/${encodeURIComponent(projectName)}/episodes/${episode}/script-review/confirm`,
-      { method: "POST" }
+      `/projects/${encodeURIComponent(projectName)}/episodes/${episode}/prompt-authoring`,
+      { method: "POST", body: JSON.stringify(body) }
     );
   }
 
-  /** 只读预演机械转换：按当前脚本规划与正式剧本列出新增 / 失效 / 移出条目，不落盘。 */
-  static async previewScriptPlanConversion(
+  /** 只保存本集提示词编写的附加指令（「交给 Agent」路径），不提交生成。 */
+  static async savePromptAuthoringInstructions(
     projectName: string,
     episode: number,
-    options?: { signal?: AbortSignal },
-  ): Promise<ScriptPlanConversionPreview> {
+    instructions: string
+  ): Promise<{ success: boolean }> {
     return this.request(
-      `/projects/${encodeURIComponent(projectName)}/episodes/${episode}/script-review/conversion-preview`,
-      { signal: options?.signal },
+      `/projects/${encodeURIComponent(projectName)}/episodes/${episode}/prompt-authoring/instructions`,
+      { method: "PUT", body: JSON.stringify({ instructions }) }
     );
   }
 
   /**
-   * 把脚本规划机械转为正式脚本（只同步内容层，drama / narration 的提示词以待生成落盘）。
-   * `entryIds` 非空时让点名的失效条目「采用新内容」：内容按脚本规划重取、提示词保留。
+   * AI 规划脚本，与 Agent 的 generate_script_plan 同一服务命令；提交即返生成批次。
+   * 新的脚本规划整份替换本集现有的规划与草稿，替换前的确认由调用方负责。附加指令随请求按集保存。
    */
-  static async convertScriptPlan(
+  static async planScript(
     projectName: string,
     episode: number,
-    entryIds: string[] = [],
-  ): Promise<ScriptPlanConversionReceipt> {
+    body: PlanScriptRequest
+  ): Promise<PlanScriptResponse> {
     return this.request(
-      `/projects/${encodeURIComponent(projectName)}/episodes/${episode}/script-review/convert`,
-      { method: "POST", body: JSON.stringify({ entry_ids: entryIds }) },
+      `/projects/${encodeURIComponent(projectName)}/episodes/${episode}/script-plan`,
+      { method: "POST", body: JSON.stringify(body) }
+    );
+  }
+
+  /**
+   * 广告/短片「AI 生成脚本」，与 Agent 的 generate_episode_script 同一服务命令；提交即返生成批次，结果直接写成正式脚本。
+   * 整份重做（`regenerate`）会替换已有正式脚本而未带有效 `overwrite_revision` 时 409，`diagnostic.script_overwrite` 带丢失清单。
+   */
+  static async generateAdScript(
+    projectName: string,
+    episode: number,
+    body: GenerateAdScriptRequest
+  ): Promise<PlanScriptResponse> {
+    return this.request(
+      `/projects/${encodeURIComponent(projectName)}/episodes/${episode}/ad-script`,
+      { method: "POST", body: JSON.stringify(body) }
+    );
+  }
+
+  /** 只保存本集 AI 规划脚本的附加指令（「交给 Agent」路径），不提交生成。 */
+  static async saveScriptPlanInstructions(
+    projectName: string,
+    episode: number,
+    instructions: string
+  ): Promise<{ success: boolean }> {
+    return this.request(
+      `/projects/${encodeURIComponent(projectName)}/episodes/${episode}/script-plan/instructions`,
+      { method: "PUT", body: JSON.stringify({ instructions }) }
+    );
+  }
+
+  /**
+   * 用户显式确认 script_plan 内容：整份转为正式脚本，放行 prompt_authoring 视觉生成。
+   * 该集已有正式脚本时须带 `overwriteRevision`（覆盖清单的 `revision`）；缺失或与当前正式脚本不符时 409，
+   * `diagnostic.script_overwrite` 带当前将被移除的分镜与服务端生成的丢失清单文本（`text`）。
+   */
+  static async confirmScriptReview(
+    projectName: string,
+    episode: number,
+    options: { overwriteRevision?: string } = {}
+  ): Promise<ScriptReviewState> {
+    return this.request(
+      `/projects/${encodeURIComponent(projectName)}/episodes/${episode}/script-review/confirm`,
+      {
+        method: "POST",
+        body: JSON.stringify({ overwrite_revision: options.overwriteRevision ?? null }),
+      }
+    );
+  }
+
+  // ==================== 草稿（待修复草稿 / Agent 的可编辑草稿） ====================
+
+  /** 本集在场的草稿摘要。 */
+  static async listEpisodeDrafts(
+    projectName: string,
+    episode: number,
+    options: { signal?: AbortSignal } = {}
+  ): Promise<{ episode: number; drafts: EpisodeDraftSummary[] }> {
+    return this.request(
+      `/projects/${encodeURIComponent(projectName)}/episodes/${episode}/drafts`,
+      { signal: options.signal }
+    );
+  }
+
+  /** 一份草稿的呈现视图：违约与降级提示逐条目定位；Agent 的可编辑草稿不带正文。 */
+  static async getEpisodeDraft(
+    projectName: string,
+    episode: number,
+    docType: DraftDocType,
+    options: { signal?: AbortSignal } = {}
+  ): Promise<EpisodeDraftView> {
+    return this.request(
+      `/projects/${encodeURIComponent(projectName)}/episodes/${episode}/drafts/${docType}`,
+      { signal: options.signal }
+    );
+  }
+
+  /** 手修保存：服务端全量重判，违约清零即采用为正式内容，否则返回刷新后的草稿视图。 */
+  static async saveEpisodeDraft(
+    projectName: string,
+    episode: number,
+    docType: DraftDocType,
+    content: Record<string, unknown>,
+    baseRevision: string
+  ): Promise<SaveEpisodeDraftResult> {
+    return this.request(
+      `/projects/${encodeURIComponent(projectName)}/episodes/${episode}/drafts/${docType}`,
+      {
+        method: "PUT",
+        body: JSON.stringify({ content, base_revision: baseRevision }),
+      }
+    );
+  }
+
+  /**
+   * AI 修复，与 Agent 同一服务命令；以排队文本任务提交，立即返回生成批次。只改违约所在的条目，
+   * 修完照常重判，违约清零即采用，否则写回草稿。附加指令不保存。
+   */
+  static async repairEpisodeDraft(
+    projectName: string,
+    episode: number,
+    docType: DraftDocType,
+    baseRevision: string,
+    instructions: string | null
+  ): Promise<DraftRepairResponse> {
+    return this.request(
+      `/projects/${encodeURIComponent(projectName)}/episodes/${episode}/drafts/${docType}/repair`,
+      {
+        method: "POST",
+        body: JSON.stringify({ base_revision: baseRevision, instructions }),
+      }
+    );
+  }
+
+  /** 丢弃草稿，回到正式内容。 */
+  static async discardEpisodeDraft(
+    projectName: string,
+    episode: number,
+    docType: DraftDocType,
+    baseRevision: string | null
+  ): Promise<{ episode: number; doc_type: DraftDocType; discarded: boolean }> {
+    const query = `?base_revision=${encodeURIComponent(baseRevision ?? "")}`;
+    return this.request(
+      `/projects/${encodeURIComponent(projectName)}/episodes/${episode}/drafts/${docType}${query}`,
+      { method: "DELETE" }
     );
   }
 
@@ -1729,8 +1539,8 @@ class API {
 
   /**
    * 旁白/解说分镜 PATCH（剧情演绎分镜走 {@link API.updateScene}）。`updates` 必带
-   * `script_file`，其余为可选白名单字段：`duration_seconds`、`segment_break`、
-   * `image_prompt`、`video_prompt`、`transition_to_next`、`note`、
+   * `script_file`，其余为可选白名单字段：`duration_seconds`、`segment_break`、`novel_text`、
+   * `image_prompt`、`video_prompt`、`note`、
    * `characters_in_segment`、`scenes`、`props`。字段清单以后端为准，
    * mirrors server/routers/projects.py UpdateSegmentRequest。
    * 保留 Record 以兼容 spread 调用。
@@ -1767,18 +1577,61 @@ class API {
     );
   }
 
-  /** 按给定全排列重排 ad 剧本的分镜顺序。 */
-  static async reorderShots(
+  /**
+   * 把分镜 `itemId` 移到 `afterId` 之后（`null` 移到最前），各形态通用；分镜连同产物一起移动。
+   * 服务端按当前剧本 revision 执行。
+   */
+  static async moveScriptItem(
     projectName: string,
     scriptFile: string,
-    shotIds: string[]
-  ): Promise<SuccessResponse & { shots?: AdShot[] }> {
+    itemId: string,
+    afterId: string | null
+  ): Promise<SuccessResponse> {
     return this.request(
-      `/projects/${encodeURIComponent(projectName)}/script-shots/reorder`,
+      `/projects/${encodeURIComponent(projectName)}/script-items/${encodeURIComponent(itemId)}/move`,
       {
         method: "POST",
-        body: JSON.stringify({ script_file: scriptFile, shot_ids: shotIds }),
+        body: JSON.stringify({ script_file: scriptFile, after_id: afterId }),
       }
+    );
+  }
+
+  /**
+   * 新增一条待编写分镜（剧情演绎 / 旁白 / 广告通用）：`afterId` 给定时插在该分镜之后，缺省时追加到
+   * 末尾（空脚本里即第一条）。服务端按当前剧本 revision 执行，并发改写时返回 409；新分镜不继承同号
+   * 旧分镜的产物与版本历史。旁白分镜的正文即配音内容，`novelText` 必填。
+   */
+  static async insertScriptItem(
+    projectName: string,
+    scriptFile: string,
+    options: { afterId?: string; novelText?: string } = {}
+  ): Promise<SuccessResponse & { item: NarrationSegment | DramaScene | AdShot | null }> {
+    return this.request(`/projects/${encodeURIComponent(projectName)}/script-items`, {
+      method: "POST",
+      body: JSON.stringify({
+        script_file: scriptFile,
+        ...(options.afterId !== undefined ? { after_id: options.afterId } : {}),
+        ...(options.novelText !== undefined ? { novel_text: options.novelText } : {}),
+      }),
+    });
+  }
+
+  /** 从空白开始：本集没有正式脚本时建出空的正式脚本，未确认的脚本规划随之弃置。 */
+  static async startBlankScript(projectName: string, episode: number): Promise<SuccessResponse & { script_file: string }> {
+    return this.request(`/projects/${encodeURIComponent(projectName)}/episodes/${episode}/blank-script`, {
+      method: "POST",
+    });
+  }
+
+  /** 移除分镜 `itemId`，其产物随分镜一并移除；服务端按当前剧本 revision 执行。 */
+  static async removeScriptItem(
+    projectName: string,
+    itemId: string,
+    scriptFile: string
+  ): Promise<SuccessResponse> {
+    return this.request(
+      `/projects/${encodeURIComponent(projectName)}/script-items/${encodeURIComponent(itemId)}?script_file=${encodeURIComponent(scriptFile)}`,
+      { method: "DELETE" }
     );
   }
 
@@ -1789,12 +1642,32 @@ class API {
     uploadType: string,
     file: File,
     name: string | null = null,
-    options: { onConflict?: "fail" | "replace" | "rename" } = {}
+    options: {
+      onConflict?: "fail" | "replace" | "rename";
+      /** 仅 source：whole_source 登记为整本源文的文件，episode 在播出顺序末尾登记一集自带原文的集。 */
+      role?: "whole_source" | "episode";
+      /** 仅 source 的 whole_source：登记后文件在整本源文清单里的下标，缺省接在末尾。 */
+      insertAt?: number;
+      /** 仅 source：剧情演绎项目这份原文的源文件类型，缺省为小说。 */
+      sourceKind?: SourceKind;
+      /**
+       * 仅 source 的 whole_source：确认过的受影响集清单的版本。插入或覆盖整本源文文件波及切出集时，
+       * 不带它的上传不写入，返回 `status=confirmation_required`、受影响集清单与 `revision`。
+       */
+      revision?: string;
+      signal?: AbortSignal;
+    } = {}
   ): Promise<{
     success: boolean;
-    path: string;
-    url: string;
+    path?: string;
+    /** 整本源文文件的插入或覆盖：是否已执行，以及受影响集清单。 */
+    status?: SourceFileChangeResponse["status"];
+    impact?: SourceFileChangeResponse["impact"];
+    revision?: string;
+    url?: string;
     filename?: string;
+    /** role=episode：新登记的集 ID。 */
+    episode?: number;
     normalized?: boolean;
     original_kept?: boolean;
     original_filename?: string;
@@ -1809,12 +1682,25 @@ class API {
     if (uploadType === "source" && options.onConflict) {
       qsParts.push(`on_conflict=${encodeURIComponent(options.onConflict)}`);
     }
+    if (uploadType === "source" && options.role) {
+      qsParts.push(`role=${encodeURIComponent(options.role)}`);
+    }
+    if (uploadType === "source" && options.insertAt !== undefined) {
+      qsParts.push(`insert_at=${options.insertAt}`);
+    }
+    if (uploadType === "source" && options.sourceKind) {
+      qsParts.push(`source_kind=${options.sourceKind}`);
+    }
+    if (uploadType === "source" && options.revision) {
+      qsParts.push(`revision=${encodeURIComponent(options.revision)}`);
+    }
     const qs = qsParts.join("&");
     const url = `/projects/${encodeURIComponent(projectName)}/upload/${uploadType}${qs ? "?" + qs : ""}`;
 
     const response = await fetch(`${API_BASE}${url}`, withAuth(url, {
       method: "POST",
       body: formData,
+      signal: options.signal,
     }));
 
     if (response.status === 409) {
@@ -1829,7 +1715,7 @@ class API {
       // 若 detail 缺字段则视为协议异常，抛通用错误（带文件名标识）而非手搓 fallback —
       // 避免前端"猜"一个可能与后端命名规则不一致的 suggested_name 误导用户
       if (!detail?.existing || !detail?.suggested_name) {
-        throw new Error(`上传 "${file.name}" 失败：服务端返回 409 但 detail 字段不完整`);
+        throw new Error(i18n.t("errors:upload_conflict_incomplete", { filename: file.name }));
       }
       throw new ConflictError(
         detail.existing,
@@ -1838,10 +1724,13 @@ class API {
       );
     }
 
-    await throwIfNotOk(response, "上传失败");
+    await throwIfNotOk(response, i18n.t("errors:upload_failed"));
     return (await response.json()) as {
       success: boolean;
-      path: string;
+      path?: string;
+      status?: SourceFileChangeResponse["status"];
+      impact?: SourceFileChangeResponse["impact"];
+      revision?: string;
       url: string;
       filename?: string;
       normalized?: boolean;
@@ -1857,7 +1746,7 @@ class API {
     const formData = new FormData();
     formData.append("file", file);
     const response = await fetch(`${API_BASE}${url}`, withAuth(url, { method: "POST", body: formData }));
-    await throwIfNotOk(response, "上传失败");
+    await throwIfNotOk(response, i18n.t("errors:upload_failed"));
     return (await response.json()) as T;
   }
 
@@ -1935,27 +1824,9 @@ class API {
     return API.postFileUpload<ShotUploadResult>(url, file);
   }
 
-  static async listFiles(
-    projectName: string
-  ): Promise<{
-    files: {
-      source?: { name: string; size: number; url: string; raw_filename?: string | null }[];
-      characters?: { name: string; size: number; url: string }[];
-      scenes?: { name: string; size: number; url: string }[];
-      props?: { name: string; size: number; url: string }[];
-      storyboards?: { name: string; size: number; url: string }[];
-      videos?: { name: string; size: number; url: string }[];
-      output?: { name: string; size: number; url: string }[];
-    };
-  }> {
-    return this.request(
-      `/projects/${encodeURIComponent(projectName)}/files`
-    );
-  }
-
   /**
    * 取本次请求的权威工作流计划。无副作用：不入队、不写项目，
-   * `narration_delivery` 与 `confirmed_request_durations` 只作用于这一次求解。
+   * `confirmed_request_durations` 只作用于这一次求解。
    */
   static async getWorkflowPlan(
     projectName: string,
@@ -1966,6 +1837,47 @@ class API {
       method: "POST",
       body: JSON.stringify(request),
       signal: options.signal,
+    });
+  }
+
+  /** 项目层的制作状态：不指定集时，下一步取账本顺序中第一个未完成的集或项目层动作。 */
+  static async getWorkflowStatus(
+    projectName: string,
+    options: { signal?: AbortSignal } = {}
+  ): Promise<WorkflowStatus> {
+    return this.request(`/projects/${encodeURIComponent(projectName)}/workflow-status`, {
+      signal: options.signal,
+    });
+  }
+
+  /** 账本顺序中每一集建议的下一步。 */
+  static async getEpisodeNextSteps(
+    projectName: string,
+    options: { signal?: AbortSignal } = {}
+  ): Promise<{ episodes: EpisodeNextStep[] }> {
+    return this.request(`/projects/${encodeURIComponent(projectName)}/workflow-status/episodes`, {
+      signal: options.signal,
+    });
+  }
+
+  /** 一集的剪辑概况：剪辑时间线条数、最近修改那条的问题数、成片已落后的几条。 */
+  static async getEpisodeEditOverview(
+    projectName: string,
+    episode: number,
+    options: { signal?: AbortSignal } = {}
+  ): Promise<EpisodeEditOverview> {
+    return this.request(`/projects/${encodeURIComponent(projectName)}/episodes/${episode}/edit-overview`, {
+      signal: options.signal,
+    });
+  }
+
+  /**
+   * 重跑项目数据升级链，与 Agent 的 retry_project_migration 同一服务命令。
+   * 仍失败时 422，`diagnostic.reason` 是失败原文，`diagnostic.details` 是结构化明细。
+   */
+  static async retryProjectMigration(projectName: string): Promise<{ success: boolean }> {
+    return this.request(`/projects/${encodeURIComponent(projectName)}/migration/retry`, {
+      method: "POST",
     });
   }
 
@@ -1994,36 +1906,256 @@ class API {
    */
   static async getSourceContent(
     projectName: string,
-    filename: string
+    filename: string,
+    options: { signal?: AbortSignal } = {}
   ): Promise<string> {
     const url = `/projects/${encodeURIComponent(projectName)}/source/${encodeURIComponent(filename)}`;
     const response = await fetch(
       `${API_BASE}${url}`,
-      withAuth(url)
+      withAuth(url, { signal: options.signal })
     );
-    await throwIfNotOk(response, "获取文件内容失败");
+    await throwIfNotOk(response, i18n.t("errors:file_content_load_failed"));
     return response.text();
   }
 
+  /** 「分集」视图：整本源文按集分段、每集体量与首尾句、source/ 里没有登记的文件。 */
+  static async getEpisodesView(
+    projectName: string,
+    options: { signal?: AbortSignal } = {}
+  ): Promise<EpisodesView> {
+    return this.request(`/projects/${encodeURIComponent(projectName)}/episodes-view`, {
+      signal: options.signal,
+    });
+  }
+
   /**
-   * 保存 source 文件（新建或更新）
+   * 手工切分，直接写入分集账本。波及有产物的集、合并会并入未切分的原文（或 `dryRun`）时返回确认清单、不写入；
+   * 确认后把清单里的集 ID 放进 `confirmEpisodes`、并入体量放进 `confirmMergedUnits` 重新提交。
    */
-  static async saveSourceFile(
+  static async manualSplit(
+    projectName: string,
+    action: ManualSplitAction,
+    options: { confirmEpisodes?: number[]; confirmMergedUnits?: number; dryRun?: boolean } = {}
+  ): Promise<ManualSplitResponse> {
+    return this.request(`/projects/${encodeURIComponent(projectName)}/episodes-view/manual-split`, {
+      method: "POST",
+      body: JSON.stringify({
+        ...action,
+        confirm_episodes: options.confirmEpisodes ?? [],
+        ...(options.confirmMergedUnits ? { confirm_merged_units: options.confirmMergedUnits } : {}),
+        dry_run: options.dryRun ?? false,
+      }),
+    });
+  }
+
+  /**
+   * AI 规划分集：从规划起点逐窗规划到整本源文结尾，每一窗是一个排队的文本任务；提交即返首窗的生成批次。
+   * 已有进行中的分集规划时 409，没有整本源文等准入不成立时 422。附加指令不写进项目。
+   */
+  static async planEpisodes(
+    projectName: string,
+    instructions: string | null,
+    gap: PlanningGap | null = null
+  ): Promise<EpisodePlanningResponse> {
+    return this.request(`/projects/${encodeURIComponent(projectName)}/episode-planning`, {
+      method: "POST",
+      body: JSON.stringify(gap === null ? { instructions } : { instructions, gap }),
+    });
+  }
+
+  /** 从这一集开始重新规划的范围：会被替换的切出集与其中已开始制作的集。不发起，不写入。 */
+  static async previewEpisodeReplan(projectName: string, episode: number): Promise<ReplanPreview> {
+    return this.request(`/projects/${encodeURIComponent(projectName)}/episode-replan`, {
+      method: "POST",
+      body: JSON.stringify({ episode, dry_run: true }),
+    });
+  }
+
+  /**
+   * 从这一集开始重新规划：逐窗生成一份「新的分集方案」，分集账本在采纳前不变；提交即返首窗的生成批次。
+   * 已有方案或分集规划在进行时 409。附加指令随方案保存。
+   */
+  static async startEpisodeReplan(
+    projectName: string,
+    episode: number,
+    instructions: string | null
+  ): Promise<EpisodePlanningResponse> {
+    return this.request(`/projects/${encodeURIComponent(projectName)}/episode-replan`, {
+      method: "POST",
+      body: JSON.stringify({ episode, instructions }),
+    });
+  }
+
+  /**
+   * 接着生成中途停止的新的分集方案：从方案的结尾逐窗生成到整本源文结尾，沿用发起时的附加指令；提交即返首窗的
+   * 生成批次。方案已覆盖到结尾或已过时时 409，分集规划在进行时 409。
+   */
+  static async continueEpisodeReplan(projectName: string, candidateId: string): Promise<EpisodePlanningResponse> {
+    return this.request(`/projects/${encodeURIComponent(projectName)}/episode-replan/continue`, {
+      method: "POST",
+      body: JSON.stringify({ candidate_id: candidateId }),
+    });
+  }
+
+  /**
+   * 采纳新的分集方案。不带 `revision` 时只返回服务端成文的后果；带上 `revision` 才采纳，
+   * 后果在两次调用之间变了时再次返回确认。`deleteRetired` 把保留为无原文的集连同产物一起删除。
+   */
+  static async adoptEpisodeReplan(
+    projectName: string,
+    candidateId: string,
+    options: { revision?: string | null; deleteRetired?: boolean } = {}
+  ): Promise<ReplanAdoptionResponse> {
+    return this.request(`/projects/${encodeURIComponent(projectName)}/episode-replan/adopt`, {
+      method: "POST",
+      body: JSON.stringify({
+        candidate_id: candidateId,
+        revision: options.revision ?? null,
+        delete_retired: options.deleteRetired ?? false,
+      }),
+    });
+  }
+
+  /** 放弃新的分集方案，分集账本不变。 */
+  static async discardEpisodeReplan(projectName: string, candidateId: string): Promise<void> {
+    await this.request(`/projects/${encodeURIComponent(projectName)}/episode-replan/discard`, {
+      method: "POST",
+      body: JSON.stringify({ candidate_id: candidateId }),
+    });
+  }
+
+  /** 新建一集：插在 `after` 之后，缺省放在播出顺序末尾；带原文时是自带原文的集。返回新集 ID。 */
+  static async createEpisode(projectName: string, body: CreateEpisodeBody): Promise<{ episode: number }> {
+    return this.request(`/projects/${encodeURIComponent(projectName)}/episodes`, {
+      method: "POST",
+      body: JSON.stringify(body),
+    });
+  }
+
+  /** 调整播出顺序：把这一集移到 `after` 之后，`after` 为 null 时移到最前。切出集之间违背源文顺序时 409。 */
+  static async moveEpisode(projectName: string, episode: number, after: number | null): Promise<void> {
+    await this.request(`/projects/${encodeURIComponent(projectName)}/episodes/${episode}/move`, {
+      method: "POST",
+      body: JSON.stringify({ after }),
+    });
+  }
+
+  /**
+   * 删除一集。不带 `revision` 时只返回服务端成文的丢失清单；带上清单的 `revision` 才删除，
+   * 清单在两次调用之间变了时再次返回确认。
+   */
+  static async deleteEpisode(
+    projectName: string,
+    episode: number,
+    revision: string | null = null
+  ): Promise<EpisodeDeletionResponse> {
+    return this.request(`/projects/${encodeURIComponent(projectName)}/episodes/${episode}/delete`, {
+      method: "POST",
+      body: JSON.stringify({ revision }),
+    });
+  }
+
+  /** 停止分集规划：取消排队中的窗口，执行中的那一窗照常完成，已切出的集保留。 */
+  static async stopEpisodePlanning(projectName: string): Promise<StopEpisodePlanningResponse> {
+    return this.request(`/projects/${encodeURIComponent(projectName)}/episode-planning/stop`, { method: "POST" });
+  }
+
+  /** 处置 source/ 里没有登记的文件：加入整本源文，或用作一集的原文（原文件随即删除）。 */
+  static async adoptSourceFile(
     projectName: string,
     filename: string,
-    content: string
-  ): Promise<SuccessResponse> {
-    const url = `/projects/${encodeURIComponent(projectName)}/source/${encodeURIComponent(filename)}`;
-    const response = await fetch(
-      `${API_BASE}${url}`,
-      withAuth(url, {
-        method: "PUT",
-        headers: { "Content-Type": "text/plain" },
-        body: content,
-      })
+    target: AdoptSourceFileTarget
+  ): Promise<{ success: boolean; target: string; episode?: number }> {
+    return this.request(
+      `/projects/${encodeURIComponent(projectName)}/source-files/${encodeURIComponent(filename)}/adopt`,
+      { method: "POST", body: JSON.stringify(target) }
     );
-    await throwIfNotOk(response, "保存文件失败");
-    return response.json() as Promise<SuccessResponse>;
+  }
+
+  /**
+   * 改整本源文文件的源文件类型（只对剧情演绎开放）。会让已开始制作的集的脚本规划判 stale 时，
+   * 不带 `confirm` 不写入，返回 `needs_confirmation` 与这些集。
+   */
+  static async setSourceFileKind(
+    projectName: string,
+    filename: string,
+    sourceKind: SourceKind,
+    confirm = false
+  ): Promise<SourceKindChangeResult> {
+    return this.request(
+      `/projects/${encodeURIComponent(projectName)}/source-files/${encodeURIComponent(filename)}/source-kind`,
+      { method: "PUT", body: JSON.stringify({ source_kind: sourceKind, confirm }) }
+    );
+  }
+
+  /**
+   * 整本源文文件的编辑、替换、调序与删除。不带 `revision` 时，波及切出集的改动不写入，返回服务端成文的
+   * 受影响集清单与 `revision`；带上它重新提交才执行，清单在两次调用之间变了时再次返回确认。没有受影响的集时直接执行。
+   */
+  static async editSourceFile(
+    projectName: string,
+    filename: string,
+    text: string,
+    revision: string | null = null
+  ): Promise<SourceFileChangeResponse> {
+    return this.request(
+      `/projects/${encodeURIComponent(projectName)}/source-files/${encodeURIComponent(filename)}/text`,
+      { method: "PUT", body: JSON.stringify({ text, revision }) }
+    );
+  }
+
+  /** 用上传的文件替换整本源文文件：保留位置与文件名；`sourceKind` 缺省时类型不变。确认协议同 `editSourceFile`。 */
+  static async replaceSourceFile(
+    projectName: string,
+    filename: string,
+    file: File,
+    options: { sourceKind?: SourceKind; revision?: string | null } = {}
+  ): Promise<SourceFileChangeResponse> {
+    const formData = new FormData();
+    formData.append("file", file);
+    if (options.sourceKind) formData.append("source_kind", options.sourceKind);
+    if (options.revision) formData.append("revision", options.revision);
+    const url = `/projects/${encodeURIComponent(projectName)}/source-files/${encodeURIComponent(filename)}/replace`;
+    const response = await fetch(`${API_BASE}${url}`, withAuth(url, { method: "POST", body: formData }));
+    await throwIfNotOk(response, i18n.t("errors:file_replace_failed"));
+    return (await response.json()) as SourceFileChangeResponse;
+  }
+
+  /** 把整本源文文件上移或下移一位，其中的切出集整块跟着走。确认协议同 `editSourceFile`。 */
+  static async moveSourceFile(
+    projectName: string,
+    filename: string,
+    direction: "up" | "down",
+    revision: string | null = null
+  ): Promise<SourceFileChangeResponse> {
+    return this.request(
+      `/projects/${encodeURIComponent(projectName)}/source-files/${encodeURIComponent(filename)}/move`,
+      { method: "POST", body: JSON.stringify({ direction, revision }) }
+    );
+  }
+
+  /** 按文件在 ArcReel 之外的改动更新分集账本：以快照为旧文本重映射触及它的切出集。确认协议同 `editSourceFile`。 */
+  static async acceptExternalSourceChange(
+    projectName: string,
+    filename: string,
+    revision: string | null = null
+  ): Promise<SourceFileChangeResponse> {
+    return this.request(
+      `/projects/${encodeURIComponent(projectName)}/source-files/${encodeURIComponent(filename)}/accept-external`,
+      { method: "POST", body: JSON.stringify({ revision }) }
+    );
+  }
+
+  /** 删除整本源文文件：等同于删掉它的全部文字，再移出整本源文。确认协议同 `editSourceFile`。 */
+  static async deleteWholeSourceFile(
+    projectName: string,
+    filename: string,
+    revision: string | null = null
+  ): Promise<SourceFileChangeResponse> {
+    return this.request(
+      `/projects/${encodeURIComponent(projectName)}/source-files/${encodeURIComponent(filename)}/delete`,
+      { method: "POST", body: JSON.stringify({ revision }) }
+    );
   }
 
   /**
@@ -2040,7 +2172,7 @@ class API {
         method: "DELETE",
       })
     );
-    await throwIfNotOk(response, "删除文件失败");
+    await throwIfNotOk(response, i18n.t("errors:file_delete_failed"));
     return response.json() as Promise<SuccessResponse>;
   }
 
@@ -2072,7 +2204,7 @@ class API {
       `${API_BASE}${url}`,
       withAuth(url)
     );
-    await throwIfNotOk(response, "获取草稿内容失败");
+    await throwIfNotOk(response, i18n.t("errors:stage_file_load_failed"));
     return response.text();
   }
 
@@ -2094,7 +2226,7 @@ class API {
         body: content,
       })
     );
-    await throwIfNotOk(response, "保存草稿失败");
+    await throwIfNotOk(response, i18n.t("errors:stage_file_save_failed"));
     return response.json() as Promise<SuccessResponse>;
   }
 
@@ -2182,7 +2314,6 @@ class API {
     prompt: string | Record<string, unknown>,
     scriptFile: string,
     durationSeconds: number = 4,
-    requestOptions: ReferenceGenerationRequestOptions = {},
   ): Promise<{ success: boolean; task_id: string; deduped: boolean; message: string }> {
     return this.request(
       `/projects/${encodeURIComponent(projectName)}/generate/video/${encodeURIComponent(segmentId)}`,
@@ -2192,7 +2323,6 @@ class API {
           prompt,
           script_file: scriptFile,
           duration_seconds: durationSeconds,
-          ...requestOptions,
         }),
       }
     );
@@ -2308,12 +2438,12 @@ class API {
    * 生成角色资产图
    * @param projectName - 项目名称
    * @param charName - 角色名称
-   * @param prompt - 角色描述 prompt
+   *
+   * 请求体没有 prompt：描述只取项目里存储的条目。
    */
   static async generateCharacter(
     projectName: string,
-    charName: string,
-    prompt: string
+    charName: string
   ): Promise<{
     success: boolean;
     task_id: string;
@@ -2324,7 +2454,6 @@ class API {
       `/projects/${encodeURIComponent(projectName)}/generate/character/${encodeURIComponent(charName)}`,
       {
         method: "POST",
-        body: JSON.stringify({ prompt }),
       }
     );
   }
@@ -2333,12 +2462,12 @@ class API {
    * 生成场景资产图
    * @param projectName - 项目名称
    * @param sceneName - 场景名称
-   * @param prompt - 场景描述 prompt
+   *
+   * 请求体没有 prompt：描述只取项目里存储的条目。
    */
   static async generateProjectScene(
     projectName: string,
-    sceneName: string,
-    prompt: string
+    sceneName: string
   ): Promise<{
     success: boolean;
     task_id: string;
@@ -2349,7 +2478,6 @@ class API {
       `/projects/${encodeURIComponent(projectName)}/generate/scene/${encodeURIComponent(sceneName)}`,
       {
         method: "POST",
-        body: JSON.stringify({ prompt }),
       }
     );
   }
@@ -2358,12 +2486,12 @@ class API {
    * 生成道具资产图
    * @param projectName - 项目名称
    * @param propName - 道具名称
-   * @param prompt - 道具描述 prompt
+   *
+   * 请求体没有 prompt：描述只取项目里存储的条目。
    */
   static async generateProjectProp(
     projectName: string,
-    propName: string,
-    prompt: string
+    propName: string
   ): Promise<{
     success: boolean;
     task_id: string;
@@ -2374,7 +2502,6 @@ class API {
       `/projects/${encodeURIComponent(projectName)}/generate/prop/${encodeURIComponent(propName)}`,
       {
         method: "POST",
-        body: JSON.stringify({ prompt }),
       }
     );
   }
@@ -2383,12 +2510,12 @@ class API {
    * 生成商品资产图（product sheet）
    * @param projectName - 项目名称
    * @param productName - 商品名称
-   * @param prompt - 商品描述 prompt
+   *
+   * 请求体没有 prompt：描述只取项目里存储的条目。
    */
   static async generateProjectProduct(
     projectName: string,
-    productName: string,
-    prompt: string
+    productName: string
   ): Promise<{
     success: boolean;
     task_id: string;
@@ -2399,7 +2526,6 @@ class API {
       `/projects/${encodeURIComponent(projectName)}/generate/product/${encodeURIComponent(productName)}`,
       {
         method: "POST",
-        body: JSON.stringify({ prompt }),
       }
     );
   }
@@ -2439,7 +2565,8 @@ class API {
   // ==================== 任务队列 API ====================
 
   static async getTask(taskId: string): Promise<TaskItem> {
-    return this.request(`/tasks/${encodeURIComponent(taskId)}`);
+    const { task } = await this.request<{ task: TaskItem }>(`/tasks/${encodeURIComponent(taskId)}`);
+    return task;
   }
 
   static async listTasks(
@@ -2487,8 +2614,14 @@ class API {
     taskId: string,
     options: { signal?: AbortSignal } = {},
   ): Promise<{
-    task: { task_id: string; task_type: string; resource_id: string; status: string };
-    cascaded: { task_id: string; task_type: string; resource_id: string }[];
+    task: {
+      task_id: string;
+      task_type: string;
+      resource_id: string;
+      resource_ref?: EpisodeItemRef | null;
+      status: string;
+    };
+    cascaded: { task_id: string; task_type: string; resource_id: string; resource_ref?: EpisodeItemRef | null }[];
   }> {
     return this.request(`/tasks/${encodeURIComponent(taskId)}/cancel-preview`, {
       signal: options.signal,
@@ -2499,7 +2632,6 @@ class API {
     taskId: string
   ): Promise<{
     cancelled: TaskItem[];
-    cancelling: string[];
     skipped_terminal: TaskItem[];
   }> {
     return this.request(`/tasks/${encodeURIComponent(taskId)}/cancel`, {
@@ -2538,7 +2670,7 @@ class API {
       url,
       headers: sseHeaders,
       onMessage(message) {
-        const payload = parseSseJson(message.data, "项目事件");
+        const payload = parseSseJson(message.data, "project event");
         if (!payload) return;
         switch (message.event) {
           case "snapshot":
@@ -2569,14 +2701,15 @@ class API {
   static async getVersions(
     projectName: string,
     resourceType: string,
-    resourceId: string
+    resourceId: string,
+    options?: { signal?: AbortSignal },
   ): Promise<{
     resource_type: string;
     resource_id: string;
     current_version: number;
     versions: VersionInfo[];
   }> {
-    return this.request(versionsResourcePath(projectName, resourceType, resourceId));
+    return this.request(versionsResourcePath(projectName, resourceType, resourceId), { signal: options?.signal });
   }
 
   /**
@@ -2629,7 +2762,7 @@ class API {
       })
     );
 
-    await throwIfNotOk(response, "上传失败");
+    await throwIfNotOk(response, i18n.t("errors:upload_failed"));
 
     return response.json() as Promise<{ success: boolean; style_image: string; style_description: string; url: string }>;
   }
@@ -2772,7 +2905,7 @@ class API {
       url: this.getAssistantEntriesStreamUrl(options.projectName, options.sessionId, options.after ?? -1),
       headers: sseHeaders,
       onMessage(message) {
-        const payload = parseSseJson(message.data, "会话");
+        const payload = parseSseJson(message.data, "session");
         if (payload) options.onEvent(message.event, payload);
       },
       onError: sseErrorHandler(options.onError),
@@ -2859,8 +2992,8 @@ class API {
   // ==================== API Key 管理 API ====================
 
   /** 列出所有 API Key（不含完整 key）。 */
-  static async listApiKeys(): Promise<ApiKeyInfo[]> {
-    return this.request("/api-keys");
+  static async listApiKeys(options: { signal?: AbortSignal } = {}): Promise<ApiKeyInfo[]> {
+    return this.request("/api-keys", { signal: options.signal });
   }
 
   /** 创建新 API Key，返回含完整 key 的响应（仅此一次）。 */
@@ -2914,8 +3047,8 @@ class API {
 
   // ==================== Provider 凭证管理 API ====================
 
-  static async listCredentials(providerId: string): Promise<{ credentials: ProviderCredential[] }> {
-    return this.request(`/providers/${encodeURIComponent(providerId)}/credentials`);
+  static async listCredentials(providerId: string, options: { signal?: AbortSignal } = {}): Promise<{ credentials: ProviderCredential[] }> {
+    return this.request(`/providers/${encodeURIComponent(providerId)}/credentials`, { signal: options.signal });
   }
 
   static async createCredential(
@@ -2961,18 +3094,18 @@ class API {
       `${API_BASE}${url}`,
       withAuth(url, { method: "POST", body: formData }),
     );
-    await throwIfNotOk(response, "上传凭证失败");
+    await throwIfNotOk(response, i18n.t("errors:credential_upload_failed"));
     return response.json() as Promise<ProviderCredential>;
   }
 
   // ==================== Agent 配置 / 凭证 API ====================
 
-  static async listAgentPresetProviders(): Promise<PresetProvidersResponse> {
-    return this.request("/agent/preset-providers");
+  static async listAgentPresetProviders(options: { signal?: AbortSignal } = {}): Promise<PresetProvidersResponse> {
+    return this.request("/agent/preset-providers", { signal: options.signal });
   }
 
-  static async listAgentCredentials(): Promise<{ credentials: AgentCredential[] }> {
-    return this.request("/agent/credentials");
+  static async listAgentCredentials(options: { signal?: AbortSignal } = {}): Promise<{ credentials: AgentCredential[] }> {
+    return this.request("/agent/credentials", { signal: options.signal });
   }
 
   static async createAgentCredential(
@@ -3031,8 +3164,8 @@ class API {
     return this.request("/custom-providers", { method: "POST", body: JSON.stringify(data) });
   }
 
-  static async getCustomProvider(id: number): Promise<CustomProviderInfo> {
-    return this.request(`/custom-providers/${id}`);
+  static async getCustomProvider(id: number, options: { signal?: AbortSignal } = {}): Promise<CustomProviderInfo> {
+    return this.request(`/custom-providers/${id}`, { signal: options.signal });
   }
 
   static async updateCustomProvider(id: number, data: Partial<Omit<CustomProviderCreateRequest, "discovery_format" | "models" | "image_max_workers" | "video_max_workers" | "audio_max_workers">>): Promise<void> {
@@ -3047,15 +3180,11 @@ class API {
     return this.request(`/custom-providers/${id}`, { method: "DELETE" });
   }
 
-  static async replaceCustomProviderModels(id: number, models: CustomProviderModelInput[]): Promise<CustomProviderModelInfo[]> {
-    return this.request(`/custom-providers/${id}/models`, { method: "PUT", body: JSON.stringify({ models }) });
-  }
-
-  static async discoverModels(data: { discovery_format: string; base_url: string; api_key: string }): Promise<{ models: DiscoveredModel[] }> {
+  static async discoverModels(data: { discovery_format: string; base_url: string; api_key: string }): Promise<DiscoverModelsResponse> {
     return this.request("/custom-providers/discover", { method: "POST", body: JSON.stringify(data) });
   }
 
-  static async discoverModelsForProvider(id: number): Promise<{ models: DiscoveredModel[] }> {
+  static async discoverModelsForProvider(id: number): Promise<DiscoverModelsResponse> {
     return this.request(`/custom-providers/${id}/discover`, { method: "POST" });
   }
 
@@ -3067,10 +3196,6 @@ class API {
     return this.request(`/custom-providers/${id}/test`, { method: "POST" });
   }
 
-  static async getCustomProviderCredentials(id: number): Promise<CustomProviderCredentials> {
-    return this.request(`/custom-providers/${id}/credentials`);
-  }
-
   static async discoverAnthropicModels(
     data: AnthropicDiscoverRequest,
     options: { signal?: AbortSignal } = {},
@@ -3080,6 +3205,154 @@ class API {
       body: JSON.stringify(data),
       signal: options.signal,
     });
+  }
+
+  // ==================== 市场 API ====================
+
+  static async listMarketSources(
+    options: { signal?: AbortSignal } = {},
+  ): Promise<MarketSourceListResponse> {
+    return this.request("/market/sources", { signal: options.signal });
+  }
+
+  /** 添加即抓取一次；地址不被接受、已添加或抓取失败时抛错，不落库。 */
+  static async addMarketSource(body: {
+    address: string;
+    display_name?: string;
+  }): Promise<MarketSourceInfo> {
+    return this.request("/market/sources", { method: "POST", body: JSON.stringify(body) });
+  }
+
+  static async updateMarketSource(
+    id: number,
+    patch: { display_name?: string; is_enabled?: boolean },
+  ): Promise<MarketSourceInfo> {
+    return this.request(`/market/sources/${id}`, { method: "PATCH", body: JSON.stringify(patch) });
+  }
+
+  /** 官方市场源返回 409。 */
+  static async deleteMarketSource(id: number): Promise<void> {
+    return this.request(`/market/sources/${id}`, { method: "DELETE" });
+  }
+
+  /** ids 须是全部市场源 id 的全排列。 */
+  static async reorderMarketSources(ids: number[]): Promise<MarketSourceListResponse> {
+    return this.request("/market/sources/order", { method: "PUT", body: JSON.stringify({ ids }) });
+  }
+
+  /** 刷新失败不抛错：结果落在返回行的 status / last_error 上。 */
+  static async refreshMarketSource(id: number): Promise<MarketSourceInfo> {
+    return this.request(`/market/sources/${id}/refresh`, { method: "POST" });
+  }
+
+  /**
+   * 刷新全部启用源，逐源返回刷新过的行。
+   * @param staleOnly - 打开市场页时的自动刷新：只刷距上次成功刷新超过 1 小时的源。
+   */
+  static async refreshMarketSources(
+    options: { staleOnly?: boolean; signal?: AbortSignal } = {},
+  ): Promise<MarketSourceListResponse> {
+    const query = options.staleOnly ? "?stale_only=true" : "";
+    return this.request(`/market/refresh${query}`, { method: "POST", signal: options.signal });
+  }
+
+  /** 所有启用源缓存快照里的条目，按源顺序、源内按名称排列；只读快照，不触发抓取。 */
+  static async listMarketEntries(
+    options: { type?: string; signal?: AbortSignal } = {},
+  ): Promise<MarketEntryListResponse> {
+    const query = new URLSearchParams({ type: options.type ?? "endpoint" });
+    return this.request(`/market/entries?${query}`, { signal: options.signal });
+  }
+
+  static async getMarketEntry(sourceId: number, slug: string, options: { signal?: AbortSignal } = {}): Promise<MarketEntryDetail> {
+    return this.request(`/market/sources/${sourceId}/entries/${encodeURIComponent(slug)}`, options);
+  }
+
+  static async getMarketEntryDefinition(sourceId: number, slug: string, options: { signal?: AbortSignal } = {}): Promise<{ definition: unknown; entry_matches_definition: boolean; definition_digest: string | null }> {
+    return this.request(`/market/sources/${sourceId}/entries/${encodeURIComponent(slug)}/definition`, options);
+  }
+
+  /** `definitionDigest` 取自确认页加载的定义；服务端重新抓取后内容不同即 409 拒装。 */
+  static async installMarketEntry(sourceId: number, slug: string, definitionDigest: string, overwriteEndpointId?: number): Promise<{ endpoint: CustomEndpointInfo; installation: MarketEntryInstallation }> {
+    return this.request(`/market/sources/${sourceId}/entries/${encodeURIComponent(slug)}/install`, {
+      method: "POST", body: JSON.stringify({ definition_digest: definitionDigest, overwrite_endpoint_id: overwriteEndpointId }),
+    });
+  }
+
+  /**
+   * 经后端代理取条目 icon。接口走会话鉴权，`<img>` 带不上凭证，故取回 Blob；
+   * 地址带上条目版本，条目升版即绕过浏览器缓存。
+   */
+  static async getMarketEntryIcon(
+    sourceId: number,
+    slug: string,
+    version: string,
+    options: { signal?: AbortSignal } = {},
+  ): Promise<Blob> {
+    const url = `/market/sources/${sourceId}/entries/${encodeURIComponent(slug)}/icon?v=${encodeURIComponent(version)}`;
+    const response = await fetch(`${API_BASE}${url}`, withAuth(url, { signal: options.signal }));
+    await throwIfNotOk(response, i18n.t("errors:market_icon_load_failed"));
+    return response.blob();
+  }
+
+  // ==================== 官方服务 API ====================
+  // 前端只与本地服务端通信；官方服务的调用全部由本地服务端代理，关闭时本地服务端零出站。
+
+  static async getOfficialService(options: { signal?: AbortSignal } = {}): Promise<OfficialServiceState> {
+    return this.request("/official-service", { signal: options.signal });
+  }
+
+  static async updateOfficialService(patch: {
+    enabled?: boolean;
+    notice_seen?: boolean;
+  }): Promise<OfficialServiceState> {
+    return this.request("/official-service", { method: "PATCH", body: JSON.stringify(patch) });
+  }
+
+  /** 删除实例标识；下次请求官方服务时生成新的。 */
+  static async resetOfficialInstanceId(): Promise<OfficialServiceState> {
+    return this.request("/official-service/instance-id/reset", { method: "POST" });
+  }
+
+  /** 启用的官方市场源条目的安装量与评分；官方服务关闭或取不回时抛错。 */
+  static async listMarketEntryAggregates(
+    options: { signal?: AbortSignal } = {},
+  ): Promise<{ items: MarketEntryAggregate[] }> {
+    return this.request("/market/entries/aggregates?type=endpoint", { signal: options.signal });
+  }
+
+  /** 1–5 星；官方服务没有本实例的安装记录时抛出 409。 */
+  static async rateMarketEntry(sourceId: number, slug: string, stars: number): Promise<void> {
+    return this.request(`/market/sources/${sourceId}/entries/${encodeURIComponent(slug)}/rating`, {
+      method: "PUT",
+      body: JSON.stringify({ stars }),
+    });
+  }
+
+  /** 与官方服务预检同口径的本地校验，不出站；只报错误。 */
+  static async checkMarketSubmission(
+    draft: MarketSubmissionDraft,
+    options: { signal?: AbortSignal } = {},
+  ): Promise<{ diagnostics: MarketSubmissionDiagnostic[] }> {
+    return this.request("/market/submissions/check", {
+      method: "POST",
+      body: JSON.stringify(draft),
+      signal: options.signal,
+    });
+  }
+
+  /** 把端点已保存的定义分享到官方市场；PR 未合并时再次提交进入同一 PR。 */
+  static async createMarketSubmission(
+    draft: MarketSubmissionDraft & { github_username: string | null },
+  ): Promise<MarketSubmission> {
+    return this.request("/market/submissions", { method: "POST", body: JSON.stringify(draft) });
+  }
+
+  /** 本地记录的分享提交，调用时向官方服务刷新一次状态；官方服务关闭时抛出 409。 */
+  static async listMarketSubmissions(
+    options: { signal?: AbortSignal } = {},
+  ): Promise<{ submissions: MarketSubmission[] }> {
+    return this.request("/market/submissions", { signal: options.signal });
   }
 
   // ==================== 自定义调用端点 API ====================
@@ -3109,9 +3382,12 @@ class API {
    */
   static async validateCustomEndpoint(
     definition: unknown,
-    options: { excludeId?: number; signal?: AbortSignal } = {},
+    options: { excludeId?: number; mediaType?: ComfyuiMediaType; signal?: AbortSignal } = {},
   ): Promise<EndpointValidateResponse> {
-    const query = options.excludeId === undefined ? "" : `?exclude_id=${options.excludeId}`;
+    const params = new URLSearchParams();
+    if (options.excludeId !== undefined) params.set("exclude_id", String(options.excludeId));
+    if (options.mediaType !== undefined) params.set("media_type", options.mediaType);
+    const query = params.size === 0 ? "" : `?${params.toString()}`;
     return this.request(`/custom-endpoints/validate${query}`, {
       method: "POST",
       body: JSON.stringify(definition),
@@ -3119,9 +3395,28 @@ class API {
     });
   }
 
+  /**
+   * 推断一份 workflow 的节点绑定候选；载荷带既有节点绑定时同时做重导入重匹配。
+   *
+   * 服务端不留状态：结果只用来渲染绑定编辑器，用户确认后才经创建或整份替换接口落盘
+   * （`docs/adr/0082`）。`mediaType` 只在载荷是原始 API workflow 时生效——端点定义
+   * 自己带着这一项。
+   */
+  static async inferComfyuiBindings(
+    payload: unknown,
+    options: { mediaType?: ComfyuiMediaType; signal?: AbortSignal } = {},
+  ): Promise<ComfyuiInferResponse> {
+    const query = options.mediaType === undefined ? "" : `?media_type=${options.mediaType}`;
+    return this.request(`/custom-endpoints/comfyui/infer${query}`, {
+      method: "POST",
+      body: JSON.stringify(payload),
+      signal: options.signal,
+    });
+  }
+
   /** 内置声明式端点的定义原样 JSON，供「复制为我的」；Python 实现的内置端点 404。 */
-  static async getBuiltinEndpointDefinition(key: string): Promise<EndpointDefinition> {
-    return this.request(`/custom-providers/endpoints/${encodeURIComponent(key)}/definition`);
+  static async getBuiltinEndpointDefinition(key: string, options: { signal?: AbortSignal } = {}): Promise<EndpointDefinition> {
+    return this.request(`/custom-providers/endpoints/${encodeURIComponent(key)}/definition`, { signal: options.signal });
   }
 
   static async previewEndpointRequest(
@@ -3192,12 +3487,11 @@ class API {
    */
   static async getCostEstimate(
     projectName: string,
-    options: ReferenceRequestOptions & { referenceUnitId?: string; signal?: AbortSignal } = {}
+    options: { referenceUnitId?: string; signal?: AbortSignal } = {}
   ): Promise<CostEstimateResponse> {
-    const suffix = referenceRequestQuery(
-      options,
-      options.referenceUnitId ? { reference_unit_id: options.referenceUnitId } : undefined,
-    );
+    const suffix = options.referenceUnitId
+      ? `?${new URLSearchParams({ reference_unit_id: options.referenceUnitId }).toString()}`
+      : "";
     return this.request(`/projects/${encodeURIComponent(projectName)}/cost-estimate${suffix}`, {
       signal: options.signal,
     });
@@ -3223,6 +3517,8 @@ class API {
     task_ids: string[];
     /** grid_id → task_id；只含本次真正入队的宫格。 */
     task_ids_by_grid: Record<string, string>;
+    /** 不传 sceneIds（缺失即生成）时，联合图已就绪、尚未切分落格而跳过的宫格。 */
+    unsplit_grid_ids: string[];
     deduped: boolean;
     message: string;
   }> {
@@ -3263,8 +3559,14 @@ class API {
    * @param projectName - 项目名称
    * @param gridId - Grid ID
    */
-  static async getGrid(projectName: string, gridId: string): Promise<GridGeneration> {
-    return this.request(`/projects/${encodeURIComponent(projectName)}/grids/${encodeURIComponent(gridId)}`);
+  static async getGrid(
+    projectName: string,
+    gridId: string,
+    options: { signal?: AbortSignal } = {}
+  ): Promise<GridGeneration> {
+    return this.request(`/projects/${encodeURIComponent(projectName)}/grids/${encodeURIComponent(gridId)}`, {
+      signal: options.signal,
+    });
   }
 
   /**
@@ -3329,7 +3631,7 @@ class API {
     if (params.q) usp.set("q", params.q);
     if (params.limit) usp.set("limit", String(params.limit));
     if (params.offset) usp.set("offset", String(params.offset));
-    return this.request<{ items: Asset[] }>(`/assets?${usp.toString()}`, options);
+    return this.request<AssetListPage>(`/assets?${usp.toString()}`, options);
   }
 
   static async getAsset(id: string) {
@@ -3351,7 +3653,7 @@ class API {
       const error = (await response.json().catch(() => ({ detail: response.statusText }))) as {
         detail?: string;
       };
-      throw new Error(typeof error.detail === "string" ? error.detail : "请求失败");
+      throw new Error(typeof error.detail === "string" ? error.detail : i18n.t("errors:request_failed"));
     }
     return response.json() as Promise<{ asset: Asset }>;
   }
@@ -3374,7 +3676,7 @@ class API {
       const error = (await response.json().catch(() => ({ detail: response.statusText }))) as {
         detail?: string;
       };
-      throw new Error(typeof error.detail === "string" ? error.detail : "请求失败");
+      throw new Error(typeof error.detail === "string" ? error.detail : i18n.t("errors:request_failed"));
     }
     return response.json() as Promise<{ asset: Asset }>;
   }
@@ -3414,7 +3716,7 @@ class API {
   static getGlobalAssetUrl(path: string | null, fp?: string | null): string | null {
     if (!path) return null;
     const parts = path.split("/");
-    if (parts.length < 3 || parts[0] !== "_global_assets") return null;
+    if (parts.length < 3 || parts[0] !== "global_assets") return null;
     const type = parts[1];
     const filename = parts.slice(2).join("/");
     const qs = fp ? `?fp=${encodeURIComponent(fp)}` : "";
@@ -3427,7 +3729,7 @@ class API {
   static async listReferenceVideoUnits(
     projectName: string,
     episode: number,
-  ): Promise<{ units: ReferenceVideoUnit[] }> {
+  ): Promise<{ units: ReferenceVideoUnit[]; unit_capabilities: ReferenceUnitCapabilityMap }> {
     return this.request(
       `/projects/${encodeURIComponent(projectName)}/reference-videos/episodes/${episode}/units`,
     );
@@ -3440,17 +3742,18 @@ class API {
     payload: {
       prompt: string;
       duration_seconds?: number;
-      transition_to_next?: TransitionType;
       note?: string | null;
+      /** 插在这个单元之后；缺省时追加到末尾。 */
+      after_unit_id?: string;
     },
-  ): Promise<{ unit: ReferenceVideoUnit }> {
+  ): Promise<{ unit: ReferenceVideoUnit; unit_capability: ReferenceUnitCapability }> {
     return this.request(
       `/projects/${encodeURIComponent(projectName)}/reference-videos/episodes/${episode}/units`,
       { method: "POST", body: JSON.stringify(payload) },
     );
   }
 
-  /** Patch body/duration/transition/note on an existing unit. */
+  /** Patch body/duration/note on an existing unit. */
   static async patchReferenceVideoUnit(
     projectName: string,
     episode: number,
@@ -3458,10 +3761,9 @@ class API {
     patch: {
       prompt?: string;
       duration_seconds?: number;
-      transition_to_next?: TransitionType;
       note?: string | null;
     },
-  ): Promise<{ unit: ReferenceVideoUnit }> {
+  ): Promise<{ unit: ReferenceVideoUnit; unit_capability: ReferenceUnitCapability }> {
     return this.request(
       `/projects/${encodeURIComponent(projectName)}/reference-videos/episodes/${episode}/units/${encodeURIComponent(unitId)}`,
       { method: "PATCH", body: JSON.stringify(patch) },
@@ -3480,15 +3782,16 @@ class API {
     );
   }
 
-  /** Reorder units by providing the full ordered unit_id list. */
-  static async reorderReferenceVideoUnits(
+  /** 把单元 `unitId` 移到 `afterUnitId` 之后（`null` 移到最前），返回移动后的单元列表。 */
+  static async moveReferenceVideoUnit(
     projectName: string,
     episode: number,
-    unitIds: string[],
+    unitId: string,
+    afterUnitId: string | null,
   ): Promise<{ units: ReferenceVideoUnit[] }> {
     return this.request(
-      `/projects/${encodeURIComponent(projectName)}/reference-videos/episodes/${episode}/units/reorder`,
-      { method: "POST", body: JSON.stringify({ unit_ids: unitIds }) },
+      `/projects/${encodeURIComponent(projectName)}/reference-videos/episodes/${episode}/units/${encodeURIComponent(unitId)}/move`,
+      { method: "POST", body: JSON.stringify({ after_unit_id: afterUnitId }) },
     );
   }
 
@@ -3501,11 +3804,10 @@ class API {
     projectName: string,
     episode: number,
     unitId: string,
-    options?: ReferenceRequestOptions & { signal?: AbortSignal },
+    options?: { signal?: AbortSignal },
   ): Promise<ReferenceDurationPrecheck> {
-    const suffix = referenceRequestQuery(options ?? {});
     return this.request(
-      `/projects/${encodeURIComponent(projectName)}/reference-videos/episodes/${episode}/units/${encodeURIComponent(unitId)}/duration-precheck${suffix}`,
+      `/projects/${encodeURIComponent(projectName)}/reference-videos/episodes/${episode}/units/${encodeURIComponent(unitId)}/duration-precheck`,
       { signal: options?.signal },
     );
   }
@@ -3514,7 +3816,7 @@ class API {
    * 视频单元正文的读时派生预览：utterances + 降级可见性提示。
    *
    * 只读、不落盘——正文是唯一真相。提示文本由后端按请求语言渲染（含依赖项目当前
-   * 视频模型能力的声音相关几条），前端不再二次翻译。
+   * 视频模型能力的声音相关几条），前端不二次翻译。
    */
   static async previewReferenceScript(
     projectName: string,
@@ -3524,6 +3826,19 @@ class API {
   ): Promise<ScriptPreview> {
     return this.request(
       `/projects/${encodeURIComponent(projectName)}/reference-videos/episodes/${episode}/script-preview`,
+      { method: "POST", body: JSON.stringify({ prompt }), signal: options?.signal },
+    );
+  }
+
+  static async previewReferenceUnitPrompt(
+    projectName: string,
+    episode: number,
+    unitId: string,
+    prompt: string,
+    options?: { signal?: AbortSignal },
+  ): Promise<ReferenceUnitPromptPreview> {
+    return this.request(
+      `/projects/${encodeURIComponent(projectName)}/reference-videos/episodes/${episode}/units/${encodeURIComponent(unitId)}/prompt-preview`,
       { method: "POST", body: JSON.stringify({ prompt }), signal: options?.signal },
     );
   }

@@ -18,17 +18,17 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from PIL import Image
 
-from lib.data_validator import DataValidator
+from lib.artifacts.version_manager import VersionManager
 from lib.i18n import _ as i18n_message
-from lib.json_io import atomic_write_json
-from lib.project_manager import ProjectManager
-from lib.script_editor import ScriptEditError
-from lib.version_manager import VersionManager
+from lib.infra.json_io import atomic_write_json
+from lib.project.data_validator import DataValidator
+from lib.project.project_manager import ProjectManager
+from lib.script.script_editor import ScriptEditError
 from server.auth import CurrentUserInfo, get_current_user
 from server.error_handlers import register_error_handlers
 from server.routers import end_frames
-from server.services import end_frame as end_frame_service
-from server.services import upload_finalize
+from server.services.currency import upload_finalize
+from server.services.project import end_frame as end_frame_service
 from tests.auth_deps import AUTH_DEPENDENCIES
 
 END_FRAME_REL = "end_frames/scene_E1S01.png"
@@ -228,7 +228,7 @@ class TestSelectChannel:
         assert resp.status_code == 400
         # max_mb 由字节上限整除 1 MB 得出，本例上限被压到 16 字节故为 0
         assert resp.json()["detail"] == i18n_message(
-            "end_frame_source_too_large", max_mb=0, path="storyboards/scene_E1S02.png"
+            "end_frame_source_too_large", max_mb=0, path="storyboards/scene_未命名集 · S02.png"
         )
         assert _segment(pm).get("end_frame_image") is None
 
@@ -911,7 +911,8 @@ class TestReferenceVideoRejection:
         c, pm = _client_with_project(
             tmp_path, monkeypatch, content_mode="narration", script=script, project_generation_mode="reference_video"
         )
-        pm.save_script("demo", script, "custom.json", validate=False)
+        # 文件名不含集号的剧本写盘入口会拒绝，直接落盘模拟外部写入的文件。
+        (pm.get_project_path("demo") / "scripts" / "custom.json").write_text(json.dumps(script), encoding="utf-8")
 
         resp = c.post(
             "/api/v1/projects/demo/shots/E1S01/end-frame/upload?script_file=custom.json",
@@ -926,5 +927,5 @@ class TestValidatorAcceptsWrittenSnapshot:
         _upload(c, _img_bytes("PNG"))
         # end_frames 已登记为允许的项目根目录条目，不被判为未知目录
         assert "end_frames" in DataValidator.ALLOWED_ROOT_ENTRIES
-        result = DataValidator(projects_root=str(pm.projects_root)).validate_project_tree("demo")
+        result = DataValidator(projects_dir=str(pm.projects_dir)).validate_project_tree("demo")
         assert not [e for e in result.errors if "end_frames" in e]

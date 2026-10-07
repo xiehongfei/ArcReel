@@ -1,12 +1,16 @@
 import { useTranslation } from "react-i18next";
 
+import { Button } from "@/components/ui/button";
 import { voidPromise } from "@/utils/async";
+import { episodeItemRefLabel } from "@/utils/episode-display";
 import type { CancelRequest } from "./use-task-cancellation";
 
 interface CancelConfirmDialogProps {
   request: CancelRequest;
   cancelling: boolean;
   failed: boolean;
+  /** 服务端拒绝取消的已本地化原因；为空时显示通用失败文案。 */
+  failureDetail?: string | null;
   onConfirm: () => Promise<void>;
   onDismiss: () => void;
 }
@@ -19,6 +23,7 @@ export function CancelConfirmDialog({
   request,
   cancelling,
   failed,
+  failureDetail,
   onConfirm,
   onDismiss,
 }: CancelConfirmDialogProps) {
@@ -29,10 +34,9 @@ export function CancelConfirmDialog({
     <div
       role="alertdialog"
       aria-label={t("cancel_confirm_aria")}
-      className="border-t border-hairline-soft px-4 py-3"
-      style={{ background: "oklch(0.16 0.010 265 / 0.5)" }}
+      className="flex flex-col gap-2 border-t border-border bg-muted/40 px-4 py-3"
     >
-      <p className="text-[12px] text-text-2">
+      <p className="text-sm text-subtle-foreground">
         {request.kind === "all"
           ? t("cancel_all_confirm", { count: request.queuedCount })
           : cascaded.length > 0
@@ -40,42 +44,27 @@ export function CancelConfirmDialog({
             : t("cancel_single_confirm")}
       </p>
       {cascaded.length > 0 && (
-        <ul className="num mt-1.5 max-h-20 overflow-y-auto text-[10.5px] text-text-4">
+        <ul className="num relative max-h-20 overflow-y-auto text-xs text-muted-foreground">
           {cascaded.map((task) => (
             <li key={task.task_id}>
               {t(`task_type_${task.task_type}`, { defaultValue: task.task_type })} /{" "}
-              {task.resource_id}
+              {episodeItemRefLabel(task.resource_id, task.resource_ref, t)}
             </li>
           ))}
         </ul>
       )}
       {failed && (
-        <p role="alert" className="mt-1.5 text-[11px] text-danger-2">
-          {t("cancel_failed")}
+        <p role="alert" className="text-xs text-destructive">
+          {failureDetail ?? t("cancel_failed")}
         </p>
       )}
-      <div className="mt-2.5 flex gap-2">
-        <button
-          type="button"
-          onClick={voidPromise(onConfirm)}
-          disabled={cancelling}
-          className="focus-ring rounded px-2.5 py-1 text-[11px] font-medium transition-transform disabled:opacity-50"
-          style={{
-            color: "oklch(0.98 0 0)",
-            background: "linear-gradient(135deg, oklch(0.55 0.20 25), oklch(0.45 0.18 25))",
-            boxShadow:
-              "inset 0 1px 0 oklch(1 0 0 / 0.18), 0 4px 14px -4px oklch(0.40 0.18 25 / 0.5)",
-          }}
-        >
+      <div className="flex gap-2">
+        <Button size="sm" variant="destructive" onClick={voidPromise(onConfirm)} disabled={cancelling}>
           {cancelling ? t("cancelling") : t("confirm_cancel")}
-        </button>
-        <button
-          type="button"
-          onClick={onDismiss}
-          className="focus-ring rounded border border-hairline bg-bg-grad-a/50 px-2.5 py-1 text-[11px] text-text-3 transition-colors hover:text-text"
-        >
+        </Button>
+        <Button size="sm" variant="outline" onClick={onDismiss}>
           {t("go_back")}
-        </button>
+        </Button>
       </div>
     </div>
   );

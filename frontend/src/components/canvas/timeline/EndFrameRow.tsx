@@ -1,9 +1,11 @@
 import { useId, useState } from "react";
 import { ChevronRight } from "lucide-react";
+import { cn } from "cn";
+import { Button } from "@/components/ui/button";
 import { useTranslation } from "react-i18next";
 import { API } from "@/api";
-import { AspectFrame } from "@/components/ui/AspectFrame";
-import { InlineWarning } from "@/components/ui/InlineWarning";
+import { AspectFrame } from "@/components/canvas/shared/AspectFrame";
+import { InlineWarning } from "@/components/shared/InlineWarning";
 import { useModelCapabilities } from "@/hooks/useModelCapabilities";
 import { useDemoWorkbench } from "@/onboarding/use-demo-workbench";
 import { useAppStore } from "@/stores/app-store";
@@ -11,10 +13,13 @@ import { useProjectsStore } from "@/stores/projects-store";
 import { isResourceBusy, useActiveResourceIds } from "@/stores/tasks-store";
 import type { EditorContentMode } from "@/utils/script-shape";
 import { errMsg } from "@/utils/async";
+import { itemIdWithinEpisode } from "@/utils/episode-display";
 import { EndFramePicker } from "./EndFramePicker";
 
 interface EndFrameRowProps {
   projectName: string;
+  lastFrame?: boolean | null;
+  capabilitiesLoading?: boolean;
   segmentId: string;
   scriptFile: string;
   contentMode: EditorContentMode;
@@ -27,6 +32,8 @@ interface EndFrameRowProps {
   onSubmittingChange?: (submitting: boolean) => void;
   /** 视频卡的手动上传占用：同一分镜的视频文件正在上传时反向禁用本行的写入通道，避免与其共享的资产落盘并发冲突。 */
   videoUploadBusy?: boolean;
+  /** 本分镜的修改正在保存：「保存并生成」落定后紧接着入队视频，期间改尾帧会让视频用上旧尾帧。 */
+  shotSaving?: boolean;
 }
 
 /**
@@ -44,6 +51,8 @@ interface EndFrameRowProps {
  */
 export function EndFrameRow({
   projectName,
+  lastFrame,
+  capabilitiesLoading,
   segmentId,
   scriptFile,
   contentMode,
@@ -52,6 +61,7 @@ export function EndFrameRow({
   readOnly = false,
   onSubmittingChange,
   videoUploadBusy = false,
+  shotSaving = false,
 }: EndFrameRowProps) {
   const { t } = useTranslation("dashboard");
   const panelId = useId();
@@ -60,12 +70,12 @@ export function EndFrameRow({
   const [submitting, setSubmitting] = useState(false);
   const viewOnly = useDemoWorkbench() || readOnly;
 
-  // 能力按项目生成模式定轴、全项目同一口径（生成模式创建即定），故不带集号。
-  const { lastFrame, loading: capsLoading } = useModelCapabilities({
-    projectName,
-  });
+  const standaloneCapabilities = useModelCapabilities({ projectName, enabled: lastFrame === undefined });
+  const effectiveLastFrame = lastFrame === undefined ? standaloneCapabilities.lastFrame : lastFrame;
+  const capsLoading = capabilitiesLoading ?? standaloneCapabilities.loading;
+
   // 未查到能力（加载中 / 失败）时不谎报不支持：仅明确的 false 才门控。
-  const unsupported = lastFrame === false;
+  const unsupported = effectiveLastFrame === false;
 
   const videoBusyIds = useActiveResourceIds("video", projectName);
   // 占用不区分来源（任务队列在跑 / 视频卡手动上传在途）：二者都在写同一份 project.json，
@@ -76,10 +86,16 @@ export function EndFrameRow({
   // 兄弟控件同步：更换 / 清除 / 选图器的提交入口共读这一个值。
   // 只含占用维度——能力维度（不支持、以及「尚未查到」）一律不参与门控：既然不支持都不
   // 拦，等待查询结果更没有可拦的理由，否则换模型后又会凭能力管线短暂灰掉写入控件。
-  const controlsDisabled = videoBusy || submitting || viewOnly;
+  const controlsDisabled = videoBusy || shotSaving || submitting || viewOnly;
 
   // 灰化控件的 hover 原因。
-  const disabledHint = !viewOnly && videoBusy ? t("end_frame_busy_hint") : undefined;
+  const disabledHint = viewOnly
+    ? undefined
+    : videoBusy
+      ? t("end_frame_busy_hint")
+      : shotSaving
+        ? t("common:save_status_saving")
+        : undefined;
 
   // 已设尾帧 + 模型明确不支持才告警：未设尾帧的分镜没有会被拒绝的东西，不该打扰。
   const showUnsupportedNotice = unsupported && !!endFramePath;
@@ -89,6 +105,10 @@ export function EndFrameRow({
    * 一个竞态窗口。命中则拒绝并给出可见反馈。
    */
   const rejectIfDisabled = (): boolean => {
+    if (shotSaving) {
+      useAppStore.getState().pushToast(t("common:save_status_saving"), "info");
+      return true;
+    }
     if (videoUploadBusy) {
       useAppStore.getState().pushToast(t("end_frame_busy_hint"), "info");
       return true;
@@ -103,7 +123,8 @@ export function EndFrameRow({
     onSubmittingChange?.(value);
   };
 
-  const runWrite = async (action: () => Promise<unknown>, successKey: string) => {
+  // 设置与清除尾帧是即时动作，成功不弹提示
+  const runWrite = async (action: () => Promise<unknown>) => {
     if (rejectIfDisabled()) return;
     updateSubmitting(true);
     try {
@@ -117,7 +138,6 @@ export function EndFrameRow({
       updateSubmitting(false);
     }
     setPickerOpen(false);
-    useAppStore.getState().pushToast(t(successKey, { id: segmentId }), "success");
     // 快照路径固定、换图原地覆盖，须重取项目数据拿新的资产指纹才能 cache-bust。
     // refreshProject 内部吞掉请求错误、以返回值表达结果（从不 reject）：写入已经成功，
     // 刷新失败要单独提示，不能把它误报成尾帧写入失败；刷新被项目切换取消则不代表出错，
@@ -129,22 +149,13 @@ export function EndFrameRow({
   };
 
   const handlePickProjectImage = (sourcePath: string) =>
-    void runWrite(
-      () => API.selectEndFrame(projectName, segmentId, scriptFile, sourcePath),
-      "end_frame_set_success",
-    );
+    void runWrite(() => API.selectEndFrame(projectName, segmentId, scriptFile, sourcePath));
 
   const handlePickUpload = (file: File) =>
-    void runWrite(
-      () => API.uploadEndFrame(projectName, segmentId, scriptFile, file),
-      "end_frame_set_success",
-    );
+    void runWrite(() => API.uploadEndFrame(projectName, segmentId, scriptFile, file));
 
   const handleClear = () =>
-    void runWrite(
-      () => API.clearEndFrame(projectName, segmentId, scriptFile),
-      "end_frame_clear_success",
-    );
+    void runWrite(() => API.clearEndFrame(projectName, segmentId, scriptFile));
 
   const previewUrl = endFramePath ? API.getFileUrl(projectName, endFramePath, fp) : null;
 
@@ -157,48 +168,32 @@ export function EndFrameRow({
       : t("end_frame_summary_unset");
 
   return (
-    <div
-      className="mb-2.5 rounded-[10px]"
-      style={{
-        border: "1px solid var(--color-hairline)",
-        background: "oklch(0.18 0.010 265 / 0.4)",
-      }}
-    >
+    <div className="mb-2.5 rounded-lg border border-border bg-muted/30">
       <button
         type="button"
         onClick={() => setExpanded((prev) => !prev)}
         aria-expanded={expanded}
         aria-controls={panelId}
-        className="focus-ring flex w-full items-center gap-2 px-3 py-2 text-left"
+        className="group/end-frame focus-ring flex w-full items-center gap-2 rounded-lg px-3 py-2 text-left"
       >
         <ChevronRight
           aria-hidden
-          className="h-3.5 w-3.5 transition-transform"
-          style={{
-            color: "var(--color-text-3)",
-            transform: expanded ? "rotate(90deg)" : undefined,
-          }}
+          className="size-3.5 text-muted-foreground transition-transform group-aria-expanded/end-frame:rotate-90"
         />
-        <span className="text-[12px] font-semibold" style={{ color: "var(--color-text-2)" }}>
-          {t("end_frame_title")}
-        </span>
+        <span className="text-xs font-medium text-subtle-foreground">{t("end_frame_title")}</span>
         <span className="flex-1" />
         {previewUrl && (
           <img
             src={previewUrl}
             alt=""
             aria-hidden
-            className="h-4 w-2.5 rounded-[3px] object-cover"
-            style={{ border: "1px solid var(--color-accent-soft)" }}
+            className="h-4 w-2.5 rounded-xs border border-primary/25 object-cover"
           />
         )}
         <span
-          className="text-[11px]"
           // 摘要随能力查询异步变化（检查中 → 已设置 / 未设置），朗读器需要跟上
           aria-live="polite"
-          style={{
-            color: endFramePath ? "var(--color-accent-2)" : "var(--color-text-4)",
-          }}
+          className={cn("text-xs", endFramePath ? "text-primary" : "text-muted-foreground")}
         >
           {summary}
         </span>
@@ -225,78 +220,52 @@ export function EndFrameRow({
       )}
 
       {expanded && (
-        <div
-          id={panelId}
-          className="flex items-start gap-3 px-3 pb-3 pt-1"
-          style={{ borderTop: "1px solid var(--color-hairline-soft)" }}
-        >
+        <div id={panelId} className="flex items-start gap-3 border-t border-border/50 px-3 pt-2.5 pb-3">
           <div
-            className="w-16 shrink-0 overflow-hidden rounded-[6px]"
-            style={{
-              border: previewUrl
-                ? "1px solid var(--color-accent-soft)"
-                : "1px dashed var(--color-hairline-strong)",
-              background: previewUrl ? undefined : "oklch(0.20 0.011 265 / 0.5)",
-            }}
+            className={cn(
+              "w-16 shrink-0 overflow-hidden rounded-sm border",
+              previewUrl ? "border-primary/25" : "border-dashed border-input bg-muted/50",
+            )}
           >
             <AspectFrame ratio={aspectRatio}>
               {previewUrl ? (
                 <img
                   src={previewUrl}
-                  alt={t("end_frame_preview_alt", { id: segmentId })}
-                  className="h-full w-full object-cover"
+                  alt={t("end_frame_preview_alt", { id: itemIdWithinEpisode(segmentId) })}
+                  className="size-full object-cover"
                 />
               ) : (
-                <div
-                  className="grid h-full w-full place-items-center text-[9.5px]"
-                  style={{ color: "var(--color-text-4)" }}
-                >
+                <div className="grid size-full place-items-center text-xs text-muted-foreground">
                   {t("end_frame_summary_unset")}
                 </div>
               )}
             </AspectFrame>
           </div>
-          <div className="flex flex-1 flex-col gap-2 pt-1">
-            <p className="text-[11px] leading-relaxed" style={{ color: "var(--color-text-3)" }}>
-              {t("end_frame_description")}
-            </p>
+          <div className="flex flex-1 flex-col gap-2">
+            <p className="text-xs leading-relaxed text-muted-foreground">{t("end_frame_description")}</p>
             {/* 展开面板讲恢复路径（改模型 / 调能力覆盖），与警告条的「后果 + 清除」互补；
                 未设尾帧时也给，让用户在动手设之前就知道这个模型设了也白设。 */}
             {unsupported && (
-              <p className="text-[11px] leading-relaxed" style={{ color: "var(--color-text-4)" }}>
-                {t("end_frame_unsupported_hint")}
-              </p>
+              <p className="text-xs leading-relaxed text-muted-foreground">{t("end_frame_unsupported_hint")}</p>
             )}
             {!viewOnly && (
-              <div className="flex items-center gap-2">
-                <button
-                  type="button"
+              <div className="flex items-center gap-1.5">
+                <Button
+                  variant="outline"
+                  size="sm"
                   onClick={() => {
                     if (rejectIfDisabled()) return;
                     setPickerOpen(true);
                   }}
                   disabled={controlsDisabled}
                   title={disabledHint}
-                  className="focus-ring rounded-md px-2.5 py-1 text-[11.5px] font-medium transition-colors hover:bg-[oklch(0.26_0.013_265_/_0.7)] disabled:cursor-not-allowed disabled:opacity-50"
-                  style={{
-                    border: "1px solid var(--color-hairline)",
-                    background: "oklch(0.22 0.011 265 / 0.5)",
-                    color: "var(--color-text-2)",
-                  }}
                 >
                   {endFramePath ? t("end_frame_replace") : t("end_frame_choose")}
-                </button>
+                </Button>
                 {endFramePath && (
-                  <button
-                    type="button"
-                    onClick={handleClear}
-                    disabled={controlsDisabled}
-                    title={disabledHint}
-                    className="focus-ring rounded-md px-2.5 py-1 text-[11.5px] transition-colors hover:bg-[oklch(0.26_0.013_265_/_0.7)] disabled:cursor-not-allowed disabled:opacity-50"
-                    style={{ color: "var(--color-text-3)" }}
-                  >
+                  <Button variant="ghost" size="sm" onClick={handleClear} disabled={controlsDisabled} title={disabledHint}>
                     {t("end_frame_clear")}
-                  </button>
+                  </Button>
                 )}
               </div>
             )}

@@ -39,7 +39,6 @@ describe("UsageRecordsSection cancel-all", () => {
       stats: {
         queued: 0,
         running: 0,
-        cancelling: 0,
         succeeded: 0,
         failed: 0,
         cancelled: 0,
@@ -85,7 +84,7 @@ describe("UsageRecordsSection cancel-all", () => {
 
     renderUsageRecordsSection(PROJECT_QUERY);
 
-    expect(await screen.findByText("分镜 E1S10")).toBeInTheDocument();
+    expect(await screen.findByText("S10")).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "全部取消" })).not.toBeInTheDocument();
   });
 
@@ -94,7 +93,7 @@ describe("UsageRecordsSection cancel-all", () => {
 
     renderUsageRecordsSection("section=usage");
 
-    expect(await screen.findByText("分镜 E1S10")).toBeInTheDocument();
+    expect(await screen.findByText("S10")).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "全部取消" })).not.toBeInTheDocument();
   });
 

@@ -3,6 +3,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { Router, useLocation } from "wouter";
 import { memoryLocation } from "wouter/memory-location";
 import { API, type ProjectEventStreamOptions } from "@/api";
+import { LeaveGuardProvider, useLeaveGuard } from "@/components/shared/edit-unit/LeaveGuard";
 import { useProjectEventsSSE } from "./useProjectEventsSSE";
 import { useAppStore } from "@/stores/app-store";
 import { useProjectsStore } from "@/stores/projects-store";
@@ -159,6 +160,44 @@ describe("useProjectEventsSSE", () => {
     expect(useAppStore.getState().assistantToolActivitySuppressed).toBe(true);
   });
 
+  it("navigates product changes to the products page", async () => {
+    const stream = mockProjectEventStream();
+
+    renderHarness("/");
+
+    act(() => {
+      stream.options?.onChanges?.({
+        project_name: "demo",
+        batch_id: "batch-product",
+        fingerprint: "fp-product",
+        generated_at: "2026-03-01T00:00:00Z",
+        source: "filesystem",
+        changes: [
+          {
+            entity_type: "product",
+            action: "created",
+            entity_id: "咖啡",
+            label: "backend fallback",
+            label_key: "named_entity_product",
+            label_params: { id: "咖啡" },
+            focus: { pane: "products", anchor_type: "product", anchor_id: "咖啡" },
+            important: true,
+          },
+        ],
+      });
+    });
+
+    await waitFor(() => {
+      expect(screen.getByTestId("location")).toHaveTextContent("/products");
+    });
+    expect(useAppStore.getState().workspaceNotifications[0]).toEqual(
+      expect.objectContaining({
+        text: "AI 刚新增了 商品「咖啡」，点击查看",
+        target: expect.objectContaining({ type: "product", id: "咖啡", route: "/products" }),
+      }),
+    );
+  });
+
   it("navigates reference video units to the reference canvas via reference_unit target", async () => {
     const stream = mockProjectEventStream();
 
@@ -254,6 +293,57 @@ describe("useProjectEventsSSE", () => {
     });
     expect(screen.getByTestId("location")).toHaveTextContent("/");
     expect(useAppStore.getState().scrollTarget).toBeNull();
+  });
+
+  it("invalidates episode draft views when a reconnect snapshot shows missed changes", () => {
+    // 草稿面板各自取数、只随 draft 事件重拉；断线期间错过的草稿变化要在重连快照时作废。
+    useProjectsStore.setState({
+      currentProjectData: { ...makeGetProjectResult("Demo").project, episodes: [{ episode: 4, title: "雨夜" }] },
+    } as never);
+    const stream = mockProjectEventStream();
+    renderHarness("/");
+    const revision = () => useAppStore.getState().getEntityRevision("draft:episode_4_script_plan");
+
+    act(() => stream.options?.onSnapshot?.({ project_name: "demo", fingerprint: "fp-a" } as never));
+    const before = revision();
+    act(() => stream.options?.onSnapshot?.({ project_name: "demo", fingerprint: "fp-b" } as never));
+
+    expect(revision()).toBeGreaterThan(before);
+    expect(useAppStore.getState().getEntityRevision("draft:episode_4_prompt_authoring")).toBeGreaterThan(0);
+  });
+
+  it("names an episode the Agent just created from the refreshed ledger", async () => {
+    // 事件到达时本地账本还没有这一集；通知应等刷新后按标题成文，而不是显示未命名集。
+    const stream = mockProjectEventStream();
+
+    renderHarness("/");
+    act(() => {
+      stream.options?.onChanges?.({
+        project_name: "demo",
+        batch_id: "batch-episode",
+        fingerprint: "fp-episode",
+        generated_at: "2026-03-01T00:00:00Z",
+        source: "filesystem",
+        changes: [
+          {
+            entity_type: "episode",
+            action: "created",
+            entity_id: "1",
+            label: "集（id=1）",
+            label_key: "episode",
+            label_params: { episode: 1 },
+            episode: 1,
+            focus: null,
+            important: true,
+          },
+        ],
+      });
+    });
+
+    await waitFor(() => {
+      expect(useAppStore.getState().workspaceNotifications.map((n) => n.text).join("\n")).toContain("第一集");
+    });
+    expect(useAppStore.getState().workspaceNotifications.map((n) => n.text).join("\n")).not.toContain("未命名集");
   });
 
   it("shows a toast without navigation for generation completion batches", async () => {
@@ -581,6 +671,51 @@ describe("useProjectEventsSSE", () => {
     });
     expect(screen.getByTestId("location")).toHaveTextContent("/characters");
     expect(useAppStore.getState().scrollTarget).toBeNull();
+  });
+
+  it("有编辑单元带着未保存修改时，Agent 改动不触发自动跳转与定位", async () => {
+    const stream = mockProjectEventStream();
+    const saveNothing = async () => true;
+    function DirtyUnit() {
+      useLeaveGuard({ dirty: true, save: saveNothing });
+      return null;
+    }
+    const { hook } = memoryLocation({ path: "/episodes/1" });
+    render(
+      <Router hook={hook}>
+        <LeaveGuardProvider>
+          <DirtyUnit />
+          <HookHarness projectName="demo" />
+        </LeaveGuardProvider>
+      </Router>,
+    );
+
+    act(() => {
+      stream.options?.onChanges?.({
+        project_name: "demo",
+        batch_id: "batch-dirty",
+        fingerprint: "fp-dirty",
+        generated_at: "2026-03-01T00:00:00Z",
+        source: "filesystem",
+        changes: [
+          {
+            entity_type: "scene",
+            action: "updated",
+            entity_id: "酒馆",
+            label: "场景「酒馆」",
+            focus: { pane: "scenes", anchor_type: "scene", anchor_id: "酒馆" },
+            important: true,
+          },
+        ],
+      });
+    });
+
+    await waitFor(() => {
+      expect(useAppStore.getState().workspaceNotifications[0]?.target?.id).toBe("酒馆");
+    });
+    expect(screen.getByTestId("location")).toHaveTextContent("/episodes/1");
+    expect(useAppStore.getState().scrollTarget).toBeNull();
+    expect(screen.queryByRole("alertdialog")).not.toBeInTheDocument();
   });
 
   it("一次不带聚焦目标的刷新（如 onSnapshot）落定时，不应抢先消费更晚一批 onChanges 排队的目标", async () => {
@@ -927,6 +1062,27 @@ describe("useProjectEventsSSE", () => {
             entity_id: "E1U1",
             label: "视频单元「E1U1」",
             episode: 1,
+            focus: null,
+            important: false,
+          },
+        ]);
+
+        expect(useAppStore.getState().referenceVideoUnitsRevision).toBe(1);
+      },
+    );
+
+    it.each(["character", "scene", "prop", "product"] as const)(
+      "资产 %s 变更让分组缓存失效：单元可用参考图与所落的桶要重拉",
+      async (entityType) => {
+        const stream = mockProjectEventStream();
+
+        renderHarness("/");
+        emit(stream, [
+          {
+            entity_type: entityType,
+            action: "updated",
+            entity_id: "阿离",
+            label: "资产「阿离」",
             focus: null,
             important: false,
           },

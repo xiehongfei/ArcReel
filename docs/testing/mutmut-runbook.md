@@ -1,6 +1,14 @@
 # mutmut 变异测试 runbook
 
-跑一批变异测试、复核结果、改造测试后验收的操作步骤。规范（信号不闸门、存活 mutant 如何接入三步处置、三层验收判据）在 [CONTRIBUTING「变异测试」](../../CONTRIBUTING.md#变异测试)，本文只讲怎么跑。配置在 `pyproject.toml` 的 `[tool.mutmut]`，配置项的取舍理由写在那里的注释里。
+跑一批变异测试、复核结果、改造测试后验收的操作步骤。配置在 `pyproject.toml` 的 `[tool.mutmut]`，配置项的取舍理由写在那里的注释里。
+
+变异得分的定位见 `docs/standards/testing.md`「覆盖率与变异得分只是信号」。变异测试不进 CI，按批次手动运行，把本批模块填进 `[tool.mutmut] only_mutate`。
+
+**存活只是把测试送上审查台，不是删除依据。** 存活 mutant 落在已有测试覆盖的代码上时，按 `docs/standards/testing.md`「每条用例保护一个可观察的契约」的三步处置逐条判定。以下情形不处置：
+
+- 不改既有用例的输入、只加强断言杀不死，必须换输入才能杀死的 mutant（这属于覆盖补偿）。
+- 等价变异体（源码改了但行为不变）。
+- 落在无测试覆盖代码上的 mutant。
 
 ## 1. 环境
 
@@ -26,7 +34,7 @@ uv sync --group mutation
 
   不带参数则按目录汇总跳过行占比，用来看哪些目录整体值得挑。
 
-- **优先级**：按「没跑过、测试多、代码量大」挑，`server/services`、`lib/video_backends`、`lib/custom_provider`、`lib/reference_video` 优先。不找预测候选率或可处置率的规则：替身密度、弱断言用例占比都试过，对结果没有预测力。测试快慢也不是准入条件，超时与并行子进程的问题已在 `tests/conftest.py` 与 `tests/mutmut_plugin.py` 里消除，DB 档集成用例同样跑得干净。
+- **优先级**：按「没跑过、测试多、代码量大」挑，`server/services`、`lib/backends/video_backends`、`lib/custom_provider`、`lib/script/reference_video` 优先。不找预测候选率或可处置率的规则：替身密度、弱断言用例占比都试过，对结果没有预测力。测试快慢也不是准入条件，超时与并行子进程的问题已在 `tests/conftest.py` 与 `tests/mutmut_plugin.py` 里消除，DB 档集成用例同样跑得干净。
 - **终点**：不设。每批跑完算可处置率（判为 ③ 值得保护的存活 mutant 数 / 存活 mutant 数），连续两批明显下降就停。
 
 ### 2.2 跑一轮
@@ -44,7 +52,7 @@ uv sync --group mutation
 
 `only_mutate` 跑完记得还原成注释，`mutants/` 已在 `.gitignore`。
 
-**凡读源码文本而不是 import 模块的用例，都要在 `pytest_add_cli_args` 里按 nodeid `--deselect`，不要整文件 `--ignore`。** `mutants/` 里的源文件同时含所有 mutant 变体（每个字符串字面量都多出 `XXfooXX` / `FOO` 两份），任何扫 `lib/` `server/` 源码字面量再比对登记表的用例都会在 stats 阶段报「未登记」，整轮起不来。`--ignore` 的粒度是文件：同文件里的行为测试会一并消失，它们独家覆盖的 mutant 就记成存活（`test_task_failure_capability.py` 三个扫描用例之外的 100 余个用例就是这种情况）。已排除的是该文件的 `test_capability_codes_registered_no_drift` / `test_no_unscannable_capability_construction_sites` / `test_capability_construction_sites_supply_every_template_param`；新加排除时在 `[tool.mutmut]` 注释里写明它独家能杀什么、为何排除不漏杀（判据同 `test_skill_script_path_guards.py`：排除只多出假存活，不藏假杀死）。
+**凡读源码文本而不是 import 模块的用例，都要在 `pytest_add_cli_args` 里按 nodeid `--deselect`，不要整文件 `--ignore`。** `mutants/` 里的源文件同时含所有 mutant 变体（每个字符串字面量都多出 `XXfooXX` / `FOO` 两份），任何扫 `lib/` `server/` 源码字面量再比对登记表的用例都会在 stats 阶段报「未登记」，整轮起不来。`--ignore` 的粒度是文件：同文件里的行为测试会一并消失，它们独家覆盖的 mutant 就记成存活（`test_task_failure_capability.py` 三个扫描用例之外的 100 余个用例就是这种情况）。已排除的是该文件的 `test_capability_codes_registered_no_drift` / `test_no_unscannable_capability_construction_sites` / `test_capability_construction_sites_supply_every_template_param`；新加排除时在 `[tool.mutmut]` 注释里写明它独家能杀什么、为何排除不漏杀（判据：排除只多出假存活，不藏假杀死）。
 
 ## 3. 读结果
 
@@ -68,10 +76,10 @@ uv sync --group mutation
 
 ```bash
 # 在项目根跑：tests-for-mutant 读 mutants/mutmut-stats.json，在 mutants/ 里跑会报 Failed to load stats
-uv run mutmut tests-for-mutant lib.speech_rate.x_estimate_spoken_seconds__mutmut_8 > nodeids.txt
+uv run mutmut tests-for-mutant lib.speech.speech_rate.x_estimate_spoken_seconds__mutmut_8 > nodeids.txt
 
 # 在 mutants/ 里跑，用 .venv 的解释器，不要用 uv run（见第 6 节）
-cd mutants && MUTANT_UNDER_TEST=lib.speech_rate.x_estimate_spoken_seconds__mutmut_8 \
+cd mutants && MUTANT_UNDER_TEST=lib.speech.speech_rate.x_estimate_spoken_seconds__mutmut_8 \
   ../.venv/bin/python -m pytest -x -q @../nodeids.txt
 ```
 
@@ -120,7 +128,6 @@ uv run python scripts/mutmut_compare.py \
 - **新增的测试文件不触及任何被变异函数时，增量 stats 会中止。** mutmut 检测到新用例只对它们跑一次 stats，若这批用例没碰到任何 mutant，报 `Stopping early, because we could not find any test case for any mutant` 退出。删 `mutants/mutmut-stats.json` 走全量 stats。
 - **不要在 `mutants/` 里跑 `uv run`。** uv 会按那份 `pyproject.toml` 副本另建一个环境，mutmut 不在里面，变异模块顶部的 trampoline import 直接 `ModuleNotFoundError`。用 `../.venv/bin/python`。
 - **`tests-for-mutant` 只在项目根可用。** 它读 `mutants/mutmut-stats.json`，在 `mutants/` 里跑找不到。
-- **`tests/unit/test_skill_script_path_guards.py` 被整体排除**，理由在 `[tool.mutmut]` 注释。排除只会多出假存活（多复核一个），不会造成假杀死。
 - **`timeout_multiplier` 不要调小。** 调小不省时间，只会让已证实的真存活被记成 killed，把无效测试藏起来。
 - **−11（段错误）成批出现即整轮作废，不要逐个复核。** 已知的一种成因在 macOS：环境里没有 `*_proxy` 变量时，`urllib.request.getproxies()` 经 `_scproxy` 调 SystemConfiguration 读系统代理，该框架在 fork 出的多线程子进程里直接段错误，凡构造 `openai.OpenAI` / `httpx.Client` 的用例都中招（第二批 2186 个里 577 个），而同一个 mutant 在新进程里复核却正常。`tests/mutmut_plugin.py` 已把这两个入口换成常量实现；再成批出现就用 `PYTHONFAULTHANDLER=1 uv run mutmut run <mutant>` 单跑一个看崩溃栈，别当成负载或偶发。判据：−11 只该零星出现（首批 616 个里 2 个）。
 - **测试选集走全量。** 只跑 `tests/unit` 快 5.5 倍，但约 45% 的存活是假的，每个都要复核一次全量套件，总账更贵。
@@ -142,21 +149,21 @@ uv run python scripts/mutmut_compare.py \
 
 | 模块 | 批次 | 票号 | 研究分支 |
 | --- | --- | --- | --- |
-| `lib/generation_type_buckets.py` | 首批 A 组 | #2257 | `research/mutmut-batch-1`（`baseline/A/`） |
-| `lib/content_digest.py` | 首批 A 组 | #2257 | `research/mutmut-batch-1`（`baseline/A/`） |
-| `lib/episode_paths.py` | 首批 A 组 | #2257 | `research/mutmut-batch-1`（`baseline/A/`） |
-| `lib/grid/splitter.py` | 首批 A 组 | #2257 | `research/mutmut-batch-1`（`baseline/A/`） |
-| `lib/speech_rate.py` | 首批 A 组 | #2257 | `research/mutmut-batch-1`（`baseline/A/`） |
-| `lib/text_metrics.py` | 首批 A 组 | #2257 | `research/mutmut-batch-1`（`baseline/A/`） |
+| `lib/backends/generation_type_buckets.py` | 首批 A 组 | #2257 | `research/mutmut-batch-1`（`baseline/A/`） |
+| `lib/infra/content_digest.py` | 首批 A 组 | #2257 | `research/mutmut-batch-1`（`baseline/A/`） |
+| `lib/episode/episode_paths.py` | 首批 A 组 | #2257 | `research/mutmut-batch-1`（`baseline/A/`） |
+| `lib/script/grid/splitter.py` | 首批 A 组 | #2257 | `research/mutmut-batch-1`（`baseline/A/`） |
+| `lib/speech/speech_rate.py` | 首批 A 组 | #2257 | `research/mutmut-batch-1`（`baseline/A/`） |
+| `lib/infra/text_metrics.py` | 首批 A 组 | #2257 | `research/mutmut-batch-1`（`baseline/A/`） |
 | `lib/custom_provider/discovery.py` | 首批 B 组 | #2257 | `research/mutmut-batch-1`（`baseline/B/`） |
-| `lib/text_backends/openai.py` | 首批 B 组 | #2257 | `research/mutmut-batch-1`（`baseline/B/`） |
-| `lib/text_backends/instructor_support.py` | 第二批池 1 | #2297 | `research/mutmut-batch-2` |
-| `lib/text_backends/ark.py` | 第二批池 1 | #2297 | `research/mutmut-batch-2` |
-| `lib/text_backends/gemini.py` | 第二批池 1 | #2297 | `research/mutmut-batch-2` |
-| `lib/text_backends/grok.py` | 第二批池 1 | #2297 | `research/mutmut-batch-2` |
-| `lib/video_backends/gemini.py` | 第二批池 1 | #2297 | `research/mutmut-batch-2` |
-| `lib/image_backends/dashscope.py` | 第二批池 1 | #2297 | `research/mutmut-batch-2` |
-| `lib/image_backends/minimax.py` | 第二批池 1 | #2297 | `research/mutmut-batch-2` |
+| `lib/backends/text_backends/openai.py` | 首批 B 组 | #2257 | `research/mutmut-batch-1`（`baseline/B/`） |
+| `lib/backends/text_backends/instructor_support.py` | 第二批池 1 | #2297 | `research/mutmut-batch-2` |
+| `lib/backends/text_backends/ark.py` | 第二批池 1 | #2297 | `research/mutmut-batch-2` |
+| `lib/backends/text_backends/gemini.py` | 第二批池 1 | #2297 | `research/mutmut-batch-2` |
+| `lib/backends/text_backends/grok.py` | 第二批池 1 | #2297 | `research/mutmut-batch-2` |
+| `lib/backends/video_backends/gemini.py` | 第二批池 1 | #2297 | `research/mutmut-batch-2` |
+| `lib/backends/image_backends/dashscope.py` | 第二批池 1 | #2297 | `research/mutmut-batch-2` |
+| `lib/backends/image_backends/minimax.py` | 第二批池 1 | #2297 | `research/mutmut-batch-2` |
 | `lib/custom_provider/backends.py` | 第二批池 1 | #2297 | `research/mutmut-batch-2` |
 | `server/agent_runtime/sdk_tools/asset_inventory.py` | 第二批池 2 | #2298 | `research/mutmut-batch-2`（`pool2/`） |
 | `server/agent_runtime/sdk_tools/enqueue_assets.py` | 第二批池 2 | #2298 | `research/mutmut-batch-2`（`pool2/`） |

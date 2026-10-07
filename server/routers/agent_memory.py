@@ -18,10 +18,9 @@ from typing import Any
 from fastapi import APIRouter, Request
 from fastapi.responses import Response
 
-from lib.agent_memory_paths import project_memory_dir, user_memory_dir
-from lib.agent_memory_store import AgentMemoryStore
-from lib.api_errors import BadRequestError, NotFoundError
-from lib.project_manager import get_project_manager
+from lib.agent.agent_memory_store import AgentMemoryStore
+from lib.infra.api_errors import BadRequestError, NotFoundError
+from lib.project.project_manager import get_project_manager
 from server.auth import CurrentUser, CurrentUserInfo
 
 user_router = APIRouter(prefix="/agent/memory")
@@ -33,7 +32,7 @@ _TEXT_MEDIA_TYPE = "text/plain; charset=utf-8"
 
 
 def _user_store(user: CurrentUserInfo) -> AgentMemoryStore:
-    return AgentMemoryStore(user_memory_dir(get_project_manager().projects_root, user.id))
+    return AgentMemoryStore(get_project_manager().layout.user_memory_dir(user.id))
 
 
 def _project_store(project_name: str) -> AgentMemoryStore:
@@ -44,7 +43,7 @@ def _project_store(project_name: str) -> AgentMemoryStore:
         raise BadRequestError("invalid_project_name", name=project_name) from exc
     except FileNotFoundError as exc:
         raise NotFoundError("project_not_found", name=project_name) from exc
-    return AgentMemoryStore(project_memory_dir(project_dir))
+    return AgentMemoryStore.for_project(project_dir)
 
 
 async def _run(build_store: Callable[[], AgentMemoryStore], action: Callable[[AgentMemoryStore], Any]) -> Any:

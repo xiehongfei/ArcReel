@@ -11,8 +11,7 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from lib.api_errors import BadRequestError
-from lib.artifact_manifest import (
+from lib.artifacts.artifact_manifest import (
     HASH_ALGORITHM,
     MANIFEST_FILENAME,
     MANIFEST_SCHEMA_VERSION,
@@ -23,17 +22,19 @@ from lib.artifact_manifest import (
     ArtifactManifestEntry,
     ArtifactStatus,
     ProjectArtifactManifestAdapter,
-    compose_video_artifact_basis,
 )
-from lib.project_schema import CURRENT_PROJECT_SCHEMA_VERSION
-from lib.speech_artifact_provenance import build_video_duration_basis
-from lib.version_manager import VersionManager
-from lib.video_artifact_facts import VideoArtifactCurrencyFacts
-from lib.visual_artifact_provenance import build_asset_sheet_visual_basis, build_storyboard_image_visual_basis
+from lib.artifacts.version_manager import VersionManager
+from lib.artifacts.visual_artifact_provenance import build_asset_sheet_visual_basis, build_storyboard_image_visual_basis
+from lib.infra.api_errors import BadRequestError
+from lib.project.project_schema import CURRENT_PROJECT_SCHEMA_VERSION
+from lib.speech.speech_artifact_provenance import build_video_duration_basis
 from server.auth import CurrentUserInfo, get_current_user
 from server.error_handlers import register_error_handlers
 from server.routers import versions
+from server.services.currency import typed_media_restore
+from server.services.currency.artifact_version_restore import TypedMediaRestoreTarget
 from tests.auth_deps import AUTH_DEPENDENCIES
+from tests.factories import add_typed_video_version
 
 # 产物清单是读取已生成产物的唯一口径，还原路径要落到真实的 v8 项目目录才有意义。
 _MINIMAL_PROJECT = {
@@ -225,64 +226,12 @@ class _GridPM:
 
 
 def _typed_video_versions(project_path: Path, resource_type: str, resource_id: str) -> VersionManager:
-    current_file, _relative = versions._resolve_resource_path(resource_type, resource_id, project_path)
-    current_file.parent.mkdir(parents=True, exist_ok=True)
-    current_file.write_bytes(b"typed-video")
-    visual = ArtifactBasis.build(
-        (
-            "artifact-visual/video-reference"
-            if resource_type == "reference_videos"
-            else "artifact-visual/video-storyboard"
-        ),
-        kind_version=1,
-        inputs=(
-            {
-                "unit_id": resource_id,
-                "visual_lines": ["Run."],
-                "style": "cinematic",
-                "canvas": {"aspect_ratio": "9:16"},
-                "request_references": [],
-            }
-            if resource_type == "reference_videos"
-            else {
-                "resource_id": resource_id,
-                "visual_prompt": {"action": "Run.", "camera_motion": "Static"},
-                "canvas": {"aspect_ratio": "9:16"},
-                "frames": [{"role": "storyboard", "sha256": "a" * 64}],
-            }
-        ),
-    )
-    speech = ArtifactBasis.build("artifact-speech/video", kind_version=1, inputs={"mode": "narrator_voiceover"})
-    duration = build_video_duration_basis(4)
-    currency = VideoArtifactCurrencyFacts(
-        episode=1,
-        request_duration_seconds=4,
-        visual_basis=visual,
-        speech_basis=speech,
-        duration_basis=duration,
-        video_basis=compose_video_artifact_basis(visual=visual, speech=speech, duration=duration),
-        voice_style_speakers=(),
-        duration_tiers=(4,),
-        reference_image_limit=1 if resource_type == "reference_videos" else None,
-        parent_version=0,
-    )
-    manager = VersionManager(project_path)
-    manager.add_version(
-        resource_type,
-        resource_id,
-        "typed video",
-        source_file=current_file,
-        execution_checkpoint_schema_version=3,
-        execution_duration_seconds=4,
-        execution_request_digest="d" * 64,
-        artifact_video_currency=currency.to_dict(),
-        execution_script_file="episode_1.json",
-    )
-    return manager
+    add_typed_video_version(project_path, resource_type, resource_id)
+    return VersionManager(project_path)
 
 
 def _typed_audio_project(tmp_path: Path) -> tuple[object, Path, VersionManager]:
-    from lib.project_manager import ProjectManager
+    from lib.project.project_manager import ProjectManager
 
     pm = ProjectManager(tmp_path)
     pm.create_project("demo")
@@ -348,8 +297,8 @@ def _client(monkeypatch, tmp_path):
 
 class TestVersionsRouter:
     def test_storyboard_restore_registers_its_frozen_basis_instead_of_live_inputs(self, tmp_path, monkeypatch):
-        from lib.artifact_activation import ArtifactCurrencyResolver
-        from lib.project_manager import ProjectManager
+        from lib.artifacts.artifact_activation import ArtifactCurrencyResolver
+        from lib.project.project_manager import ProjectManager
 
         pm = ProjectManager(tmp_path)
         pm.create_project("demo")
@@ -423,9 +372,9 @@ class TestVersionsRouter:
         )
 
     def test_unverifiable_image_restore_removes_the_previous_claim(self, tmp_path, monkeypatch):
-        from lib.project_manager import ProjectManager
+        from lib.project.project_manager import ProjectManager
 
-        project_path = tmp_path / "demo"
+        project_path = tmp_path / "projects" / "demo"
         (project_path / "characters").mkdir(parents=True)
         project_path.joinpath("project.json").write_text(
             f'{{"schema_version":{CURRENT_PROJECT_SCHEMA_VERSION},"title":"Demo","content_mode":"narration",'
@@ -464,9 +413,9 @@ class TestVersionsRouter:
         assert ProjectArtifactManifestAdapter(project_path).get_entry(key) is None
 
     def test_deleted_asset_restore_does_not_create_an_orphan_claim(self, tmp_path, monkeypatch):
-        from lib.project_manager import ProjectManager
+        from lib.project.project_manager import ProjectManager
 
-        project_path = tmp_path / "demo"
+        project_path = tmp_path / "projects" / "demo"
         (project_path / "characters").mkdir(parents=True)
         project_path.joinpath("project.json").write_text(
             f'{{"schema_version":{CURRENT_PROJECT_SCHEMA_VERSION},"title":"Demo","content_mode":"narration",'
@@ -517,9 +466,9 @@ class TestVersionsRouter:
         tmp_path,
         monkeypatch,
     ):
-        from lib.project_manager import ProjectManager
+        from lib.project.project_manager import ProjectManager
 
-        project_path = tmp_path / "demo"
+        project_path = tmp_path / "projects" / "demo"
         (project_path / "characters").mkdir(parents=True)
         project_path.joinpath("project.json").write_text(
             f'{{"schema_version":{CURRENT_PROJECT_SCHEMA_VERSION},"title":"Demo","content_mode":"narration",'
@@ -563,9 +512,9 @@ class TestVersionsRouter:
         assert (project_path / "project.json").read_bytes() == project_before
 
     def test_storyboard_restore_duplicate_identity_rolls_back_every_formal_file(self, tmp_path, monkeypatch):
-        from lib.project_manager import ProjectManager
+        from lib.project.project_manager import ProjectManager
 
-        project_path = tmp_path / "demo"
+        project_path = tmp_path / "projects" / "demo"
         scripts_dir = project_path / "scripts"
         storyboards_dir = project_path / "storyboards"
         scripts_dir.mkdir(parents=True)
@@ -632,7 +581,7 @@ class TestVersionsRouter:
         assert not (project_path / MANIFEST_FILENAME).exists()
 
     def test_storyboard_restore_rollback_holds_script_lock_against_concurrent_edit(self, tmp_path, monkeypatch):
-        from lib.project_manager import ProjectManager
+        from lib.project.project_manager import ProjectManager
 
         pm = ProjectManager(tmp_path)
         pm.create_project("demo")
@@ -789,16 +738,21 @@ class TestVersionsRouter:
 
     @pytest.mark.parametrize("resource_type", ["videos", "reference_videos"])
     def test_typed_video_restore_uses_selection_finalization_guard(self, tmp_path, monkeypatch, resource_type):
+        from lib.project.project_manager import ProjectManager
+
         resource_id = "E1S01"
-        project_path = tmp_path / "demo"
-        project_path.mkdir()
+        pm = ProjectManager(tmp_path)
+        pm.create_project("demo")
+        pm.create_project_metadata("demo", "Demo", "Anime", "narration")
+        pm.save_script(
+            "demo",
+            {"episode": 1, "segments": [{"segment_id": resource_id, "generated_assets": {}}]},
+            "episode_1.json",
+            validate=False,
+        )
+        project_path = pm.get_project_path("demo")
         guard_active = False
         guard_calls = []
-
-        class _PM:
-            @staticmethod
-            def get_project_path(_project_name):
-                return project_path
 
         @asynccontextmanager
         async def _guard(**identity):
@@ -810,7 +764,7 @@ class TestVersionsRouter:
             finally:
                 guard_active = False
 
-        target = versions.TypedMediaRestoreTarget(
+        target = TypedMediaRestoreTarget(
             episode=1,
             script_file="episode_1.json",
             basis=ArtifactBasisDescriptor.from_basis(build_video_duration_basis(4)),
@@ -821,11 +775,11 @@ class TestVersionsRouter:
             assert guard_active
             return {"restored_version": 1, "current_version": 1, "prompt": "p"}
 
-        monkeypatch.setattr(versions, "get_project_manager", _PM)
+        monkeypatch.setattr(versions, "get_project_manager", lambda: pm)
         monkeypatch.setattr(versions, "get_version_manager", lambda _project_name: _FakeVM(project_path))
-        monkeypatch.setattr(versions, "get_typed_media_restore_target", lambda *_args, **_kwargs: target)
-        monkeypatch.setattr(versions, "restore_typed_media_version", _restore)
-        monkeypatch.setattr(versions, "generation_admission_lock", _guard)
+        monkeypatch.setattr(typed_media_restore, "get_typed_media_restore_target", lambda *_args, **_kwargs: target)
+        monkeypatch.setattr(typed_media_restore, "restore_typed_media_version", _restore)
+        monkeypatch.setattr(typed_media_restore, "generation_admission_lock", _guard)
 
         app = FastAPI()
         app.dependency_overrides[get_current_user] = lambda: CurrentUserInfo(id="default", sub="testuser", role="admin")
@@ -842,8 +796,7 @@ class TestVersionsRouter:
         pm, _project_path, manager = _typed_audio_project(tmp_path)
         monkeypatch.setattr(versions, "get_project_manager", lambda: pm)
         monkeypatch.setattr(versions, "get_version_manager", lambda project_name: manager)
-        monkeypatch.setattr(versions, "active_tts_resource_ids", AsyncMock(return_value=frozenset()))
-        monkeypatch.setattr(versions, "active_narrated_video_resource_ids", AsyncMock(return_value=frozenset()))
+        monkeypatch.setattr(typed_media_restore, "active_tts_resource_ids", AsyncMock(return_value=frozenset()))
 
         app = FastAPI()
         app.dependency_overrides[get_current_user] = lambda: CurrentUserInfo(id="default", sub="testuser", role="admin")
@@ -861,31 +814,8 @@ class TestVersionsRouter:
         monkeypatch.setattr(versions, "get_project_manager", lambda: pm)
         monkeypatch.setattr(versions, "get_version_manager", lambda project_name: manager)
         monkeypatch.setattr(
-            versions,
+            typed_media_restore,
             "active_tts_resource_ids",
-            AsyncMock(return_value=frozenset({"E1S01"})),
-        )
-        monkeypatch.setattr(versions, "active_narrated_video_resource_ids", AsyncMock(return_value=frozenset()))
-
-        app = FastAPI()
-        app.dependency_overrides[get_current_user] = lambda: CurrentUserInfo(id="default", sub="testuser", role="admin")
-        app.include_router(versions.router, prefix="/api/v1", dependencies=AUTH_DEPENDENCIES)
-        register_error_handlers(app)
-        with TestClient(app) as client:
-            response = client.post("/api/v1/projects/demo/versions/audio/E1S01/restore/1")
-
-        assert response.status_code == 409
-        assert (project_path / "audio" / "segment_E1S01.wav").read_bytes() == before
-
-    def test_audio_restore_is_blocked_while_video_consumes_current_tts(self, tmp_path, monkeypatch):
-        pm, project_path, manager = _typed_audio_project(tmp_path)
-        before = (project_path / "audio" / "segment_E1S01.wav").read_bytes()
-        monkeypatch.setattr(versions, "get_project_manager", lambda: pm)
-        monkeypatch.setattr(versions, "get_version_manager", lambda project_name: manager)
-        monkeypatch.setattr(versions, "active_tts_resource_ids", AsyncMock(return_value=frozenset()))
-        monkeypatch.setattr(
-            versions,
-            "active_narrated_video_resource_ids",
             AsyncMock(return_value=frozenset({"E1S01"})),
         )
 
@@ -917,8 +847,8 @@ class TestVersionsRouter:
     def test_grid_restore_resets_split_state_without_touching_scripts(self, tmp_path, monkeypatch):
         """grids 还原放行：只换回联合图并复位宫格记录的切分态；不同步任何剧本、
         frame_chain 原样保留，分镜图不被触碰。"""
-        from lib.grid.models import GridGeneration
-        from lib.grid_manager import GridManager
+        from lib.script.grid.grid_manager import GridManager
+        from lib.script.grid.models import GridGeneration
 
         grid = GridGeneration.create(
             episode=1,
@@ -1056,8 +986,8 @@ class TestVersionsRouter:
 
         还原同样会换掉联合图并复位宫格记录，闸门漏在这里就成了改写残留 grid 的绕行路径。
         """
-        from lib.grid.models import GridGeneration
-        from lib.grid_manager import GridManager
+        from lib.script.grid.grid_manager import GridManager
+        from lib.script.grid.models import GridGeneration
 
         grid = GridGeneration.create(
             episode=1,
@@ -1106,8 +1036,8 @@ class TestVersionsRouter:
         """生成在途时还原不把记录复位成 completed：记录一旦谎报空闲，
         切分/上传的在途闸门就会放行，用户可对着即将被 worker 覆写的联合图落格。
         切分态仍无条件作废——联合图内容确已换成历史版本。"""
-        from lib.grid.models import GridGeneration
-        from lib.grid_manager import GridManager
+        from lib.script.grid.grid_manager import GridManager
+        from lib.script.grid.models import GridGeneration
 
         grid = GridGeneration.create(
             episode=1,
@@ -1146,7 +1076,7 @@ class TestVersionsRouter:
 
     def test_reference_video_restore_returns_thumbnail_fingerprint(self, tmp_path, monkeypatch):
         """reference_videos 还原放行：清缩略图并以 fingerprint=0 通知前端失效。"""
-        from lib.project_manager import ProjectManager
+        from lib.project.project_manager import ProjectManager
 
         real_pm = ProjectManager(tmp_path)
         real_pm.create_project("demo")
@@ -1204,7 +1134,7 @@ class TestVersionsRouter:
 
     def test_ad_reference_video_restore_preserves_inert_legacy_source_signature(self, tmp_path, monkeypatch):
         """还原只更新成片元数据；遗留来源签名既不读取版本档案，也不清理或覆盖。"""
-        from lib.project_manager import ProjectManager
+        from lib.project.project_manager import ProjectManager
 
         real_pm = ProjectManager(tmp_path)
         real_pm.create_project("demo")
@@ -1251,7 +1181,7 @@ class TestVersionsRouter:
 
     def test_video_restore_clears_stale_uri_and_thumbnail_metadata(self, tmp_path, monkeypatch):
         """videos 还原同步剧本元数据：还原的是历史本地文件，过期 provider URI 与已删缩略图须清空。"""
-        from lib.project_manager import ProjectManager
+        from lib.project.project_manager import ProjectManager
 
         real_pm = ProjectManager(tmp_path)
         real_pm.create_project("demo")
@@ -1359,7 +1289,7 @@ class TestVersionsRouter:
         return TestClient(app)
 
     def test_storyboard_restore_syncs_scripts_with_error_tolerance(self, tmp_path, monkeypatch):
-        from lib.project_manager import ProjectManager
+        from lib.project.project_manager import ProjectManager
 
         pm = ProjectManager(tmp_path)
         scripts_dir = self._restore_sync_project(
@@ -1391,7 +1321,7 @@ class TestVersionsRouter:
     def test_storyboard_restore_refuses_while_a_sibling_script_is_dirty(self, tmp_path, monkeypatch):
         """跨集同步会跳过脏 sibling，但产物清单认领要按全部剧集绑定取证：
         脏 sibling 让认领无法解析，整个还原按 400 拒绝而不是静默放行。"""
-        from lib.project_manager import ProjectManager
+        from lib.project.project_manager import ProjectManager
 
         pm = ProjectManager(tmp_path)
         scripts_dir = self._restore_sync_project(
@@ -1449,7 +1379,7 @@ class TestVersionsRouter:
             assert resp.status_code == 500
 
     def test_orphaned_storyboard_version_restore_succeeds_without_a_script_binding(self, tmp_path, monkeypatch):
-        from lib.project_manager import ProjectManager
+        from lib.project.project_manager import ProjectManager
 
         pm = ProjectManager(tmp_path)
         pm.create_project("demo")
@@ -1479,7 +1409,7 @@ class TestVersionsRouter:
         assert ProjectArtifactManifestAdapter(project_path).get_entry(key) is None
 
     def test_storyboard_restore_does_not_swallow_script_write_oserror(self, tmp_path, monkeypatch):
-        from lib.project_manager import ProjectManager
+        from lib.project.project_manager import ProjectManager
 
         class _WriteFailPM(ProjectManager):
             fail_writes = False
@@ -1532,7 +1462,7 @@ class TestVersionsRouter:
         """跨集同步 sibling 集遇到 transient IO 错误(OSError)不应让主集 restore 5xx——
         restore 主集已成功,housekeeping 性质的 sibling 同步应降级跳过 + warning。
         """
-        from lib.project_manager import ProjectManager
+        from lib.project.project_manager import ProjectManager
 
         class _TransientIOFailPM(ProjectManager):
             """只在 sibling 集读取边界注入 transient IO failure。"""

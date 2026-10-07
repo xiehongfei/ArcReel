@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from lib.profile_frontmatter import FrontmatterError, parse_agent_document, parse_profile_metadata
+from lib.agent.profile_frontmatter import FrontmatterError, parse_agent_document, parse_profile_metadata
 
 
 def test_parse_agent_document_reads_identity_skills_and_body(tmp_path: Path) -> None:

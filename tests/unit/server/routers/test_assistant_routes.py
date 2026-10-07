@@ -5,9 +5,9 @@ from unittest.mock import AsyncMock, patch
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from lib.i18n import get_translator
 from server.auth import CurrentUserInfo, get_current_user
 from server.error_handlers import register_error_handlers
+from server.i18n import get_translator
 from server.routers import assistant
 from tests.auth_deps import AUTH_DEPENDENCIES
 from tests.factories import make_session_meta, make_translator
@@ -244,6 +244,7 @@ class TestAssistantRoutes:
         assert failure["project_name"] == PROJECT
         assert failure["session_id"] is None
         assert failure["summary"] == {
+            "key": "startup_failed",
             "source": "sdk_stderr",
             "type": "NotImplementedError",
             "message": stderr_text,
