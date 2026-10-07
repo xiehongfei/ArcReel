@@ -1,7 +1,7 @@
 """Host-neutral tool for instruction-based image editing (see ``docs/adr/0050``).
 
-Editing forks the **image**, not the prompt: the current image is the sole reference,
-the user's instruction is the sole prompt, ``image_prompt`` is never rewritten. This is
+Editing forks the **image**, not the prompt: the current image is the edit base,
+storyboards also carry bound character sheets, and ``image_prompt`` is never rewritten. This is
 the tool-facing entry point for that flow — the fail-fast i2i check and resource
 resolution reuse the same helpers the HTTP endpoint (``server/routers/generate.py``)
 uses, so the two entry points can't diverge (see ``server/services/image_edit_tasks.py``).

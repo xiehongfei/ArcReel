@@ -1,7 +1,7 @@
 """图片指令式编辑（image edit）任务执行层。
 
-编辑语义（见 ``docs/adr/0050`` 与 CONTEXT.md「图片编辑」术语）：以资源的当前图为唯一
-参考图、用户编辑指令为唯一 prompt 调用 i2i，产出新图覆盖 current 并自动进版本历史；
+编辑语义（见 ``docs/adr/0050`` 与 CONTEXT.md「图片编辑」术语）：以资源当前图为编辑底图，
+分镜图附加本镜角色资产图作为身份参考；按用户编辑指令调用 i2i，新图覆盖 current 并进入版本历史；
 原 image_prompt 不回写——编辑是对**图**的分叉而非对 prompt 的分叉。
 
 支持的资源：character / scene / prop / product 四类资产图 + 角色衍生资产图 + storyboard 分镜图。
@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -24,6 +25,8 @@ from lib.artifact_activation import (
     active_artifact_currency_resolver,
     artifact_input_is_usable,
     assert_artifact_input_claims_usable,
+    assert_current_artifact_input_claims_usable,
+    bind_artifact_input_claims_to_frozen_visuals,
     resolve_artifact_episode,
 )
 from lib.artifact_manifest import ArtifactBasis, ArtifactKey
@@ -39,6 +42,8 @@ from lib.asset_types import ASSET_SPECS, resolve_asset_key
 from lib.async_thread import run_noninterruptible_sync
 from lib.db.base import DEFAULT_USER_ID
 from lib.image_reference_snapshot import freeze_image_references
+from lib.prompt_builders import render_storyboard_edit_prompt
+from lib.reference_image_numbering import clamp_reference_images
 from lib.resource_paths import CHARACTER_DERIVATIVE_RESOURCE_TYPE, resource_relative_path
 from lib.script_models import get_generated_assets
 from lib.storyboard_sequence import find_storyboard_item, get_storyboard_items
@@ -57,6 +62,7 @@ from server.services.generation_tasks import (
     _finalize_asset_sheet_task,
     _finalize_storyboard_image_task,
     _storyboard_formal_image_callback,
+    collect_storyboard_character_references,
     compensable_formal_task_result,
     get_aspect_ratio,
     get_project_manager,
@@ -94,18 +100,18 @@ def _build_image_edit_basis(
     resource_id: str,
     instruction: str,
     aspect_ratio: str,
-    source: VisualReference,
+    references: Sequence[VisualReference],
 ) -> ArtifactBasis:
-    """Describe the prompt and sole image input actually used by image editing."""
+    """Record the edit instruction and complete assembled visual inputs."""
 
     if resource_type == "storyboard":
         return build_storyboard_image_visual_basis(
             resource_id=resource_id,
             image_prompt=instruction,
-            # Editing sends only the instruction; project style is not a provider input.
+            # Project style is not a separate input to editing.
             style="",
             aspect_ratio=aspect_ratio,
-            references=(source,),
+            references=references,
         )
     return build_asset_sheet_visual_basis(
         # 衍生与本体共用 asset-sheet 依据种类，只是 asset id 写作「本体/衍生」。
@@ -116,7 +122,7 @@ def _build_image_edit_basis(
         style="",
         style_description="",
         aspect_ratio=aspect_ratio,
-        references=(source,),
+        references=references,
     )
 
 
@@ -331,6 +337,7 @@ async def execute_image_edit_task(
                 script=_script,
                 script_filename=str(script_file),
             )
+        _resolver = active_artifact_currency_resolver(_project_path, _project)
         _source = resolve_usable_image_edit_source(
             project=_project,
             project_path=_project_path,
@@ -338,7 +345,7 @@ async def execute_image_edit_task(
             resource_id=resource_id,
             script=_script,
             artifact_episode=_artifact_episode,
-            resolver=active_artifact_currency_resolver(_project_path, _project),
+            resolver=_resolver,
         )
         if _source is None:
             raise ValueError(f"no current image to edit: {resource_type}/{resource_id}")
@@ -348,30 +355,48 @@ async def execute_image_edit_task(
         _current_rel = _source.artifact_path
         _current_image = _project_path / _current_rel
         _aspect_ratio = get_aspect_ratio(_project, version_resource_type)
-        _frozen = freeze_image_references(
-            [_current_image],
-            [
-                VisualReference(
-                    path=_current_image,
-                    role="edit_source",
-                    logical_type=resource_type,
-                    logical_id=_key,
-                    kind="current",
-                )
-            ],
-        )
+        _claims = list(_source.formal_claims)
+        _references: list[object] = [_current_image]
+        _visuals = [
+            VisualReference(
+                path=_current_image,
+                role="edit_source",
+                logical_type=resource_type,
+                logical_id=_key,
+                kind="current",
+            )
+        ]
+        if _script is not None:
+            characters = collect_storyboard_character_references(
+                _project,
+                _project_path,
+                _script,
+                _key,
+                currency_resolver=_resolver,
+                formal_claims=_claims,
+            )
+            _references.extend(characters.provider_references)
+            _visuals.extend(characters.visual_references)
+        _frozen = freeze_image_references(_references, _visuals)
         try:
+            _bound_claims = bind_artifact_input_claims_to_frozen_visuals(
+                project_path=_project_path,
+                resolver=_resolver,
+                claims=_claims,
+                source_references=_visuals,
+                frozen_references=_frozen.visual_references,
+            )
             _basis = _build_image_edit_basis(
                 resource_type=resource_type,
                 resource_id=_key,
                 instruction=instruction,
                 aspect_ratio=_aspect_ratio,
-                source=_frozen.visual_references[0],
+                references=_frozen.visual_references,
             )
         except BaseException:
             _frozen.cleanup()
             raise
-        return _project, _project_path, _current_image, _key, _aspect_ratio, _frozen, _basis, _source
+        return _project, _project_path, _current_image, _key, _aspect_ratio, _frozen, _basis, _source, _bound_claims
 
     (
         project,
@@ -382,8 +407,8 @@ async def execute_image_edit_task(
         frozen_references,
         edit_basis,
         selected_source,
+        formal_claims,
     ) = await asyncio.to_thread(_prepare)
-    formal_claims = selected_source.formal_claims
 
     canonical_rel = resource_relative_path(version_resource_type, resource_key)
     formal_outcomes: list[Any] = []
@@ -397,6 +422,15 @@ async def execute_image_edit_task(
             image=ImageLaneRequest(generation_type="i2i"),
         )
         generator = ctx.generator
+        reference_clamp = clamp_reference_images(
+            frozen_references.visual_references, ctx.image.max_reference_images, model=ctx.image.backend_model
+        )
+        sent_references = frozen_references.sent(reference_clamp.kept)
+        prompt_text = (
+            render_storyboard_edit_prompt(instruction, sent_references.visual_references)
+            if resource_type == "storyboard"
+            else instruction
+        )
 
         await asyncio.to_thread(
             assert_artifact_input_claims_usable,
@@ -470,14 +504,14 @@ async def execute_image_edit_task(
                 script_file=str(script_file) if script_file is not None else None,
                 selected=selected_source,
             )
+            await asyncio.to_thread(assert_current_artifact_input_claims_usable, project_path, formal_claims)
 
-        # 参考图仅当前图一张、prompt 仅编辑指令（不拼原 image_prompt / 不追加生成路径的
-        # 自动参考图收集）；provider 与 frozen basis 共享 task-owned 源图字节。
+        # 底图总是第一张；角色编号只对应实发图，依据记录完整装配集的同一批冻结字节。
         _, version = await generator.generate_image_async(
-            prompt=instruction,
+            prompt=prompt_text,
             resource_type=version_resource_type,
             resource_id=resource_key,
-            reference_images=frozen_references.reference_images,
+            reference_images=sent_references.reference_images,
             aspect_ratio=aspect_ratio,
             image_size=ctx.image.resolution,
             formal_output=True,
@@ -527,13 +561,13 @@ async def execute_image_edit_task(
             project_manager=get_project_manager(),
         )
 
-    return compensable_formal_task_result(
-        {
-            "version": version,
-            "file_path": canonical_rel,
-            "created_at": created_at,
-            "resource_type": version_resource_type,
-            "resource_id": resource_key,
-        },
-        receipt,
-    )
+    result: dict[str, Any] = {
+        "version": version,
+        "file_path": canonical_rel,
+        "created_at": created_at,
+        "resource_type": version_resource_type,
+        "resource_id": resource_key,
+    }
+    if (warning := reference_clamp.warning()) is not None:
+        result["warnings"] = [warning]
+    return compensable_formal_task_result(result, receipt)

@@ -74,6 +74,8 @@ def _image_label(position: int) -> str:
 
 
 def _describe(slot: ReferenceImageSlot) -> str:
+    if slot.role == "edit_source":
+        return "待编辑底图"
     if slot.role == PREVIOUS_STORYBOARD_ROLE:
         return _PREVIOUS_STORYBOARD_DESCRIPTION
     if slot.logical_type in _TYPE_DESCRIPTIONS:
@@ -93,7 +95,7 @@ def reference_images_declaration(
             label = _image_label(position)
             description = _describe(slot)
             named_description = _NAMED_TYPE_DESCRIPTIONS.get(slot.logical_type or "")
-            if slot.logical_id is None or named_description is None:
+            if slot.role == "edit_source" or slot.logical_id is None or named_description is None:
                 entries.append(f"{label}为{description}")
             else:
                 entries.append(f"{label}为{named_description.format(logical_id=slot.logical_id)}")

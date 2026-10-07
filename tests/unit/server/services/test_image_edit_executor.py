@@ -1,4 +1,4 @@
-"""image_edit executor 的编辑独有语义：底图即当前图且是唯一参考图、prompt 即指令、
+"""image_edit executor 的编辑语义：当前图作底图，分镜附加角色资产图，按指令编辑、
 按资源类型写回、版本带编辑标记、失败不写回；image_size 解析迁移前后同源。"""
 
 import json
@@ -26,6 +26,7 @@ from lib.project_migration_failure import ProjectMigrationError
 from lib.project_schema import CURRENT_PROJECT_SCHEMA_VERSION
 from lib.resource_paths import resource_relative_path
 from lib.version_manager import VersionManager
+from lib.visual_artifact_provenance import visual_file_digest
 from server.services import generation_context, generation_tasks, image_edit_tasks
 from server.services.generation_context import (
     GenerationContext,
@@ -65,7 +66,10 @@ class _FakeGenerator:
     async def generate_image_async(self, **kwargs):
         if self.fail:
             raise RuntimeError("backend boom")
-        self.reference_bytes = [Path(reference).read_bytes() for reference in kwargs["reference_images"]]  # noqa: ASYNC240 -- 测试内本地小文件读写/断言，不在生产事件循环上
+        self.reference_bytes = [
+            Path(reference["image"] if isinstance(reference, dict) else reference).read_bytes()  # noqa: ASYNC240 -- 测试内本地小文件读写/断言，不在生产事件循环上
+            for reference in kwargs["reference_images"]
+        ]
         self.image_calls.append(kwargs)
         if self.project_path is not None:
             canonical = self.project_path / resource_relative_path(kwargs["resource_type"], kwargs["resource_id"])
@@ -166,7 +170,9 @@ def _prepare_files(tmp_path: Path) -> Path:
     return project_path
 
 
-def _patch_common(monkeypatch, fake_pm, fake_generator, *, resolution=None, register_artifacts=True):
+def _patch_common(
+    monkeypatch, fake_pm, fake_generator, *, resolution=None, register_artifacts=True, max_reference_images=0
+):
     """替换项目管理器与 generation context 解析缝：ctx.generator 即 fake_generator，
     image lane 携带指定 resolution。断言编辑恒声明 i2i 槽（generation_type == "i2i"）。"""
     if isinstance(fake_pm, _FakePM):
@@ -186,7 +192,7 @@ def _patch_common(monkeypatch, fake_pm, fake_generator, *, resolution=None, regi
             backend_name="gemini-aistudio",
             backend_model="gemini-image",
             resolution=resolution,
-            max_reference_images=0,
+            max_reference_images=max_reference_images,
         )
         return GenerationContext(generator=fake_generator, image_lane=lane)
 
@@ -230,8 +236,10 @@ class TestResolveCurrentImageRel:
 
 
 class TestExecuteImageEditTask:
+    @pytest.mark.parametrize("resource_type", ["character", "storyboard"])
     async def test_active_edit_rejects_same_claim_with_replaced_source_bytes_before_submit(
         self,
+        resource_type: str,
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
@@ -262,6 +270,33 @@ class TestExecuteImageEditTask:
             artifact_path="characters/Alice.png",
             basis=ArtifactBasis.build("test/asset-sheet", kind_version=1, inputs={}),
         )
+        if resource_type == "storyboard":
+            pm.add_episode("demo", 1, "Episode 1", "scripts/episode_1.json")
+            storyboard = project_path / "storyboards/scene_E1S01.png"
+            storyboard.parent.mkdir(parents=True, exist_ok=True)
+            storyboard.write_bytes(b"storyboard")
+            pm.save_script(
+                "demo",
+                {
+                    "episode": 1,
+                    "content_mode": "narration",
+                    "segments": [
+                        {
+                            "segment_id": "E1S01",
+                            "characters_in_segment": ["Alice"],
+                            "image_prompt": "Alice",
+                            "generated_assets": {"storyboard_image": "storyboards/scene_E1S01.png"},
+                        }
+                    ],
+                },
+                "episode_1.json",
+                validate=False,
+            )
+            ArtifactManifest(ProjectArtifactManifestAdapter(project_path)).register(
+                ArtifactKey.episode_storyboard(1, "E1S01"),
+                artifact_path="storyboards/scene_E1S01.png",
+                basis=ArtifactBasis.build("test/storyboard", kind_version=1, inputs={}),
+            )
         provider_reached = False
 
         class _ReplacingGenerator(_FakeGenerator):
@@ -290,8 +325,12 @@ class TestExecuteImageEditTask:
         with pytest.raises(ValueError, match="changed since it was selected"):
             await execute_image_edit_task(
                 "demo",
-                "Alice",
-                {"resource_type": "character", "prompt": "red hair"},
+                "Alice" if resource_type == "character" else "E1S01",
+                {
+                    "resource_type": resource_type,
+                    "prompt": "red hair",
+                    **({"script_file": "episode_1.json"} if resource_type == "storyboard" else {}),
+                },
             )
 
         assert provider_reached is False
@@ -428,6 +467,12 @@ class TestExecuteImageEditTask:
             version_resource_type = "storyboards"
             current_rel = "storyboards/scene_E1S01.png"
             script_file = "episode_1.json"
+            pm.add_character("demo", "Alice", "hero")
+            pm.update_project_character_sheet("demo", "Alice", "characters/Alice.png")
+            character = pm.get_project_path("demo") / "characters/Alice.png"
+            character.parent.mkdir(parents=True, exist_ok=True)
+            character.write_bytes(b"character-before-await")
+            register_current_artifact(pm.get_project_path("demo"), ArtifactKey.asset_sheet("character", "Alice"))
             pm.add_episode("demo", 1, "Episode 1", "scripts/episode_1.json")
             pm.save_script(
                 "demo",
@@ -440,7 +485,7 @@ class TestExecuteImageEditTask:
                             "novel_text": "雨夜",
                             "image_prompt": "old prompt",
                             "video_prompt": "镜头前推",
-                            "characters_in_segment": [],
+                            "characters_in_segment": ["Alice"],
                             "scenes": [],
                             "props": [],
                             "generated_assets": {"storyboard_image": current_rel},
@@ -469,13 +514,24 @@ class TestExecuteImageEditTask:
             logical_id=resource_id,
             kind="current",
         )
+        storyboard_references = [reference]
+        if resource_type == "storyboard":
+            storyboard_references.append(
+                VisualReference(
+                    path=project_path / "characters/Alice.png",
+                    role="asset_sheet",
+                    logical_type="character",
+                    logical_id="Alice",
+                    kind="sheet",
+                )
+            )
         expected_basis = (
             build_storyboard_image_visual_basis(
                 resource_id=resource_id,
                 image_prompt=instruction,
                 style="",
                 aspect_ratio="9:16",
-                references=(reference,),
+                references=storyboard_references,
             )
             if resource_type == "storyboard"
             else build_asset_sheet_visual_basis(
@@ -488,6 +544,12 @@ class TestExecuteImageEditTask:
                 references=(reference,),
             )
         )
+        if resource_type == "storyboard":
+            evidence = expected_basis.to_evidence_dict()
+            inputs = evidence["inputs"]
+            assert evidence["kind_version"] == 2
+            assert isinstance(inputs, dict)
+            assert inputs["characters"] == []
         manager = VersionManager(project_path)
         provider_references: list[Path] = []
 
@@ -500,6 +562,12 @@ class TestExecuteImageEditTask:
                 provider_reference = Path(kwargs["reference_images"][0])
                 provider_references.append(provider_reference)
                 assert provider_reference.read_bytes() == b"source-before-await"  # noqa: ASYNC240 -- 测试内本地小文件读写/断言，不在生产事件循环上
+                if resource_type == "storyboard":
+                    character_reference = Path(kwargs["reference_images"][1]["image"])
+                    provider_references.append(character_reference)
+                    (project_path / "characters/Alice.png").write_bytes(b"character-changed-during-await")
+                    assert character_reference.read_bytes() == b"character-before-await"  # noqa: ASYNC240 -- 校验供应商读取冻结的角色图
+                    assert "图2为角色「Alice」参考图" in kwargs["prompt"]
 
                 def _mutate(project):
                     project["style"] = "style-changed-during-await"
@@ -543,8 +611,8 @@ class TestExecuteImageEditTask:
             is ArtifactStatus.STALE
         )
         assert current.read_bytes() == b"edited-image"
-        assert len(provider_references) == 1
-        assert not provider_references[0].exists()
+        assert len(provider_references) == (2 if resource_type == "storyboard" else 1)
+        assert all(not reference.exists() for reference in provider_references)
 
         adapter.delete_entry(source_key)
         monkeypatch.setattr(versions_router, "get_project_manager", lambda: pm)
@@ -736,7 +804,7 @@ class TestExecuteImageEditTask:
                 return self.compare(key, artifact_path=entry.artifact_path)
 
             def artifact_content_digest(self, artifact_path):
-                return "0" * 64
+                return visual_file_digest(project_path / artifact_path)
 
         def _resolver(*_args):
             return _Currency(statuses.pop(0))
@@ -752,7 +820,8 @@ class TestExecuteImageEditTask:
         with pytest.raises(error_type, match=error_match):
             await execute_image_edit_task("demo", resource_id, payload)
 
-        assert [key for key, _path, _status in comparisons] == [expected_key] * (3 + successful_rechecks)
+        assert {key for key, _path, _status in comparisons} == {expected_key}
+        assert comparisons[-1][2] is claim_status
         assert statuses == []
         if successful_rechecks:
             assert fake_generator.tracked == [
@@ -829,6 +898,89 @@ class TestExecuteImageEditTask:
             }
         ]
         assert result["file_path"] == "storyboards/scene_E1S01.png"
+
+    @pytest.mark.parametrize(
+        ("content_mode", "items_key", "id_field", "char_field"),
+        [
+            ("narration", "segments", "segment_id", "characters_in_segment"),
+            ("drama", "scenes", "scene_id", "characters_in_scene"),
+            ("ad", "shots", "shot_id", "characters_in_shot"),
+        ],
+    )
+    @pytest.mark.parametrize("max_reference_images", [0, 1, 2])
+    async def test_storyboard_edit_sends_only_bound_character_sheets_after_base(
+        self, tmp_path, monkeypatch, content_mode, items_key, id_field, char_field, max_reference_images
+    ):
+        project_path = _prepare_files(tmp_path)
+        fake_pm = _FakePM(project_path)
+        fake_pm.project["content_mode"] = content_mode
+        fake_pm.project["characters"]["Alice"]["derivatives"] = {
+            "冬装": {"description": "厚重冬装描述", "character_sheet": "characters/Alice_winter.png"}
+        }
+        winter = project_path / "characters/Alice_winter.png"
+        winter.write_bytes(b"winter-sheet")
+        (project_path / "characters/Alice.png").write_bytes(b"alice-sheet")
+        fake_pm.project["characters"]["Unused"] = {"character_sheet": "characters/Unused.png"}
+        (project_path / "characters/Unused.png").write_bytes(b"unused-sheet")
+        fake_pm.project["scenes"]["祠堂"]["scene_sheet"] = "scenes/temple.png"
+        (project_path / "scenes").mkdir()
+        (project_path / "scenes/temple.png").write_bytes(b"scene-sheet")
+        fake_pm.script = {
+            "episode": 1,
+            "content_mode": content_mode,
+            items_key: [
+                {
+                    id_field: "E1S01",
+                    char_field: ["Alice/冬装", "Alice", "Alice/冬装"],
+                    "scenes": ["祠堂"],
+                    "props": [],
+                    "image_prompt": "原始分镜提示词",
+                    "generated_assets": {"storyboard_image": "storyboards/scene_E1S01_first.png"},
+                }
+            ],
+        }
+        fake_generator = _FakeGenerator()
+        _patch_common(
+            monkeypatch, fake_pm, fake_generator, max_reference_images=max_reference_images, register_artifacts=False
+        )
+        manifest = ArtifactManifest(ProjectArtifactManifestAdapter(project_path))
+        for key, path in [
+            (ArtifactKey.episode_storyboard(1, "E1S01"), "storyboards/scene_E1S01_first.png"),
+            (ArtifactKey.asset_sheet("character", "Alice"), "characters/Alice.png"),
+            (ArtifactKey.asset_sheet("character", "Alice/冬装"), "characters/Alice_winter.png"),
+            (ArtifactKey.asset_sheet("character", "Unused"), "characters/Unused.png"),
+            (ArtifactKey.asset_sheet("scene", "祠堂"), "scenes/temple.png"),
+        ]:
+            manifest.register(
+                key, artifact_path=path, basis=ArtifactBasis.build("test/edit-input", kind_version=1, inputs={})
+            )
+
+        result = await execute_image_edit_task(
+            "demo", "E1S01", {"resource_type": "storyboard", "prompt": "去掉路人", "script_file": "episode_1.json"}
+        )
+
+        kept = max_reference_images or 3
+        assert fake_generator.reference_bytes == [b"png", b"winter-sheet", b"alice-sheet"][:kept]
+        prompt = fake_generator.image_calls[0]["prompt"]
+        assert "去掉路人" in prompt
+        assert "原始分镜提示词" not in prompt
+        assert "少女剑客" not in prompt
+        assert "厚重冬装描述" not in prompt
+        if kept > 1:
+            assert "图1为待编辑底图；图2为角色「Alice/冬装」参考图" in prompt
+            assert "不复制其版式、背景、姿势" in prompt
+            assert "脸型、眼形、眼距、鼻口比例、发际线" in prompt
+        else:
+            assert prompt == "去掉路人"
+        assert ("图3为角色「Alice」参考图" in prompt) == (kept == 3)
+        if kept < 3:
+            assert result["warnings"] == [
+                {"key": "ref_too_many_images", "params": {"count": 3, "model": "gemini-image", "max_count": kept}}
+            ]
+        else:
+            assert "warnings" not in result
+        for reference in fake_generator.image_calls[0]["reference_images"]:
+            assert not Path(reference["image"] if isinstance(reference, dict) else reference).exists()  # noqa: ASYNC240 -- 校验任务结束后快照清理
 
     async def test_no_current_image_raises(self, tmp_path, monkeypatch):
         project_path = _prepare_files(tmp_path)

@@ -1008,7 +1008,7 @@ async def edit_image(
 ):
     """提交图片指令式编辑任务到队列，立即返回 task_id。
 
-    以当前图为唯一参考图、编辑指令为唯一 prompt 走 i2i；新图覆盖 current、旧图自动进
+    以当前图为底图走 i2i，分镜图附加本镜角色资产作为身份参考；新图覆盖 current、旧图自动进
     版本历史，原 image_prompt 不回写（编辑语义见 ``docs/adr/0050``）。
     """
     if req.resource_type not in EDITABLE_RESOURCE_TYPES:
