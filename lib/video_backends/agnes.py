@@ -21,8 +21,8 @@ v2.0 关键帧 / 多图映射：无图 → 文生视频；起始图 → 顶层 `
 
 2.5 与 2.5 Flash 改走官方 Videos 兼容字段：``seconds`` / ``mode`` / ``size`` /
 ``aspect_ratio``，``mode=keyframe`` 时 ``first_frame`` / ``last_frame`` 至少其一（可单独尾帧）；
-``mode=reference`` 时 ``images`` 为 data URI 列表。轮询打 ``/agnesapi?video_id=&model_name=``。
-Flash 的 ``size`` 固定 ``720P``，参考图上限 5。
+``mode=reference`` 时 ``images`` / ``audios`` 为 data URI 列表（音频最多 3 段、总时长 12s）。
+轮询打 ``/agnesapi?video_id=&model_name=``。Flash 的 ``size`` 固定 ``720P``，参考图上限 5。
 """
 
 from __future__ import annotations
@@ -60,6 +60,7 @@ from lib.retry import (
 from lib.video_backends.base import (
     IMAGE_MIME_TYPES,
     ProviderJobIdPersistenceMixin,
+    ReferenceAudioMode,
     ResumeExpiredError,
     VideoAudioMode,
     VideoCapabilities,
@@ -70,6 +71,7 @@ from lib.video_backends.base import (
     poll_with_retry,
     raise_for_status_redacted,
     recording_poll,
+    reference_audio_to_data_uri,
     should_retry_poll,
     should_retry_submit,
     submit_post,
@@ -102,6 +104,11 @@ _MAX_DURATION_SECONDS = 18
 _MAX_REFERENCE_IMAGES = 4
 _MAX_REFERENCE_IMAGES_25 = 8
 _MAX_REFERENCE_IMAGES_25_FLASH = 5
+
+# 2.5 / Flash 官方参考音频：最多 3 段、合计不超过 12 秒；v2.0 无此通道。
+_MAX_REFERENCE_AUDIOS_25 = 3
+_MAX_REFERENCE_AUDIO_TOTAL_SECONDS_25 = 12.0
+_REFERENCE_AUDIO_MIME_TYPES = {".wav": "audio/wav", ".mp3": "audio/mpeg"}
 
 # 2.5 官方时长 4–12s；未登记型号回落 v2.0 的 1–18s。
 _MIN_DURATION_SECONDS_25 = 4
@@ -168,6 +175,10 @@ def _max_reference_images(model: str) -> int:
     if _is_video_25(model):
         return _MAX_REFERENCE_IMAGES_25
     return _MAX_REFERENCE_IMAGES
+
+
+def _max_reference_audios(model: str) -> int:
+    return _MAX_REFERENCE_AUDIOS_25 if _is_video_25(model) else 0
 
 
 def _duration_bounds(model: str) -> tuple[int, int]:
@@ -264,6 +275,9 @@ def _safe_body_for_log(body: dict) -> dict:
     images = body.get("images")
     if isinstance(images, list):
         view["images"] = f"<{len(images)} img>"
+    audios = body.get("audios")
+    if isinstance(audios, list):
+        view["audios"] = f"<{len(audios)} audio>"
     return view
 
 
@@ -372,9 +386,20 @@ class AgnesVideoBackend(ProviderJobIdPersistenceMixin):
         2.5 官方允许单独尾帧（``first_frame`` / ``last_frame`` 至少其一）；v2.0 尾帧只能配首帧。
         两条路径都声明 ``last_frame=True``——UI 尾帧槽位按此开放，v2.0 单独尾帧仍在构造期 fail-loud。
 
-        音轨恒无声：请求体没有音轨字段、成片不带音轨（``generate`` 结算时直接写死
-        ``generate_audio=False``），用户的开启意图无处可下发。
+        音轨恒无声：请求体没有成片音轨开关、结算时写死 ``generate_audio=False``，
+        用户的开启意图无处可下发。2.5 / Flash 另有参考音频**输入**通道（官方 ``audios``），
+        与成片音轨开关不是同一维。
         """
+        if _is_video_25(model):
+            return VideoCapabilities(
+                first_frame=True,
+                last_frame=True,
+                max_reference_images=_max_reference_images(model),
+                reference_audio_mode=ReferenceAudioMode.DIRECT,
+                max_reference_audio_count=_max_reference_audios(model),
+                max_reference_audio_total_seconds=_MAX_REFERENCE_AUDIO_TOTAL_SECONDS_25,
+                audio_track=VideoAudioMode.ALWAYS_OFF,
+            )
         return VideoCapabilities(
             first_frame=True,
             last_frame=True,
@@ -436,6 +461,9 @@ class AgnesVideoBackend(ProviderJobIdPersistenceMixin):
             payload["seed"] = request.seed
 
         reference_images, start_image, end_image = self._image_channels(request)
+        audio_files = self._valid_paths(request.reference_audio_files)
+        if audio_files:
+            raise VideoCapabilityError("video_reference_audio_unsupported", provider=self.name, model=self._model)
         self._reject_mixed_channels(reference_images, start_image, end_image)
         # 尾帧仅在 keyframes（首+尾）模式下生效，无独立尾帧通道。只给尾帧时 fail-loud，而非静默
         # 退化为文生视频——video_capabilities.last_frame=True 表示支持首尾帧对，不含单独尾帧。
@@ -459,7 +487,9 @@ class AgnesVideoBackend(ProviderJobIdPersistenceMixin):
         """2.5 / 2.5 Flash 官方 Videos 兼容提交体：``seconds`` / ``mode`` / ``size`` / ``aspect_ratio``。
 
         不发 width/height/fps/num_frames（官方列为非法）。图像走 data URI，写入
-        ``first_frame`` / ``last_frame`` / ``images``。单独尾帧合法。Flash 的 ``size`` 固定 720P。
+        ``first_frame`` / ``last_frame`` / ``images``；参考音频写入 ``audios``。单独尾帧合法。
+        Flash 的 ``size`` 固定 720P。``images`` 与 ``audios`` 可单独或同时使用，均走
+        ``mode=reference``；与首/尾帧互斥（官方 keyframe 模式不允许 audios）。
         """
         payload: dict = {
             "model": self._model,
@@ -473,14 +503,21 @@ class AgnesVideoBackend(ProviderJobIdPersistenceMixin):
             payload["seed"] = request.seed
 
         reference_images, start_image, end_image = self._image_channels(request)
-        self._reject_mixed_channels(reference_images, start_image, end_image)
+        audio_files = self._valid_paths(request.reference_audio_files)
+        self._reject_mixed_channels(reference_images, start_image, end_image, audio_files)
 
-        if reference_images:
-            self._reject_reference_overflow(reference_images)
+        if audio_files:
+            self._reject_reference_audio_overflow(audio_files)
+
+        if reference_images or audio_files:
             payload["mode"] = _REFERENCE_MODE_25
-            payload["images"] = [
-                self._encode_data_uri(p, error_code="video_reference_images_unreadable") for p in reference_images
-            ]
+            if reference_images:
+                self._reject_reference_overflow(reference_images)
+                payload["images"] = [
+                    self._encode_data_uri(p, error_code="video_reference_images_unreadable") for p in reference_images
+                ]
+            if audio_files:
+                payload["audios"] = [self._encode_audio_data_uri(p) for p in audio_files]
         elif start_image is not None or end_image is not None:
             payload["mode"] = _KEYFRAME_MODE_25
             if start_image is not None:
@@ -498,9 +535,14 @@ class AgnesVideoBackend(ProviderJobIdPersistenceMixin):
         )
 
     def _reject_mixed_channels(
-        self, reference_images: list[Path], start_image: Path | None, end_image: Path | None
+        self,
+        reference_images: list[Path],
+        start_image: Path | None,
+        end_image: Path | None,
+        reference_audios: list[Path] | None = None,
     ) -> None:
-        if reference_images and (start_image is not None or end_image is not None):
+        has_reference = bool(reference_images) or bool(reference_audios)
+        if has_reference and (start_image is not None or end_image is not None):
             raise VideoCapabilityError("video_reference_images_with_frames_unsupported", model=self._model)
 
     def _reject_reference_overflow(self, reference_images: list[Path]) -> None:
@@ -510,6 +552,16 @@ class AgnesVideoBackend(ProviderJobIdPersistenceMixin):
                 "video_reference_images_exceeded",
                 model=self._model,
                 count=len(reference_images),
+                limit=limit,
+            )
+
+    def _reject_reference_audio_overflow(self, reference_audios: list[Path]) -> None:
+        limit = _max_reference_audios(self._model)
+        if len(reference_audios) > limit:
+            raise VideoCapabilityError(
+                "video_reference_audio_exceeded",
+                model=self._model,
+                count=len(reference_audios),
                 limit=limit,
             )
 
@@ -559,6 +611,14 @@ class AgnesVideoBackend(ProviderJobIdPersistenceMixin):
             return _image_to_bare_base64(path)
         except OSError as exc:
             raise VideoCapabilityError(error_code, model=self._model, **err_params) from exc
+
+    def _encode_audio_data_uri(self, path: Path) -> str:
+        """2.5 官方 ``audios`` 要可访问 URL；本地文件编成 data URI，格式或不可读 fail-loud。
+
+        不跳过任何一段：prompt 里的「音频N」按 ``audios`` 数组顺序编号，静默少发一段会把
+        后续角色的音色绑错，且照常扣费。
+        """
+        return reference_audio_to_data_uri(path, model=self._model, mime_types=_REFERENCE_AUDIO_MIME_TYPES)
 
     def _encode_data_uri(self, path: Path, *, error_code: str) -> str:
         """2.5 官方要可访问 URL；本地文件编成 data URI，缺失或不可读 fail-loud。"""
@@ -733,8 +793,8 @@ class AgnesVideoBackend(ProviderJobIdPersistenceMixin):
             video_uri=video_url,
             task_id=task_id,
             seed=request.seed,
-            # Agnes 视频无音频能力（未声明 GENERATE_AUDIO、提交体不带音频字段），成片恒无声；
-            # 固定 False 与 kling/vidu 无声模型一致，避免下游（计费/版本元数据/剪映导出）误判有声。
+            # 成片音轨开关不存在：请求体没有 generate_audio 字段，结算固定 False，避免下游
+            # （计费/版本元数据/剪映导出）把参考音频输入误判成成片有声。
             generate_audio=False,
         )
 

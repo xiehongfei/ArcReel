@@ -930,6 +930,30 @@ class TestVoiceConsistency:
         caps = await self._caps(db_factory, {"video_backend": "agnes/agnes-video-v2.0"})
         assert caps["voice_consistency"] == "none"
 
+    async def test_agnes_25_reference_audio_binding_is_native(self, db_factory):
+        """2.5 / Flash 接上官方 audios 后，参考生视频 + 角色参考音频绑定 → native。"""
+        caps = await self._caps(
+            db_factory,
+            {
+                "video_backend": "agnes/agnes-video-2.5-flash",
+                "generation_mode": "reference_video",
+                "character_voice_binding": "reference_audio",
+            },
+        )
+        assert caps["voice_consistency"] == "native"
+        assert caps["max_reference_audio_count"] == 3
+
+    async def test_agnes_25_non_reference_mode_stays_none(self, db_factory):
+        """成片音轨仍恒无声：非参考生视频路径没有 native 通道，档位保持 none。"""
+        caps = await self._caps(
+            db_factory,
+            {
+                "video_backend": "agnes/agnes-video-2.5",
+                "generation_mode": "storyboard",
+            },
+        )
+        assert caps["voice_consistency"] == "none"
+
     async def test_custom_provider_without_overrides_defaults_to_soft(self, db_factory):
         """自定义供应商无 generate_audio 目录声明：与 default_tier_generates_audio 同口径，
         无信号时假定有声，不凭空判定为真无声模型。"""

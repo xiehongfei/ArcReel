@@ -19,7 +19,9 @@ from lib.video_backends.base import (
     AmbiguousSubmitError,
     ArtifactDownloadError,
     ProviderResponseStage,
+    ReferenceAudioMode,
     ResumeExpiredError,
+    VideoAudioMode,
     VideoCapabilityError,
     VideoGenerationRequest,
 )
@@ -92,6 +94,11 @@ def _write_image(path: Path, payload: bytes) -> Path:
     return path
 
 
+def _write_audio(path: Path, payload: bytes = b"id3-audio") -> Path:
+    path.write_bytes(payload)
+    return path
+
+
 def _sent_payload(routes: _AgnesRoutes) -> dict:
     return request_json(only_request(routes.submit))
 
@@ -112,18 +119,29 @@ class TestCapabilities:
         assert caps.first_frame is True
         assert caps.last_frame is True
         assert caps.max_reference_images == 4
+        assert caps.reference_audio_mode is ReferenceAudioMode.NONE
+        assert caps.max_reference_audio_count == 0
+        assert caps.audio_track is VideoAudioMode.ALWAYS_OFF
 
     def test_video_25_capabilities_include_last_frame(self):
         caps = AgnesVideoBackend.video_capabilities_for_model("agnes-video-2.5")
         assert caps.first_frame is True
         assert caps.last_frame is True
         assert caps.max_reference_images == 8
+        assert caps.reference_audio_mode is ReferenceAudioMode.DIRECT
+        assert caps.max_reference_audio_count == 3
+        assert caps.max_reference_audio_total_seconds == 12.0
+        assert caps.audio_track is VideoAudioMode.ALWAYS_OFF
 
     def test_video_25_flash_capabilities_cap_reference_images_at_five(self):
         caps = AgnesVideoBackend.video_capabilities_for_model("agnes-video-2.5-flash")
         assert caps.first_frame is True
         assert caps.last_frame is True
         assert caps.max_reference_images == 5
+        assert caps.reference_audio_mode is ReferenceAudioMode.DIRECT
+        assert caps.max_reference_audio_count == 3
+        assert caps.max_reference_audio_total_seconds == 12.0
+        assert caps.audio_track is VideoAudioMode.ALWAYS_OFF
 
 
 class TestNumFramesAndSize:
@@ -346,6 +364,18 @@ class TestImageChannels:
                 )
 
             assert ei.value.code == "video_reference_images_with_frames_unsupported"
+            assert routes.submit.call_count == 0
+
+    async def test_reference_audio_unsupported_on_v20(self, tmp_path: Path):
+        """v2.0 没有官方 audios 通道：带参考音频 fail-loud，不静默丢弃后当文生视频扣费。"""
+        audio = _write_audio(tmp_path / "voice.mp3")
+
+        with _agnes_api() as routes:
+            backend = AgnesVideoBackend(api_key="k", base_url=_BASE_URL)
+            with pytest.raises(VideoCapabilityError) as ei:
+                await backend.generate(_request(tmp_path, reference_audio_files=[audio]))
+
+            assert ei.value.code == "video_reference_audio_unsupported"
             assert routes.submit.call_count == 0
 
     async def test_end_image_only_fails_loud(self, tmp_path: Path):
@@ -1036,6 +1066,83 @@ class TestVideo25:
         assert body["mode"] == "reference"
         assert len(body["images"]) == 2
         assert all(item.startswith("data:image/png;base64,") for item in body["images"])
+        assert "audios" not in body
+
+    async def test_reference_audio_uses_reference_mode(self, tmp_path: Path):
+        """官方 audios 走 data URI，顺序与请求字段一致；可与参考图同时下发。"""
+        refs = [_write_image(tmp_path / "r.png", b"ref")]
+        first = _write_audio(tmp_path / "a.mp3", b"id3-first")
+        second = _write_audio(tmp_path / "b.wav", b"riff-second")
+
+        with _agnes_api(base_url=_GATEWAY_BASE_URL) as routes:
+            routes.submit.mock(return_value=_queued_25())
+            routes.query.mock(return_value=_json(_completed_25()))
+            routes.download.mock(return_value=httpx.Response(200, content=b"v"))
+
+            await self._backend().generate(
+                _request(tmp_path, reference_images=refs, reference_audio_files=[first, second])
+            )
+
+        body = _sent_payload(routes)
+        assert body["mode"] == "reference"
+        assert len(body["images"]) == 1
+        assert body["audios"][0].startswith("data:audio/mpeg;base64,")
+        assert body["audios"][1].startswith("data:audio/wav;base64,")
+
+    async def test_audio_only_reference_mode(self, tmp_path: Path):
+        """无参考图、仅参考音频时仍走 mode=reference（官方允许 audios 单独使用）。"""
+        audio = _write_audio(tmp_path / "voice.mp3")
+
+        with _agnes_api(base_url=_GATEWAY_BASE_URL) as routes:
+            routes.submit.mock(return_value=_queued_25())
+            routes.query.mock(return_value=_json(_completed_25()))
+            routes.download.mock(return_value=httpx.Response(200, content=b"v"))
+
+            await self._backend().generate(_request(tmp_path, reference_audio_files=[audio]))
+
+        body = _sent_payload(routes)
+        assert body["mode"] == "reference"
+        assert "images" not in body
+        assert len(body["audios"]) == 1
+
+    async def test_reference_audio_exceeded_at_four(self, tmp_path: Path):
+        audios = [_write_audio(tmp_path / f"a{i}.mp3") for i in range(4)]
+
+        with _agnes_api(base_url=_GATEWAY_BASE_URL) as routes:
+            with pytest.raises(VideoCapabilityError) as ei:
+                await self._backend().generate(_request(tmp_path, reference_audio_files=audios))
+
+            assert ei.value.code == "video_reference_audio_exceeded"
+            assert routes.submit.call_count == 0
+
+    async def test_reference_audio_with_frame_fails_loud(self, tmp_path: Path):
+        audio = _write_audio(tmp_path / "voice.mp3")
+        frame = _write_image(tmp_path / "f.png", b"frame")
+
+        with _agnes_api(base_url=_GATEWAY_BASE_URL) as routes:
+            with pytest.raises(VideoCapabilityError) as ei:
+                await self._backend().generate(_request(tmp_path, start_image=frame, reference_audio_files=[audio]))
+
+            assert ei.value.code == "video_reference_images_with_frames_unsupported"
+            assert routes.submit.call_count == 0
+
+    async def test_unsupported_audio_format_fails_loud(self, tmp_path: Path):
+        bad = _write_audio(tmp_path / "a.ogg", b"ogg")
+
+        with _agnes_api(base_url=_GATEWAY_BASE_URL) as routes:
+            with pytest.raises(VideoCapabilityError) as ei:
+                await self._backend().generate(_request(tmp_path, reference_audio_files=[bad]))
+
+            assert ei.value.code == "video_reference_audio_format_unsupported"
+            assert routes.submit.call_count == 0
+
+    async def test_missing_audio_file_fails_loud(self, tmp_path: Path):
+        with _agnes_api(base_url=_GATEWAY_BASE_URL) as routes:
+            with pytest.raises(VideoCapabilityError) as ei:
+                await self._backend().generate(_request(tmp_path, reference_audio_files=[tmp_path / "missing.mp3"]))
+
+            assert ei.value.code == "video_reference_audio_unreadable"
+            assert routes.submit.call_count == 0
 
     @pytest.mark.parametrize("duration", [3, 13])
     async def test_out_of_range_duration_fails_loud(self, tmp_path: Path, duration: int):
@@ -1124,3 +1231,20 @@ class TestVideo25Flash:
         body = _sent_payload(routes)
         assert body["mode"] == "reference"
         assert len(body["images"]) == 5
+
+    async def test_reference_audio_uses_official_audios(self, tmp_path: Path):
+        audio = _write_audio(tmp_path / "voice.mp3")
+
+        with _agnes_api(base_url=_GATEWAY_BASE_URL) as routes:
+            routes.submit.mock(return_value=_queued_25(model="agnes-video-2.5-flash"))
+            routes.query.mock(return_value=_json(_completed_25()))
+            routes.download.mock(return_value=httpx.Response(200, content=b"v"))
+
+            await self._backend().generate(_request(tmp_path, reference_audio_files=[audio]))
+
+        body = _sent_payload(routes)
+        assert body["model"] == "agnes-video-2.5-flash"
+        assert body["mode"] == "reference"
+        assert body["size"] == "720P"
+        assert len(body["audios"]) == 1
+        assert body["audios"][0].startswith("data:audio/mpeg;base64,")

@@ -1450,7 +1450,7 @@ PROVIDER_REGISTRY: dict[str, ProviderMeta] = {
                 pricing=_agnes_video_pricing("agnes-video-v2.0", 0.005),
             ),
             # agnes-video-2.5：官方 OpenAI Videos 兼容异步 /v1/videos。mode=text/keyframe/reference；
-            # 首帧、尾帧可单独或成对使用；时长 4–12s；分辨率 720P/1080P/1K/2K。
+            # 首帧、尾帧可单独或成对使用；时长 4–12s；分辨率 720P/1080P/1K/2K；参考音频最多 3 段。
             "agnes-video-2.5": ModelInfo(
                 display_name="Agnes Video 2.5",
                 media_type="video",
@@ -1460,7 +1460,7 @@ PROVIDER_REGISTRY: dict[str, ProviderMeta] = {
                 pricing=_agnes_video_25_pricing("agnes-video-2.5"),
             ),
             # agnes-video-2.5-flash：与 2.5 同一 Videos 契约（text/keyframe/reference、可单独尾帧），
-            # 但 size 仅 720P、参考图最多 5 张、不支持参考视频。
+            # 但 size 仅 720P、参考图最多 5 张、参考音频最多 3 段、不支持参考视频。
             "agnes-video-2.5-flash": ModelInfo(
                 display_name="Agnes Video 2.5 Flash",
                 media_type="video",
