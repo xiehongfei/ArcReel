@@ -44,6 +44,9 @@ CLAUDE.local.md
 # Local Codex runtime metadata
 .codex/
 
+# scripts/dev.py 的本地运行状态（PID、日志），不提交
+.dev/
+
 # Frontend build artifacts
 frontend/node_modules/
 frontend/dist/

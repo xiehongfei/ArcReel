@@ -42,6 +42,10 @@ cd frontend && pnpm dev
 # Open http://localhost:5173
 ```
 
+### Local Development Script {#local-dev-script}
+
+The two terminals can also be managed by `scripts/dev.py`: `setup` prepares the environment, `start` launches the services in the background, and `status`, `logs`, and `stop` inspect and manage them. See [Service Lifecycle and Operations Scripts](https://docs.arc-reel.com/en/ops/service-management) for the complete commands, options, and runtime files.
+
 ### Documentation Site {#docs-site}
 
 `website/` is a separate package root with its own lockfile and is not grouped into a workspace with frontend:
@@ -102,6 +106,7 @@ Published pages also declare their documentation-refresh coverage tier via the `
 | `website/docs/guide/faq.md` | Frequently asked questions and short answers | Long tutorials |
 | `website/docs/ops/deployment.md` | Deployment, upgrades, backup, recovery, monitoring, and security | Product marketing copy |
 | `website/docs/ops/migrate-to-postgres.md` | SQLite-to-PostgreSQL migration, verification, and rollback steps | Day-to-day PostgreSQL deployment and operations guidance |
+| `website/docs/ops/service-management.md` | Quick reference for local development scripts and production Docker Compose start/stop, status, and log commands | Full deployment configuration, upgrades, and backup/restore procedures |
 | `website/docs/dev/architecture.md` | Stable architectural boundaries, data flows, and extension points | Temporary implementation plans and incomplete designs |
 | `SECURITY.md` | Supported versions, supported deployment boundaries, private vulnerability reporting, and coordinated disclosure policy | Details of unfixed vulnerabilities and dynamic risk registers |
 | `docs/security/threat-model.md` | Security assets, trust boundaries, attack surfaces, existing controls, and reassessment triggers | Directly exploitable unfixed vulnerabilities and patch history |

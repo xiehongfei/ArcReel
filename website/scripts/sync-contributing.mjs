@@ -18,6 +18,7 @@ const target = resolve(websiteDir, "docs", "dev", "contributing.md");
 const ANCHORS = new Map([
   ["# 贡献指南", "contributing"],
   ["## 本地开发环境", "local-development"],
+  ["### 本地开发脚本", "local-dev-script"],
   ["### 文档站", "docs-site"],
   ["## 测试", "testing"],
   ["### 前端页面级测试", "frontend-page-tests"],

@@ -35,6 +35,10 @@ cd frontend && pnpm dev
 # 访问 http://localhost:5173
 ```
 
+### 本地开发脚本
+
+两个终端也可以交给 `scripts/dev.py` 管理：`setup` 准备环境，`start` 后台启动，`status`、`logs`、`stop` 查看与管理运行中的服务。完整命令、参数与运行文件说明见[服务启停与运维脚本](https://docs.arc-reel.com/ops/service-management)。
+
 ### 文档站
 
 `website/` 是独立包根，有独立的 lockfile，不与 frontend 组成 workspace：
@@ -114,6 +118,7 @@ pnpm e2e:remote   # 终端二：构建前端，连接容器里的浏览器运行
 | `website/docs/guide/faq.md` | 高频问题和短答案 | 长篇教程 |
 | `website/docs/ops/deployment.md` | 部署、升级、备份、恢复、监控和安全 | 产品营销文案 |
 | `website/docs/ops/migrate-to-postgres.md` | SQLite 到 PostgreSQL 的迁移步骤、校验和回滚 | PostgreSQL 的日常部署与运维手册 |
+| `website/docs/ops/service-management.md` | 本地开发脚本与生产 Docker Compose 的启停、状态、日志命令速查 | 部署配置、升级、备份恢复的完整流程 |
 | `website/docs/dev/architecture.md` | 稳定的架构边界、数据流和扩展点 | 临时实现计划和未完成设计 |
 | `SECURITY.md` | 支持版本、支持的部署边界、私密漏洞报告和协调披露政策 | 未修复漏洞细节和动态风险登记 |
 | `docs/security/threat-model.md` | 安全资产、信任边界、攻击面、现有控制和重评触发条件 | 可直接利用的未修复漏洞与补丁历史 |
