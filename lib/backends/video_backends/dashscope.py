@@ -4,13 +4,13 @@
 GET /tasks/{id} 至 SUCCEEDED → 下载 video_url。覆盖 happyhorse-1.0 / happyhorse-1.1
 与 wan2.7 系列的 t2v / i2v / r2v，以及单模型通吃三条路径的 wan3.0。
 
-schema 的确权程度按型号分两档：happyhorse 与 wan2.7 依据 docs/api-docs/providers/dashscope.md 所列一手
-官方文档核实；wan3.0 无可用官方页面，其请求形态按 2.7 形状类推，出处与类推范围见 _WAN3_*
-常量处的说明。
+schema 确权按型号分两档：happyhorse 与 wan2.7 依据 docs/api-docs/providers/dashscope.md 所列一手
+官方文档核实；wan3.0（含高速版 wan3.0-video-prime）依据万相 3.0 视频生成 API 参考核实，出处见
+_WAN3_* 常量处的说明。
 
 注：t2v/i2v 起始帧用 media[{type:"first_frame"}]（first_frame type 在 r2v media
-枚举中确权）；尾帧 / 续写字段在一手 docs 未确权，故 happyhorse 与 wan2.7 的 i2v 仅
-声明首帧能力，不臆造。wan3.0 的尾帧是上述类推档的一部分，不受这条约束。
+枚举中确权）；尾帧 / 续写字段在 happyhorse 与 wan2.7 的一手 docs 未确权，故这两个系列的 i2v
+仅声明首帧能力，不臆造。wan3.0 的 last_frame 已由上述官方页面确权，不受这条约束。
 """
 
 from __future__ import annotations
@@ -114,13 +114,14 @@ _WAN27_MAX_PROMPT_CHARS = 5000
 # wan3.0 单模型覆盖文生/图生/参考生三条路径：首帧 + 尾帧，参考图 10 张，参考音频 5 段、
 # 总时长 15 秒，prompt 上限 20000 字符。prompt 超限与 2.7 同为静默截断且照常计费，同样由
 # gate_video_request 前置拒绝。
-# 出处：万相 3.0 发布说明所列能力上限。与其余型号不同，wan3.0 没有可引的一手 API schema——
-# 下方 media 条目类型（last_frame / reference_audio）与 parameters["audio"] 的字面量均按 2.7
-# 形状类推，对端如报参数错误应以此处为首查点。
+# 出处：万相 3.0 视频生成 API 参考（官方一手 schema）：last_frame / reference_audio 等 media
+# 条目类型与 parameters["audio"] 均以该页为准，不再按 2.7 形状类推。
 _WAN3_MAX_REFERENCE_IMAGES = 10
 _WAN3_MAX_REFERENCE_AUDIO = 5
 _WAN3_MAX_REFERENCE_AUDIO_TOTAL_SECONDS = 15.0
 _WAN3_MAX_PROMPT_CHARS = 20000
+# wan3.0 家族共用一个能力档：标准版与高速版（wan3.0-video-prime）的能力对齐，classify_wan_model
+# 把家族内所有 id 的 profile_key 都归一到这里。
 _WAN3_MODEL_KEY = "wan3.0-video"
 
 # 万相 3.0 家族 model_id 识别（连字符/下划线可选、不锚版本号）：此处是本后端的请求形态分派，

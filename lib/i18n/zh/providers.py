@@ -41,6 +41,7 @@ MESSAGES: dict[str, str] = {
     "model_name_dashscope_wan2.7-t2v": "万相 2.7 文生视频",
     "model_name_dashscope_wan2.7-r2v": "万相 2.7 参考生视频",
     "model_name_dashscope_wan3.0-video": "万相 3.0 视频",
+    "model_name_dashscope_wan3.0-video-prime": "万相 3.0 视频 Prime",
     "model_name_dashscope_happyhorse-1.1-i2v": "HappyHorse 1.1 图生视频",
     "model_name_dashscope_happyhorse-1.1-t2v": "HappyHorse 1.1 文生视频",
     "model_name_dashscope_happyhorse-1.1-r2v": "HappyHorse 1.1 参考生视频",

@@ -243,6 +243,15 @@ class TestProviderRegistry:
         assert wan3.resolutions == ["480p", "720p", "1080p"]
         assert wan3.default is False
 
+    def test_dashscope_video_models_include_wan3_prime(self):
+        """高速版能力对齐标准版：同分辨率与 2–30 秒时长档，非默认。"""
+        meta = PROVIDER_REGISTRY["dashscope"]
+        prime = meta.models["wan3.0-video-prime"]
+        assert prime.media_type == "video"
+        assert prime.supported_durations == list(range(2, 31))
+        assert prime.resolutions == ["480p", "720p", "1080p"]
+        assert prime.default is False
+
     def test_dashscope_declares_wan3_base_url_key(self):
         # wan3 专用 maas 域名单列一键：并进通用 base_url 会让其余型号也跟着改域名
         meta = PROVIDER_REGISTRY["dashscope"]

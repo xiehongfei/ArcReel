@@ -1068,8 +1068,9 @@ PROVIDER_REGISTRY: dict[str, ProviderMeta] = {
         description="阿里云百炼（Model Studio）全模态平台，支持 Qwen 文本、Qwen-Image / 万相图像与 HappyHorse / 万相视频（含参考生视频）。",
         required_keys=["api_key"],
         # wan3_base_url：万相 3.0 走独立 maas 域名，且域名里含地域与 workspace，
-        # 无法由通用 base_url 派生，故单列一键。仅 wan3.0-video 的请求消费它（见
-        # lib/backends/video_backends/dashscope.py），留空则该模型回落通用 base_url。
+        # 无法由通用 base_url 派生，故单列一键。仅万相 3.0 系列（wan3.0-video /
+        # wan3.0-video-prime）的请求消费它（见 lib/backends/video_backends/dashscope.py），
+        # 留空则这些模型回落通用 base_url。
         optional_keys=["base_url", "wan3_base_url", "image_max_workers", "video_max_workers", "audio_max_workers"],
         secret_keys=["api_key"],
         models={
@@ -1243,8 +1244,8 @@ PROVIDER_REGISTRY: dict[str, ProviderMeta] = {
                 pricing=_dashscope_video_pricing("wan2.7-r2v", {"720p": 0.6, "1080p": 1.0}),
             ),
             # 万相 3.0：单模型覆盖文生/图生/参考生三条路径，480P ¥0.3/s，720P ¥0.6/s，
-            # 1080P ¥1.2/s，单次最长 30 秒（出处：万相 3.0 发布说明所列的分辨率与计费档位，
-            # 非 API 参考 schema）。
+            # 1080P ¥1.2/s，单次最长 30 秒（出处：万相 3.0 视频生成 API 参考的 model 可选值
+            # 与模型价格页；价格登记页面原价，限时折扣不入表）。
             "wan3.0-video": ModelInfo(
                 display_name="万相 3.0 视频",
                 media_type="video",
@@ -1252,6 +1253,16 @@ PROVIDER_REGISTRY: dict[str, ProviderMeta] = {
                 supported_durations=list(range(2, 31)),
                 resolutions=["480p", "720p", "1080p"],
                 pricing=_dashscope_video_pricing("wan3.0-video", {"480p": 0.3, "720p": 0.6, "1080p": 1.2}),
+            ),
+            # 万相 3.0 高速版：官方口径「能力对齐标准版」，故分辨率 / 时长 / 音轨声明与
+            # 标准版一致；480P ¥0.45/s，720P ¥0.9/s，1080P ¥1.8/s（来源同上，高速版无折扣）。
+            "wan3.0-video-prime": ModelInfo(
+                display_name="万相 3.0 视频 Prime",
+                media_type="video",
+                capabilities=[],
+                supported_durations=list(range(2, 31)),
+                resolutions=["480p", "720p", "1080p"],
+                pricing=_dashscope_video_pricing("wan3.0-video-prime", {"480p": 0.45, "720p": 0.9, "1080p": 1.8}),
             ),
             # --- audio ---
             # qwen3-tts-flash：同步 HTTP 语音合成，按字符计费（¥0.8/万字符）。

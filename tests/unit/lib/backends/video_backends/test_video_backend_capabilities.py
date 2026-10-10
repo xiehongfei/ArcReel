@@ -217,6 +217,7 @@ _VIDEO_AUDIO_STANCES: dict[tuple[str, str], tuple[str, str]] = {
     ("dashscope", "wan2.7-r2v"): ("always_on", "always_on"),
     ("dashscope", "wan2.7-t2v"): ("always_on", "always_on"),
     ("dashscope", "wan3.0-video"): ("controllable", "controllable"),
+    ("dashscope", "wan3.0-video-prime"): ("controllable", "controllable"),
     ("gemini-aistudio", "veo-3.1-fast-generate-preview"): ("always_on", "always_on"),
     ("gemini-aistudio", "veo-3.1-generate-preview"): ("always_on", "always_on"),
     ("gemini-aistudio", "veo-3.1-lite-generate-preview"): ("always_on", "always_on"),
